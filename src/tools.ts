@@ -18,7 +18,6 @@ import {
   updateEntry,
   archiveEntry,
   searchEntries,
-  serializeMemory,
 } from "./storage.js"
 import { writeSummary } from "./summary.js"
 
