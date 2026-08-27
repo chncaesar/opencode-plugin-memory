@@ -29,8 +29,18 @@ Architecture: Claude Code–style hot-path. The LLM decides what to remember and
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `maxSummaryChars` | `number` | `2000` | Max characters injected into the system prompt. ~500 tokens at the default. |
+| `enableLog` | `boolean` | `true` | Write an operation log to `.opencode/memory/plugin.log`. Set `false` to disable. |
+
+```jsonc
+// Disable logging
+"plugin": [
+  ["/path/to/opencode-memory", { "enableLog": false }]
+]
+```
 
 ## Storage
+
+The plugin creates `.opencode/memory/` automatically on first write — no manual setup needed.
 
 ```
 <projectDir>/
@@ -38,6 +48,7 @@ Architecture: Claude Code–style hot-path. The LLM decides what to remember and
     memory/
       MEMORY.md          # main store — LLM writes here, you can edit too
       memory_summary.md  # compact index — auto-generated, do not edit
+      plugin.log         # operation log (add/update/delete + errors), if enableLog=true
 ```
 
 Each entry looks like:

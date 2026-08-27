@@ -29,6 +29,9 @@ All files live under `<projectDir>/.opencode/memory/`:
 
 - `MEMORY.md` — main store, human-readable, LLM-writable
 - `memory_summary.md` — compact index injected into system prompt (auto-generated, never edit manually)
+- `plugin.log` — append-only operation log (created when `enableLog=true`, which is the default)
+
+The `.opencode/memory/` directory is created automatically on first write — no manual setup needed.
 
 ### MEMORY.md structure
 
@@ -96,9 +99,8 @@ In `opencode.json` / `opencode.jsonc`:
 
 Available options (all optional):
 
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `maxSummaryChars` | number | 2000 | Max characters injected into system prompt. Approx 1 token per 4 chars. |
+- `maxSummaryChars` (number, default 2000): Max characters injected into system prompt. Approx 1 token per 4 chars.
+- `enableLog` (boolean, default true): Write operation log to `.opencode/memory/plugin.log`. Set false to disable.
 
 ## Key Implementation Details
 
