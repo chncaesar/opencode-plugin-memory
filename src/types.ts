@@ -37,8 +37,15 @@ export type PluginConfig = {
    * @default 2000
    */
   maxSummaryChars: number
+  /**
+   * Enable writing an operation log to .opencode/memory/plugin.log.
+   * Records every add/update/delete and all errors.
+   * @default true
+   */
+  enableLog: boolean
 }
 
 export const DEFAULT_CONFIG: PluginConfig = {
   maxSummaryChars: 2000,
+  enableLog: true,
 }

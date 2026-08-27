@@ -2,6 +2,7 @@ import type { Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plu
 import { DEFAULT_CONFIG, type PluginConfig } from "./types.js"
 import { createMemoryTools } from "./tools.js"
 import { readSummary } from "./summary.js"
+import { createLogger } from "./logging.js"
 
 /**
  * Parse and validate plugin options from opencode.json.
@@ -19,6 +20,10 @@ function resolveConfig(options?: PluginOptions): PluginConfig {
       typeof raw["maxSummaryChars"] === "number" && raw["maxSummaryChars"] > 0
         ? raw["maxSummaryChars"]
         : DEFAULT_CONFIG.maxSummaryChars,
+    enableLog:
+      typeof raw["enableLog"] === "boolean"
+        ? raw["enableLog"]
+        : DEFAULT_CONFIG.enableLog,
   }
 }
 
@@ -34,7 +39,8 @@ function resolveConfig(options?: PluginOptions): PluginConfig {
  */
 export const server: Plugin = async (input: PluginInput, options?: PluginOptions): Promise<Hooks> => {
   const config = resolveConfig(options)
-  const tools = createMemoryTools(config)
+  const logger = createLogger(input.directory, config.enableLog)
+  const tools = createMemoryTools(config, logger)
 
   const hooks: Hooks = {
     // ── Register the four memory tools ────────────────────────────────────

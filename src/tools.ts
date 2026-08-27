@@ -1,6 +1,7 @@
 import { tool } from "@opencode-ai/plugin/tool"
 import type { ToolDefinition } from "@opencode-ai/plugin/tool"
 import type { PluginConfig } from "./types.js"
+import type { Logger } from "./logging.js"
 
 // Use the zod instance bundled with @opencode-ai/plugin to avoid version conflicts
 const z = tool.schema
@@ -11,6 +12,7 @@ type MemoryToolSet = {
   memory_delete: ToolDefinition
   memory_read: ToolDefinition
 }
+
 import {
   readStore,
   writeStore,
@@ -22,10 +24,10 @@ import {
 import { writeSummary } from "./summary.js"
 
 /**
- * Create all four memory tools bound to the given plugin config.
+ * Create all four memory tools bound to the given plugin config and logger.
  * Each tool reads and writes from `<projectDir>/.opencode/memory/MEMORY.md`.
  */
-export function createMemoryTools(config: PluginConfig): MemoryToolSet {
+export function createMemoryTools(config: PluginConfig, logger: Logger): MemoryToolSet {
   // ── memory_add ────────────────────────────────────────────────────────────
 
   const memory_add = tool({
@@ -55,13 +57,19 @@ After adding, the memory is immediately visible in future session system prompts
         .describe("Optional tags for grouping, e.g. ['coding-style', 'workflow', 'architecture']"),
     },
     async execute({ title, content, tags }, context) {
-      const store = await readStore(context.directory)
-      const { store: updated, id } = addEntry(store, title, content, tags)
-      await writeStore(context.directory, updated)
-      await writeSummary(context.directory, updated, config.maxSummaryChars)
-      return {
-        title: `Memory saved: ${id}`,
-        output: `Saved as [${id}]: ${title}\n\nContent:\n${content}`,
+      try {
+        const store = await readStore(context.directory)
+        const { store: updated, id } = addEntry(store, title, content, tags)
+        await writeStore(context.directory, updated)
+        await writeSummary(context.directory, updated, config.maxSummaryChars)
+        await logger.info("memory_add", `${id}: ${title}`)
+        return {
+          title: `Memory saved: ${id}`,
+          output: `Saved as [${id}]: ${title}\n\nContent:\n${content}`,
+        }
+      } catch (err) {
+        await logger.error("memory_add", err)
+        throw err
       }
     },
   })
@@ -85,24 +93,31 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
       tags: z.array(z.string()).optional().describe("New tags (leave empty to keep existing)"),
     },
     async execute({ id, title, content, tags }, context) {
-      const store = await readStore(context.directory)
-      const updated = updateEntry(store, id, {
-        ...(title !== undefined ? { title } : {}),
-        ...(content !== undefined ? { content } : {}),
-        ...(tags !== undefined ? { tags } : {}),
-      })
-      if (!updated) {
-        return {
-          title: "Memory not found",
-          output: `No active memory with ID ${id}. Use memory_read to list all active memories.`,
+      try {
+        const store = await readStore(context.directory)
+        const updated = updateEntry(store, id, {
+          ...(title !== undefined ? { title } : {}),
+          ...(content !== undefined ? { content } : {}),
+          ...(tags !== undefined ? { tags } : {}),
+        })
+        if (!updated) {
+          await logger.info("memory_update", `${id} not found`)
+          return {
+            title: "Memory not found",
+            output: `No active memory with ID ${id}. Use memory_read to list all active memories.`,
+          }
         }
-      }
-      await writeStore(context.directory, updated)
-      await writeSummary(context.directory, updated, config.maxSummaryChars)
-      const entry = updated.entries.find((e) => e.id === id)!
-      return {
-        title: `Memory updated: ${id}`,
-        output: `Updated [${id}]: ${entry.title}\n\nContent:\n${entry.content}`,
+        await writeStore(context.directory, updated)
+        await writeSummary(context.directory, updated, config.maxSummaryChars)
+        const entry = updated.entries.find((e) => e.id === id)!
+        await logger.info("memory_update", `${id}: ${entry.title}`)
+        return {
+          title: `Memory updated: ${id}`,
+          output: `Updated [${id}]: ${entry.title}\n\nContent:\n${entry.content}`,
+        }
+      } catch (err) {
+        await logger.error("memory_update", err)
+        throw err
       }
     },
   })
@@ -125,20 +140,28 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
       reason: z.string().optional().describe("Optional reason for deletion (helps with auditing)"),
     },
     async execute({ id, reason }, context) {
-      const store = await readStore(context.directory)
-      const updated = archiveEntry(store, id)
-      if (!updated) {
-        return {
-          title: "Memory not found",
-          output: `No active memory with ID ${id}. Use memory_read to list all active memories.`,
+      try {
+        const store = await readStore(context.directory)
+        const updated = archiveEntry(store, id)
+        if (!updated) {
+          await logger.info("memory_delete", `${id} not found`)
+          return {
+            title: "Memory not found",
+            output: `No active memory with ID ${id}. Use memory_read to list all active memories.`,
+          }
         }
-      }
-      await writeStore(context.directory, updated)
-      await writeSummary(context.directory, updated, config.maxSummaryChars)
-      const note = reason ? `\nReason: ${reason}` : ""
-      return {
-        title: `Memory archived: ${id}`,
-        output: `[${id}] has been moved to the Archived section.${note}`,
+        await writeStore(context.directory, updated)
+        await writeSummary(context.directory, updated, config.maxSummaryChars)
+        const reasonNote = reason ? ` (reason: ${reason})` : ""
+        await logger.info("memory_delete", `${id}${reasonNote}`)
+        const note = reason ? `\nReason: ${reason}` : ""
+        return {
+          title: `Memory archived: ${id}`,
+          output: `[${id}] has been moved to the Archived section.${note}`,
+        }
+      } catch (err) {
+        await logger.error("memory_delete", err)
+        throw err
       }
     },
   })
