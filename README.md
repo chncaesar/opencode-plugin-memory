@@ -12,15 +12,26 @@ Architecture: Claude Code–style hot-path. The LLM decides what to remember and
 
 ## Installation
 
+Install the published package:
+
+```bash
+npm i @chncaesar/opencode-plugin-memory
+```
+
+Then add it to your OpenCode configuration:
+
 ```jsonc
 // opencode.json or ~/.config/opencode/opencode.jsonc
 
-// Option 1 — from a local clone
-"plugin": ["/path/to/opencode-memory"]
+// Option 1 — from npm
+"plugin": ["@chncaesar/opencode-plugin-memory"]
 
-// Option 2 — with custom token budget
+// Option 2 — from a local clone
+"plugin": ["/path/to/opencode-plugin-memory"]
+
+// Option 3 — with custom token budget
 "plugin": [
-  ["/path/to/opencode-memory", { "maxSummaryChars": 3000 }]
+  ["@chncaesar/opencode-plugin-memory", { "maxSummaryChars": 3000 }]
 ]
 ```
 
@@ -34,7 +45,7 @@ Architecture: Claude Code–style hot-path. The LLM decides what to remember and
 ```jsonc
 // Disable logging
 "plugin": [
-  ["/path/to/opencode-memory", { "enableLog": false }]
+  ["@chncaesar/opencode-plugin-memory", { "enableLog": false }]
 ]
 ```
 
