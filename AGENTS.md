@@ -79,7 +79,10 @@ Returns full content of active entries, optionally filtered by keyword. Use befo
 
 ## System Prompt Injection
 
-`experimental.chat.system.transform` hook runs before every LLM request. It reads `memory_summary.md` and appends it to `output.system`.
+`experimental.chat.system.transform` hook runs before every LLM request. It reads the store (`MEMORY.md`) and appends a memory block to `output.system` **on every request, even when empty**.
+
+- Empty store → injects a cold-start block explaining the memory system exists and listing `memory_add` triggers. Without this, a fresh project gives the LLM zero signal that memory tools are available.
+- Non-empty store → injects the summary (active entries as one-liners `[MEM-001] title`, newest-first) plus a "maintain this memory" nudge reminding the LLM to keep saving durable knowledge.
 
 The summary lists active entries as one-liners (`[MEM-001] title`), newest-first. If total chars exceed `maxSummaryChars`, oldest entries are truncated. Default is 2000 chars (~500 tokens).
 

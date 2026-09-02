@@ -16,7 +16,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc",
-    "test": "tsc && node --test dist/storage.test.js"
+    "test": "tsc && node --test dist/*.test.js"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.0.0"

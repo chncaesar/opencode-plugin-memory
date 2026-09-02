@@ -2,6 +2,28 @@ import fs from "fs/promises";
 import { summaryFilePath, memoryDir } from "./storage.js";
 const SUMMARY_HEADER = `<!-- opencode-plugin-memory: project memory summary -->
 <!-- This file is auto-generated — edit MEMORY.md instead -->`;
+// Injected into the system prompt when a project has no memories yet.
+// This is the "cold start" case: without it, a fresh project gives the LLM
+// no signal that a memory system exists at all.
+const EMPTY_SYSTEM_PROMPT = [
+    "<!-- opencode-plugin-memory: project memory system -->",
+    "",
+    "You have a persistent, project-scoped memory system (tools: memory_add, memory_update, memory_delete, memory_read).",
+    "No memories are stored for this project yet.",
+    "",
+    "Save durable knowledge with memory_add when:",
+    '- the user says "remember this" / "记住" / "save this"',
+    "- you discover a reusable coding rule or project convention",
+    "- you fix a recurring bug pattern whose lesson should persist",
+    "- you learn a project-specific fact you would otherwise re-discover",
+    "- the user corrects your behavior and the correction should persist",
+    "",
+].join("\n");
+// Appended to the summary when memories exist, so the LLM keeps maintaining
+// the store rather than treating it as a read-only list.
+const MAINTAIN_NUDGE = "Maintain this memory: call memory_add when you learn durable project knowledge — " +
+    "a reusable rule/convention, a recurring bug lesson, a project-specific fact, " +
+    "or a user behavior correction that should persist.";
 /**
  * Build the text content for memory_summary.md from active entries,
  * truncated to at most maxChars characters.
@@ -49,6 +71,20 @@ export function buildSummary(store, maxChars) {
         kept += line + "\n";
     }
     return header + kept + notice;
+}
+/**
+ * Build the full block injected into every system prompt.
+ *
+ * This is what the LLM actually sees — unlike `buildSummary`, it is not just
+ * a list of entries. It always carries an instruction to use the memory
+ * system, and it handles the empty store case so a fresh project still learns
+ * that memory tools exist (the single biggest reason memory goes unused).
+ */
+export function buildSystemPrompt(store, maxChars) {
+    const hasActive = store.entries.some((e) => !e.archived);
+    if (!hasActive)
+        return EMPTY_SYSTEM_PROMPT;
+    return buildSummary(store, maxChars).trimEnd() + "\n\n" + MAINTAIN_NUDGE + "\n";
 }
 /**
  * Write the summary file to disk, creating the directory if needed.

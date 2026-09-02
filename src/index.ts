@@ -1,7 +1,8 @@
 import type { Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
 import { DEFAULT_CONFIG, type PluginConfig } from "./types.js"
 import { createMemoryTools } from "./tools.js"
-import { readSummary } from "./summary.js"
+import { buildSystemPrompt } from "./summary.js"
+import { readStore } from "./storage.js"
 import { createLogger } from "./logging.js"
 
 /**
@@ -39,7 +40,8 @@ function resolveConfig(options?: PluginOptions): PluginConfig {
  */
 export const server: Plugin = async (input: PluginInput, options?: PluginOptions): Promise<Hooks> => {
   const config = resolveConfig(options)
-  const logger = createLogger(input.directory, config.enableLog)
+  const directory = input.directory
+  const logger = createLogger(directory, config.enableLog)
   const tools = createMemoryTools(config, logger)
 
   const hooks: Hooks = {
@@ -51,11 +53,10 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
       memory_read: tools.memory_read,
     },
 
-    // ── Inject memory summary into every system prompt ────────────────────
+    // ── Inject memory block into every system prompt ──────────────────────
     "experimental.chat.system.transform": async (_input, output) => {
-      const summary = await readSummary(input.directory)
-      if (!summary) return
-      output.system.push(summary)
+      const store = await readStore(directory)
+      output.system.push(buildSystemPrompt(store, config.maxSummaryChars))
     },
   }
 
