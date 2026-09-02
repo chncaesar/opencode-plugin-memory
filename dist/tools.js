@@ -1,4 +1,5 @@
 import { tool } from "@opencode-ai/plugin/tool";
+import { MEMORY_WRITE_POLICY } from "./prompt.js";
 // Use the zod instance bundled with @opencode-ai/plugin to avoid version conflicts
 const z = tool.schema;
 import { readStore, writeStore, addEntry, updateEntry, archiveEntry, searchEntries, } from "./storage.js";
@@ -10,19 +11,9 @@ import { writeSummary } from "./summary.js";
 export function createMemoryTools(config, logger) {
     // ── memory_add ────────────────────────────────────────────────────────────
     const memory_add = tool({
-        description: `Persist an important piece of knowledge for future OpenCode sessions in this project.
+        description: `Persist durable knowledge for future OpenCode sessions in this project. User corrections and confirmed preferences are high-priority memories, even when the user does not explicitly ask you to remember them.
 
-Call this tool when:
-- The user explicitly says "remember this", "记住", "save this", or similar
-- You discover a reusable coding rule or project convention (naming, style, architecture)
-- You fix a bug pattern that is likely to recur and a future session should know about it
-- You learn a project-specific fact that would otherwise be re-discovered repeatedly
-- The user corrects your behavior and the correction should persist
-
-Do NOT call for:
-- Temporary task-specific information (what file you are editing right now)
-- Information already in AGENTS.md or project documentation
-- Obvious general programming knowledge
+${MEMORY_WRITE_POLICY}
 
 After adding, the memory is immediately visible in future session system prompts.`,
         args: {

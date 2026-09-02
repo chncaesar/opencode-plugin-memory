@@ -1,6 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { buildSystemPrompt, buildSummary } from "./summary.js";
+import { MEMORY_POLICY_EXAMPLES, MEMORY_WRITE_POLICY } from "./prompt.js";
+import { createMemoryTools } from "./tools.js";
+import { DEFAULT_CONFIG } from "./types.js";
 function emptyStore() {
     return { entries: [], nextSeq: 1 };
 }
@@ -17,7 +20,7 @@ describe("buildSystemPrompt", () => {
         const out = buildSystemPrompt(emptyStore(), 2000);
         assert.doesNotMatch(out, /MEM-\d+/);
     });
-    it("appends a maintain nudge when memories exist", () => {
+    it("injects the complete write policy when memories exist", () => {
         const store = {
             entries: [
                 {
@@ -32,7 +35,7 @@ describe("buildSystemPrompt", () => {
         };
         const out = buildSystemPrompt(store, 2000);
         assert.match(out, /MEM-001/);
-        assert.match(out, /Maintain this memory: call memory_add/);
+        assert.ok(out.includes(MEMORY_WRITE_POLICY));
     });
     it("ignores archived entries when deciding empty vs non-empty", () => {
         const store = {
@@ -50,6 +53,48 @@ describe("buildSystemPrompt", () => {
         const out = buildSystemPrompt(store, 2000);
         assert.match(out, /No memories are stored/);
         assert.doesNotMatch(out, /Old entry/);
+    });
+});
+// ─── memory-writing behavioral policy ──────────────────────────────────────
+describe("memory-writing behavioral policy", () => {
+    const nonEmptyStore = {
+        entries: [
+            {
+                id: "MEM-001",
+                title: "Existing preference",
+                content: "Existing content.",
+                added: "2026-08-26",
+                archived: false,
+            },
+        ],
+        nextSeq: 2,
+    };
+    it("covers corrections, confirmations, temporary limits, and task-local requests", () => {
+        for (const signal of ["correction", "confirmation", "temporary", "task-local"]) {
+            assert.ok(MEMORY_POLICY_EXAMPLES.some((example) => example.signal === signal), `missing ${signal} example`);
+        }
+    });
+    for (const [state, store] of [
+        ["empty", emptyStore()],
+        ["non-empty", nonEmptyStore],
+    ]) {
+        it(`preserves every behavioral decision in the ${state} store prompt`, () => {
+            const out = buildSystemPrompt(store, 2000);
+            assert.ok(out.includes(MEMORY_WRITE_POLICY));
+            for (const example of MEMORY_POLICY_EXAMPLES) {
+                const expectedDecision = example.decision === "save" ? "SAVE" : "DO NOT SAVE";
+                const expectedLine = `- User: "${example.user}" -> ${expectedDecision}: ${example.guidance}.`;
+                assert.ok(out.includes(expectedLine), `missing ${state} policy decision: ${expectedLine}`);
+            }
+        });
+    }
+    it("uses the same complete policy in the memory_add tool description", () => {
+        const logger = {
+            async info() { },
+            async error() { },
+        };
+        const tools = createMemoryTools(DEFAULT_CONFIG, logger);
+        assert.ok(tools.memory_add.description.includes(MEMORY_WRITE_POLICY));
     });
 });
 // ─── buildSummary ───────────────────────────────────────────────────────────

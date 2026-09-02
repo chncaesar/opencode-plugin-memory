@@ -2,34 +2,16 @@ import fs from "fs/promises"
 import path from "path"
 import type { MemoryStore } from "./types.js"
 import { summaryFilePath, memoryDir } from "./storage.js"
+import { MEMORY_WRITE_POLICY } from "./prompt.js"
 
 const SUMMARY_HEADER = `<!-- opencode-plugin-memory: project memory summary -->
 <!-- This file is auto-generated — edit MEMORY.md instead -->`
 
-// Injected into the system prompt when a project has no memories yet.
-// This is the "cold start" case: without it, a fresh project gives the LLM
-// no signal that a memory system exists at all.
-const EMPTY_SYSTEM_PROMPT = [
+const MEMORY_SYSTEM_INTRO = [
   "<!-- opencode-plugin-memory: project memory system -->",
   "",
   "You have a persistent, project-scoped memory system (tools: memory_add, memory_update, memory_delete, memory_read).",
-  "No memories are stored for this project yet.",
-  "",
-  "Save durable knowledge with memory_add when:",
-  '- the user says "remember this" / "记住" / "save this"',
-  "- you discover a reusable coding rule or project convention",
-  "- you fix a recurring bug pattern whose lesson should persist",
-  "- you learn a project-specific fact you would otherwise re-discover",
-  "- the user corrects your behavior and the correction should persist",
-  "",
 ].join("\n")
-
-// Appended to the summary when memories exist, so the LLM keeps maintaining
-// the store rather than treating it as a read-only list.
-const MAINTAIN_NUDGE =
-  "Maintain this memory: call memory_add when you learn durable project knowledge — " +
-  "a reusable rule/convention, a recurring bug lesson, a project-specific fact, " +
-  "or a user behavior correction that should persist."
 
 /**
  * Build the text content for memory_summary.md from active entries,
@@ -97,8 +79,11 @@ export function buildSummary(store: MemoryStore, maxChars: number): string {
  */
 export function buildSystemPrompt(store: MemoryStore, maxChars: number): string {
   const hasActive = store.entries.some((e) => !e.archived)
-  if (!hasActive) return EMPTY_SYSTEM_PROMPT
-  return buildSummary(store, maxChars).trimEnd() + "\n\n" + MAINTAIN_NUDGE + "\n"
+  const memoryState = hasActive
+    ? buildSummary(store, maxChars).trimEnd()
+    : "No memories are stored for this project yet."
+
+  return [MEMORY_SYSTEM_INTRO, memoryState, MEMORY_WRITE_POLICY, ""].join("\n\n")
 }
 
 /**

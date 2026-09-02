@@ -19,6 +19,7 @@ src/
   index.ts      Plugin entry point — resolves config, wires hooks
   tools.ts      Four memory tools (the LLM calls these)
   storage.ts    MEMORY.md parser, serializer, and CRUD operations
+  prompt.ts     Shared memory-writing policy and behavior examples
   summary.ts    memory_summary.md builder (token-bounded injection)
   types.ts      MemoryEntry, MemoryStore, PluginConfig types
 ```
@@ -63,10 +64,11 @@ Rules:
 
 ### `memory_add`
 Creates a new entry. LLM should call when:
-- User says "remember this" / "记住"
+- User says "remember this" / "save this"
 - A reusable coding rule or project convention is discovered
 - A recurring bug pattern is fixed and the lesson should persist
-- User corrects LLM behavior that should change permanently
+- User corrects how the LLM communicates, reasons, edits, tests, or collaborates; unscoped corrections are durable by default
+- User confirms a non-obvious approach worked well and should be repeated
 
 ### `memory_update`
 Updates title, content, or tags of an existing entry by ID. Use `memory_read` first to confirm the ID if uncertain.
@@ -81,8 +83,9 @@ Returns full content of active entries, optionally filtered by keyword. Use befo
 
 `experimental.chat.system.transform` hook runs before every LLM request. It reads the store (`MEMORY.md`) and appends a memory block to `output.system` **on every request, even when empty**.
 
-- Empty store → injects a cold-start block explaining the memory system exists and listing `memory_add` triggers. Without this, a fresh project gives the LLM zero signal that memory tools are available.
-- Non-empty store → injects the summary (active entries as one-liners `[MEM-001] title`, newest-first) plus a "maintain this memory" nudge reminding the LLM to keep saving durable knowledge.
+- Every store state receives the same complete writing policy, including default-to-save user feedback rules, temporary/task-local exclusions, and few-shot examples.
+- Empty store → injects the memory-system introduction, an empty-state message, and the complete policy.
+- Non-empty store → injects the summary (active entries as one-liners `[MEM-001] title`, newest-first) and the same complete policy.
 
 The summary lists active entries as one-liners (`[MEM-001] title`), newest-first. If total chars exceed `maxSummaryChars`, oldest entries are truncated. Default is 2000 chars (~500 tokens).
 

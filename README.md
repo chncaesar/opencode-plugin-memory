@@ -39,7 +39,7 @@ Then add it to your OpenCode configuration:
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `maxSummaryChars` | `number` | `2000` | Max characters injected into the system prompt. ~500 tokens at the default. |
+| `maxSummaryChars` | `number` | `2000` | Max characters used by the memory-entry summary. The fixed writing policy is added separately. |
 | `enableLog` | `boolean` | `true` | Write an operation log to `.opencode/memory/plugin.log`. Set `false` to disable. |
 
 ```jsonc
@@ -65,24 +65,25 @@ The plugin creates `.opencode/memory/` automatically on first write — no manua
 Each entry looks like:
 
 ```markdown
-### [MEM-001] 金额用 int 存储（cents）
+### [MEM-001] Store monetary amounts as integer cents
 - added: 2026-08-26
 - tags: coding-style
-永远用 int (cents) 存储金额，不用 double。输入用 CurrencyUtils.textToCents()。
+Always store monetary amounts as integer cents, not floating-point values. Parse input with CurrencyUtils.textToCents().
 ```
 
 Deleted entries are moved to an `## Archived` section rather than erased, so you can review or restore them by editing the file directly.
 
 ## When does the LLM save a memory?
 
-The tool descriptions guide the LLM to call `memory_add` when:
+The system prompt and tool description guide the LLM to call `memory_add` when:
 
-- The user says "记住" / "remember this" / "save this"
+- The user says "remember this" / "save this"
 - A reusable coding rule or project convention is discovered
 - A recurring bug pattern is fixed and the lesson should persist
-- The user corrects LLM behavior that should change permanently
+- The user corrects how the LLM communicates, reasons, edits, tests, or collaborates
+- The user confirms that a non-obvious approach worked well and should be repeated
 
-It will not save temporary task-specific information or knowledge already in `AGENTS.md`.
+Unscoped corrections and preferences are treated as durable by default; the user does not need to say "remember this". Instructions explicitly limited to the current answer, task, file, or one-time situation are not saved. The same complete policy and few-shot examples are injected whether the memory store is empty or already contains entries.
 
 ## Development
 

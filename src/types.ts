@@ -32,7 +32,8 @@ export type MemoryStore = {
  */
 export type PluginConfig = {
   /**
-   * Maximum number of characters injected into the system prompt summary.
+   * Maximum number of characters used by the memory-entry summary.
+   * The fixed memory-writing policy is injected separately.
    * Approximate token budget: 1 token ≈ 4 chars, so default 2000 chars ≈ 500 tokens.
    * @default 2000
    */
