@@ -83,7 +83,8 @@ describe("memory-writing behavioral policy", () => {
             assert.ok(out.includes(MEMORY_WRITE_POLICY));
             for (const example of MEMORY_POLICY_EXAMPLES) {
                 const expectedDecision = example.decision === "save" ? "SAVE" : "DO NOT SAVE";
-                const expectedLine = `- User: "${example.user}" -> ${expectedDecision}: ${example.guidance}.`;
+                const speaker = example.signal === "llm-discovery" ? "LLM discovers" : "User";
+                const expectedLine = `- ${speaker}: "${example.cue}" -> ${expectedDecision}: ${example.guidance}.`;
                 assert.ok(out.includes(expectedLine), `missing ${state} policy decision: ${expectedLine}`);
             }
         });

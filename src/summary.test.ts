@@ -98,8 +98,9 @@ describe("memory-writing behavioral policy", () => {
 
       for (const example of MEMORY_POLICY_EXAMPLES) {
         const expectedDecision = example.decision === "save" ? "SAVE" : "DO NOT SAVE"
+        const speaker = example.signal === "llm-discovery" ? "LLM discovers" : "User"
         const expectedLine =
-          `- User: "${example.user}" -> ${expectedDecision}: ${example.guidance}.`
+          `- ${speaker}: "${example.cue}" -> ${expectedDecision}: ${example.guidance}.`
         assert.ok(
           out.includes(expectedLine),
           `missing ${state} policy decision: ${expectedLine}`,
