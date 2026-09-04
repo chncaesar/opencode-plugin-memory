@@ -38,7 +38,11 @@ ${MEMORY_WRITE_POLICY}
 
 After adding, the memory is immediately visible in future session system prompts.`,
     args: {
-      title: z.string().max(120).describe("Short one-line title for this memory (shown in summary)"),
+      title: z.string().max(120).describe(
+        "Short one-line title shown in the summary. Must fully represent the content: a future LLM reading only the title must be able to decide whether to load this entry. " +
+        "One entry = one distinct rule or fact. If the content covers multiple independent behaviors, split into separate entries with separate titles. " +
+        "Name the specific behavior, not just the domain. Bad: 'Metabase display rules'. Good: 'Metabase drill-through: use details-only to hide columns, not hidden'."
+      ),
       content: z
         .string()
         .describe("Full content to remember. Be specific — vague memories are not useful."),
@@ -79,7 +83,9 @@ You can update the title, content, or tags, or any combination.
 If you are unsure of the exact ID, call memory_read first to find it.`,
     args: {
       id: z.string().regex(/^MEM-\d+$/).describe("The memory ID to update, e.g. MEM-001"),
-      title: z.string().max(120).optional().describe("New title (leave empty to keep existing)"),
+      title: z.string().max(120).optional().describe(
+        "New title (leave empty to keep existing). Must fully represent the content — see memory_add for granularity rules."
+      ),
       content: z.string().optional().describe("New content (leave empty to keep existing)"),
       tags: z.array(z.string()).optional().describe("New tags (leave empty to keep existing)"),
     },
