@@ -6,6 +6,8 @@ import {
   addEntry,
   updateEntry,
   archiveEntry,
+  addSupersedingEntry,
+  resolveSuccessor,
   searchEntries,
 } from "./storage.js"
 import type { MemoryStore } from "./types.js"
@@ -328,5 +330,176 @@ describe("searchEntries", () => {
   it("returns empty when no match", () => {
     const results = searchEntries(populated(), "nonexistent-xyz")
     assert.equal(results.length, 0)
+  })
+})
+
+// ─── memory evolution: archive metadata ──────────────────────────────────────
+
+function storeWith(...entries: Array<[string, string]>): MemoryStore {
+  let s: MemoryStore = { entries: [], nextSeq: 1 }
+  for (const [title, content] of entries) s = addEntry(s, title, content).store
+  return s
+}
+
+describe("archive metadata", () => {
+  it("archiveEntry records archivedAt and a one-line reason", () => {
+    const s = storeWith(["A", "a"])
+    const out = archiveEntry(s, "MEM-001", { reason: "no longer\ntrue   here" })!
+    const e = out.entries[0]!
+    assert.equal(e.archived, true)
+    assert.match(e.archivedAt!, /^\d{4}-\d{2}-\d{2}$/)
+    assert.equal(e.archivedReason, "no longer true here")
+    assert.equal(e.supersededBy, undefined)
+  })
+
+  it("archiveEntry without opts sets no reason", () => {
+    const out = archiveEntry(storeWith(["A", "a"]), "MEM-001")!
+    assert.equal(out.entries[0]!.archivedReason, undefined)
+  })
+
+  it("round-trips archive fields through serialize → parse", () => {
+    let s = storeWith(["Old", "old body"], ["New", "new body"])
+    s = archiveEntry(s, "MEM-001", { reason: "superseded", supersededBy: "MEM-002" })!
+    const again = parseMemory(serializeMemory(s))
+    const old = again.entries.find((e) => e.id === "MEM-001")!
+    assert.equal(old.archived, true)
+    assert.equal(old.archivedReason, "superseded")
+    assert.equal(old.supersededBy, "MEM-002")
+    assert.equal(old.archivedAt, s.entries[0]!.archivedAt)
+    assert.equal(old.content, "old body")
+    assert.equal(serializeMemory(again), serializeMemory(s))
+  })
+
+  it("does not treat metadata-looking body lines as metadata", () => {
+    const body = "first line\n- tags: not-a-tag\n- superseded_by: MEM-999\n- added: 1999-01-01"
+    const s = storeWith(["T", body])
+    const again = parseMemory(serializeMemory(s))
+    const e = again.entries[0]!
+    assert.equal(e.tags, undefined)
+    assert.equal(e.supersededBy, undefined)
+    assert.notEqual(e.added, "1999-01-01")
+    assert.equal(e.content, body)
+  })
+
+  it("ignores archive metadata on active entries", () => {
+    const text = [
+      "# OpenCode Memory", "<!-- nextSeq: 2 -->", "", "## Active", "",
+      "### [MEM-001] T", "- added: 2026-01-01", "- superseded_by: MEM-002", "body", "",
+      "## Archived", "",
+    ].join("\n")
+    assert.equal(parseMemory(text).entries[0]!.supersededBy, undefined)
+  })
+})
+
+describe("legacy MEMORY.md compatibility", () => {
+  const legacy = [
+    "# OpenCode Memory",
+    "<!-- nextSeq: 5 -->",
+    "<!-- auto-managed by opencode-plugin-memory — do not edit section headings -->",
+    "",
+    "## Active",
+    "",
+    "### [MEM-001] 插件加载验证",
+    "- added: 2026-08-27",
+    "- tags: test",
+    "测试 memory_add 工具是否可用。",
+    "",
+    "### [MEM-004] WebFetch 必须走 subagent",
+    "- added: 2026-09-07",
+    "- tags: workflow, context",
+    "当 webfetch 的目的是提取信息。",
+    "",
+    "原因：raw HTML 太大。",
+    "",
+    "## Archived",
+    "",
+    "### [MEM-002] 万颗",
+    "- added: 2026-09-04",
+    "- updated: 2026-09-04",
+    "- tags: metabase, 单位",
+    "换算规则：",
+    "- 在 SQL 里用 `qty / 10000.0`",
+    "",
+  ].join("\n")
+
+  it("parses entries unchanged", () => {
+    const s = parseMemory(legacy)
+    assert.equal(s.nextSeq, 5)
+    assert.equal(s.entries.length, 3)
+    const m4 = s.entries.find((e) => e.id === "MEM-004")!
+    assert.deepEqual(m4.tags, ["workflow", "context"])
+    assert.equal(m4.content, "当 webfetch 的目的是提取信息。\n\n原因：raw HTML 太大。")
+    const m2 = s.entries.find((e) => e.id === "MEM-002")!
+    assert.equal(m2.archived, true)
+    assert.equal(m2.content, "换算规则：\n- 在 SQL 里用 `qty / 10000.0`")
+    assert.equal(m2.archivedReason, undefined)
+  })
+
+  it("is stable after one rewrite", () => {
+    const once = serializeMemory(parseMemory(legacy))
+    assert.equal(serializeMemory(parseMemory(once)), once)
+  })
+})
+
+describe("addSupersedingEntry", () => {
+  it("adds the new entry and archives the old one with a link", () => {
+    const s = storeWith(["Old rule", "x"], ["Other", "y"])
+    const r = addSupersedingEntry(s, "New rule", "z", ["t"], ["MEM-001"])
+    assert.equal(r.ok, true)
+    if (!r.ok) return
+    assert.equal(r.id, "MEM-003")
+    assert.deepEqual(r.archivedIds, ["MEM-001"])
+    const old = r.store.entries.find((e) => e.id === "MEM-001")!
+    assert.equal(old.archived, true)
+    assert.equal(old.supersededBy, "MEM-003")
+    assert.equal(old.archivedReason, "superseded")
+    assert.equal(r.store.entries.find((e) => e.id === "MEM-002")!.archived, false)
+    assert.equal(r.store.entries.find((e) => e.id === "MEM-003")!.archived, false)
+    assert.equal(r.store.nextSeq, 4)
+  })
+
+  it("supersedes several entries and collapses duplicate IDs", () => {
+    const s = storeWith(["A", "a"], ["B", "b"])
+    const r = addSupersedingEntry(s, "C", "c", undefined, ["MEM-001", "MEM-002", "MEM-001"])
+    assert.ok(r.ok)
+    if (!r.ok) return
+    assert.deepEqual(r.archivedIds, ["MEM-001", "MEM-002"])
+    assert.equal(r.store.entries.filter((e) => e.archived).length, 2)
+  })
+
+  it("fails without changing anything when an ID is unknown", () => {
+    const s = storeWith(["A", "a"])
+    const r = addSupersedingEntry(s, "B", "b", undefined, ["MEM-001", "MEM-099"])
+    assert.equal(r.ok, false)
+    if (r.ok) return
+    assert.deepEqual(r.badIds, ["MEM-099"])
+    assert.equal(s.entries.length, 1)
+    assert.equal(s.entries[0]!.archived, false)
+    assert.equal(s.nextSeq, 2)
+  })
+
+  it("fails when the target is already archived", () => {
+    const s = archiveEntry(storeWith(["A", "a"]), "MEM-001")!
+    assert.equal(addSupersedingEntry(s, "B", "b", undefined, ["MEM-001"]).ok, false)
+  })
+
+  it("resolveSuccessor walks a chain A → B → C", () => {
+    const r1 = addSupersedingEntry(storeWith(["A", "a"]), "B", "b", undefined, ["MEM-001"])
+    assert.ok(r1.ok); if (!r1.ok) return
+    const r2 = addSupersedingEntry(r1.store, "C", "c", undefined, ["MEM-002"])
+    assert.ok(r2.ok); if (!r2.ok) return
+    assert.equal(resolveSuccessor(r2.store, "MEM-001")!.id, "MEM-003")
+    assert.equal(resolveSuccessor(r2.store, "MEM-003")!.id, "MEM-003")
+  })
+
+  it("resolveSuccessor survives a cycle", () => {
+    const store: MemoryStore = {
+      nextSeq: 3,
+      entries: [
+        { id: "MEM-001", title: "a", content: "", added: "2026-01-01", archived: true, supersededBy: "MEM-002" },
+        { id: "MEM-002", title: "b", content: "", added: "2026-01-01", archived: true, supersededBy: "MEM-001" },
+      ],
+    }
+    assert.ok(resolveSuccessor(store, "MEM-001"))
   })
 })

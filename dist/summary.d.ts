@@ -16,7 +16,7 @@ export declare function buildSummary(store: MemoryStore, maxChars: number): stri
  * system, and it handles the empty store case so a fresh project still learns
  * that memory tools exist (the single biggest reason memory goes unused).
  */
-export declare function buildSystemPrompt(store: MemoryStore, maxChars: number): string;
+export declare function buildSystemPrompt(store: MemoryStore, maxChars: number, nudge?: string): string;
 /**
  * Write the summary file to disk, creating the directory if needed.
  */

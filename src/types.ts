@@ -16,6 +16,12 @@ export type MemoryEntry = {
   tags?: string[]
   /** Whether this entry is soft-deleted (moved to Archived section) */
   archived: boolean
+  /** ISO date when the entry was archived (archived entries only) */
+  archivedAt?: string
+  /** Single-line reason the entry was archived (archived entries only) */
+  archivedReason?: string
+  /** ID of the entry that replaced this one (set only when archived via supersede) */
+  supersededBy?: string
 }
 
 /**
@@ -44,9 +50,29 @@ export type PluginConfig = {
    * @default true
    */
   enableLog: boolean
+  /**
+   * Days after which an entry (by latest of added/updated) is listed as
+   * "aging" in memory_review. Informational only; never archives anything.
+   * @default 90
+   */
+  staleDays: number
+  /**
+   * Run a background semantic audit (small-model sub-call) after a session
+   * goes idle, looking for duplicate / contradicting memories.
+   * @default true
+   */
+  backgroundAudit: boolean
+  /**
+   * Minimum minutes between two background audits.
+   * @default 60
+   */
+  auditIntervalMinutes: number
 }
 
 export const DEFAULT_CONFIG: PluginConfig = {
   maxSummaryChars: 2000,
   enableLog: true,
+  staleDays: 90,
+  backgroundAudit: true,
+  auditIntervalMinutes: 60,
 }

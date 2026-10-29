@@ -57,9 +57,37 @@ export declare function updateEntry(store: MemoryStore, id: string, patch: {
 }): MemoryStore | null;
 /**
  * Soft-delete an entry by ID (moves it to the Archived section).
- * Returns null if not found.
+ * Returns null if not found among active entries.
+ *
+ * `reason` is stored on the entry (collapsed to one line); `supersededBy`
+ * links the entry to the one that replaced it.
  */
-export declare function archiveEntry(store: MemoryStore, id: string): MemoryStore | null;
+export declare function archiveEntry(store: MemoryStore, id: string, opts?: {
+    reason?: string;
+    supersededBy?: string;
+}): MemoryStore | null;
+export type SupersedeResult = {
+    ok: true;
+    store: MemoryStore;
+    id: string;
+    archivedIds: string[];
+} | {
+    ok: false;
+    error: string;
+    badIds: string[];
+};
+/**
+ * Add a new entry and archive the entries it replaces, as one atomic change.
+ *
+ * Every ID in `supersedes` must be an active entry; otherwise nothing changes
+ * and the offending IDs are reported. Duplicate IDs are collapsed.
+ */
+export declare function addSupersedingEntry(store: MemoryStore, title: string, content: string, tags: string[] | undefined, supersedes: string[]): SupersedeResult;
+/**
+ * Follow superseded_by links from an entry to the one that currently stands in
+ * for it. Returns the last entry in the chain. Cycle-safe.
+ */
+export declare function resolveSuccessor(store: MemoryStore, id: string): MemoryEntry | undefined;
 /**
  * Search active entries by keyword (case-insensitive match on title + content + tags).
  */

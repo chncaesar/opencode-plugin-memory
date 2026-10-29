@@ -6,7 +6,7 @@ const SUMMARY_HEADER = `<!-- opencode-plugin-memory: project memory summary -->
 const MEMORY_SYSTEM_INTRO = [
     "<!-- opencode-plugin-memory: project memory system -->",
     "",
-    "You have a persistent, project-scoped memory system (tools: memory_add, memory_update, memory_delete, memory_read).",
+    "You have a persistent, project-scoped memory system (tools: memory_add, memory_update, memory_delete, memory_read, memory_review).",
 ].join("\n");
 /**
  * Build the text content for memory_summary.md from active entries,
@@ -19,7 +19,12 @@ const MEMORY_SYSTEM_INTRO = [
 export function buildSummary(store, maxChars) {
     const active = store.entries
         .filter((e) => !e.archived)
-        .sort((a, b) => (b.added > a.added ? 1 : b.added < a.added ? -1 : 0));
+        .sort((a, b) => {
+        // Most recently touched first, so a corrected entry is not the first to be truncated.
+        const ka = a.updated && a.updated > a.added ? a.updated : a.added;
+        const kb = b.updated && b.updated > b.added ? b.updated : b.added;
+        return kb > ka ? 1 : kb < ka ? -1 : 0;
+    });
     if (active.length === 0) {
         return [SUMMARY_HEADER, "", "No memories stored yet.", ""].join("\n");
     }
@@ -64,12 +69,12 @@ export function buildSummary(store, maxChars) {
  * system, and it handles the empty store case so a fresh project still learns
  * that memory tools exist (the single biggest reason memory goes unused).
  */
-export function buildSystemPrompt(store, maxChars) {
+export function buildSystemPrompt(store, maxChars, nudge = "") {
     const hasActive = store.entries.some((e) => !e.archived);
     const memoryState = hasActive
         ? buildSummary(store, maxChars).trimEnd()
         : "No memories are stored for this project yet.";
-    return [MEMORY_SYSTEM_INTRO, memoryState, MEMORY_WRITE_POLICY, ""].join("\n\n");
+    return [MEMORY_SYSTEM_INTRO, memoryState, ...(nudge ? [nudge] : []), MEMORY_WRITE_POLICY, ""].join("\n\n");
 }
 /**
  * Write the summary file to disk, creating the directory if needed.

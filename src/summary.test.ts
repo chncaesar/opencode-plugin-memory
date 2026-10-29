@@ -165,3 +165,38 @@ describe("buildSummary", () => {
     assert.match(out, /truncated/)
   })
 })
+
+describe("memory evolution in the prompt", () => {
+  const mk = (id: string, title: string, added: string, updated?: string) => ({
+    id,
+    title,
+    content: "c",
+    added,
+    ...(updated ? { updated } : {}),
+    archived: false,
+  })
+
+  it("orders by latest of added/updated so a corrected entry survives truncation", () => {
+    const store: MemoryStore = {
+      entries: [mk("MEM-001", "Old but corrected", "2026-01-01", "2026-10-01"), mk("MEM-002", "Newer untouched", "2026-06-01")],
+      nextSeq: 3,
+    }
+    const out = buildSummary(store, 2000)
+    assert.ok(out.indexOf("Old but corrected") < out.indexOf("Newer untouched"))
+  })
+
+  it("appends the nudge line only when given, before the policy", () => {
+    const store: MemoryStore = { entries: [mk("MEM-001", "A", "2026-01-01")], nextSeq: 2 }
+    assert.doesNotMatch(buildSystemPrompt(store, 2000), /Memory maintenance/)
+    const nudged = buildSystemPrompt(store, 2000, "Memory maintenance: 1 possible memory conflict. Run memory_review when convenient.")
+    assert.match(nudged, /Memory maintenance/)
+    assert.ok(nudged.indexOf("Memory maintenance") < nudged.indexOf("## When to write project memory"))
+  })
+
+  it("the policy tells the LLM how to resolve conflicts, and names memory_review", () => {
+    assert.match(MEMORY_WRITE_POLICY, /Keeping memory consistent/)
+    assert.match(MEMORY_WRITE_POLICY, /supersedes/)
+    assert.match(MEMORY_WRITE_POLICY, /memory_review/)
+    assert.match(buildSystemPrompt(emptyStore(), 2000), /memory_review/)
+  })
+})

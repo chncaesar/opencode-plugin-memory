@@ -3,6 +3,9 @@ import { createMemoryTools } from "./tools.js";
 import { buildSystemPrompt } from "./summary.js";
 import { readStore } from "./storage.js";
 import { createLogger } from "./logging.js";
+import { collectAttention, nudgeLine, readReviewState } from "./review.js";
+import { createAuditScheduler, createSdkModelCall } from "./audit.js";
+import { registerAuditAgent } from "./auditAgent.js";
 /**
  * Parse and validate plugin options from opencode.json.
  * All options are optional; missing values fall back to DEFAULT_CONFIG.
@@ -21,35 +24,73 @@ function resolveConfig(options) {
         enableLog: typeof raw["enableLog"] === "boolean"
             ? raw["enableLog"]
             : DEFAULT_CONFIG.enableLog,
+        staleDays: typeof raw["staleDays"] === "number" && raw["staleDays"] > 0
+            ? raw["staleDays"]
+            : DEFAULT_CONFIG.staleDays,
+        backgroundAudit: typeof raw["backgroundAudit"] === "boolean"
+            ? raw["backgroundAudit"]
+            : DEFAULT_CONFIG.backgroundAudit,
+        auditIntervalMinutes: typeof raw["auditIntervalMinutes"] === "number" && raw["auditIntervalMinutes"] > 0
+            ? raw["auditIntervalMinutes"]
+            : DEFAULT_CONFIG.auditIntervalMinutes,
     };
 }
 /**
  * opencode-plugin-memory — project-scoped persistent memory
  *
- * Provides four tools (memory_add, memory_update, memory_delete, memory_read)
- * and injects a compact memory summary into every system prompt so the LLM
- * always knows what has been remembered without needing to read the full file.
+ * Provides five tools (memory_add, memory_update, memory_delete, memory_read,
+ * memory_review) and injects a compact memory summary into every system prompt
+ * so the LLM always knows what has been remembered without needing to read the
+ * full file.
+ *
+ * A background audit runs after sessions go idle and records possible memory
+ * conflicts in review.json; it never edits MEMORY.md.
  *
  * Storage: <projectDir>/.opencode/memory/MEMORY.md
  * Summary: <projectDir>/.opencode/memory/memory_summary.md
+ * Review:  <projectDir>/.opencode/memory/review.json
  */
 export const server = async (input, options) => {
     const config = resolveConfig(options);
     const directory = input.directory;
     const logger = createLogger(directory, config.enableLog);
-    const tools = createMemoryTools(config, logger);
+    // Throwaway sessions created by the background audit. Hooks ignore them so
+    // the audit neither injects memory into itself nor triggers further audits.
+    const auditSessions = new Set();
+    const scheduler = createAuditScheduler({
+        directory,
+        config,
+        logger,
+        call: createSdkModelCall(input.client, directory, auditSessions),
+    }, auditSessions);
+    const memoryTools = createMemoryTools(config, logger, { runAuditNow: () => scheduler.runNow() });
     const hooks = {
-        // ── Register the four memory tools ────────────────────────────────────
+        // ── Register the restricted audit agent ───────────────────────────────
+        config: async (cfg) => {
+            if (!config.backgroundAudit)
+                return;
+            registerAuditAgent(cfg);
+        },
+        // ── Register the five memory tools ────────────────────────────────────
         tool: {
-            memory_add: tools.memory_add,
-            memory_update: tools.memory_update,
-            memory_delete: tools.memory_delete,
-            memory_read: tools.memory_read,
+            memory_add: memoryTools.memory_add,
+            memory_update: memoryTools.memory_update,
+            memory_delete: memoryTools.memory_delete,
+            memory_read: memoryTools.memory_read,
+            memory_review: memoryTools.memory_review,
+        },
+        // ── Background audit: run after a session goes idle ───────────────────
+        event: async ({ event }) => {
+            if (event.type === "session.idle")
+                scheduler.onSessionIdle(event.properties.sessionID);
         },
         // ── Inject memory block into every system prompt ──────────────────────
-        "experimental.chat.system.transform": async (_input, output) => {
+        "experimental.chat.system.transform": async (hookInput, output) => {
+            if (hookInput.sessionID && auditSessions.has(hookInput.sessionID))
+                return;
             const store = await readStore(directory);
-            output.system.push(buildSystemPrompt(store, config.maxSummaryChars));
+            const nudge = nudgeLine(collectAttention(store, await readReviewState(directory)));
+            output.system.push(buildSystemPrompt(store, config.maxSummaryChars, nudge));
         },
     };
     return hooks;
