@@ -7,7 +7,7 @@ Project-scoped persistent memory for [OpenCode](https://opencode.ai). The LLM au
 - Five tools (`memory_add`, `memory_update`, `memory_delete`, `memory_read`, `memory_review`) are registered with OpenCode and available to the LLM during every session
 - A compact summary of all active memories is injected into every system prompt automatically
 - Memory is stored as plain Markdown in `<projectDir>/.opencode/memory/MEMORY.md` — human-readable and inspectable at any time
-- Writes surface the most similar existing memories so the LLM can resolve duplicates and contradictions immediately
+- When a new memory may overlap an existing one, the LLM can request an immediate model-judged check with `memory_review` and `refresh: true`
 - An optional background audit runs after a session goes idle and records possible conflicts for review. It never edits memory itself.
 
 Architecture: Claude Code–style hot-path for writes. The LLM decides what to remember and when. Consistency is checked by a model in a background audit that only writes findings to `review.json`; the main session decides what to change.
@@ -19,6 +19,8 @@ Install the published package:
 ```bash
 npm i @chncaesar/opencode-plugin-memory
 ```
+
+Restart OpenCode afterwards: plugins are loaded per server process. If the npm package is older than this repository, use the local-clone option below.
 
 Then add it to your OpenCode configuration:
 
@@ -46,6 +48,7 @@ Then add it to your OpenCode configuration:
 | `staleDays` | `number` | `90` | Entries not touched for this long are listed as "aging" in `memory_review`. Informational only; nothing is archived. |
 | `backgroundAudit` | `boolean` | `true` | Run the semantic consistency audit after sessions go idle. |
 | `auditIntervalMinutes` | `number` | `60` | Minimum minutes between two audits. |
+| `auditModel` | `string` | host default | OpenCode 2.x only. Model for the background audit, as `"providerID/modelID"` (e.g. `"bailian-payg/qwen3.7-plus"`). Set it if the host default model is unavailable to you. |
 
 ```jsonc
 // Disable logging

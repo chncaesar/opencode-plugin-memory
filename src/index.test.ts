@@ -3,7 +3,8 @@ import assert from "node:assert/strict"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
-import { server } from "./index.js"
+import { parseAuditModel, server, setup } from "./plugin.js"
+import defaultExport from "./index.js"
 import { addEntry, writeStore } from "./storage.js"
 import { emptyReviewState, hashEntries, writeReviewState } from "./review.js"
 import { AUDIT_AGENT_NAME } from "./auditAgent.js"
@@ -131,6 +132,108 @@ describe("plugin entry", () => {
       const out = { system: [] as string[] }
       await hooks["experimental.chat.system.transform"]!({ sessionID: "audit-sess", model: {} as never }, out)
       assert.equal(out.system.join(""), "")
+    })
+  })
+})
+
+describe("V2 entry", () => {
+  function mockCtx(dir: string, options?: Record<string, unknown>) {
+    const tools: Record<string, any> = {}
+    const hooks: Record<string, (e: any) => unknown> = {}
+    const disposed: string[] = []
+    const generated: string[] = []
+    const models: unknown[] = []
+    const ctx = {
+      location: { directory: dir },
+      ...(options ? { options } : {}),
+      tool: {
+        async transform(fn: (e: { add: (t: any) => void }) => void) {
+          fn({ add: (t) => { tools[t.name] = t } })
+          return { dispose: async () => { disposed.push("tool") } }
+        },
+      },
+      session: {
+        async hook(name: string, cb: (e: any) => unknown) {
+          hooks[name] = cb
+          return { dispose: async () => { disposed.push(name) } }
+        },
+      },
+      experimental: {
+        generate: {
+          async text(i: { prompt: string; model?: unknown }) {
+            generated.push(i.prompt)
+            models.push(i.model)
+            return { text: '{"findings":[{"ids":["MEM-001","MEM-002"],"relation":"duplicate","reason":"same"}]}' }
+          },
+        },
+      },
+    }
+    return { ctx, tools, hooks, disposed, generated, models }
+  }
+
+  it("default export is { id, setup } and keeps server for V1", () => {
+    assert.equal(typeof defaultExport.id, "string")
+    assert.equal(typeof defaultExport.setup, "function")
+    assert.equal(typeof defaultExport.server, "function")
+  })
+
+  it("setup registers five tools that execute, injects context, and disposes", async () => {
+    await withDir(async (dir) => {
+      await seedStore(dir)
+      const m = mockCtx(dir)
+      const cleanup = await setup(m.ctx)
+      assert.deepEqual(Object.keys(m.tools).sort(), [
+        "memory_add", "memory_delete", "memory_read", "memory_review", "memory_update",
+      ])
+
+      const added = await m.tools["memory_add"].execute({ title: "Rule three", content: "three" })
+      assert.match(added.content, /Saved as \[MEM-003\]/)
+
+      const event = { sessionID: "s1", system: [] as Array<{ type: string; text: string }> }
+      await m.hooks["context"]!(event)
+      assert.equal(event.system.length, 1)
+      assert.equal(event.system[0]!.type, "text")
+      assert.match(event.system[0]!.text, /Rule one/)
+
+      await cleanup()
+      assert.deepEqual(m.disposed.sort(), ["context", "experimental.idle", "tool"])
+    })
+  })
+
+  it("idle hook runs the audit through generate.text", async () => {
+    await withDir(async (dir) => {
+      await seedStore(dir)
+      const m = mockCtx(dir)
+      await setup(m.ctx)
+      await m.hooks["experimental.idle"]!({ sessionID: "real-1" })
+      const file = path.join(dir, ".opencode/memory/review.json")
+      for (let i = 0; i < 100 && m.generated.length === 0; i++) await new Promise((r) => setTimeout(r, 10))
+      await new Promise((r) => setTimeout(r, 50))
+      assert.equal(m.generated.length, 1)
+      assert.equal(JSON.parse(await fs.readFile(file, "utf8")).findings.length, 1)
+    })
+  })
+
+  it("passes the auditModel option to generate.text, and parses it strictly", async () => {
+    assert.deepEqual(parseAuditModel("bailian-payg/qwen3.7-plus"), { providerID: "bailian-payg", id: "qwen3.7-plus" })
+    assert.equal(parseAuditModel("nomodel"), undefined)
+    assert.equal(parseAuditModel("/x"), undefined)
+    assert.equal(parseAuditModel(5), undefined)
+    await withDir(async (dir) => {
+      await seedStore(dir)
+      const m = mockCtx(dir, { auditModel: "bailian-payg/qwen3.7-plus" })
+      await setup(m.ctx)
+      await m.hooks["experimental.idle"]!({ sessionID: "real-1" })
+      for (let i = 0; i < 100 && m.generated.length === 0; i++) await new Promise((r) => setTimeout(r, 10))
+      assert.deepEqual(m.models[0], { providerID: "bailian-payg", id: "qwen3.7-plus" })
+    })
+  })
+
+  it("does not register the idle hook when the audit is disabled", async () => {
+    await withDir(async (dir) => {
+      const m = mockCtx(dir, { backgroundAudit: false })
+      await setup(m.ctx)
+      assert.equal(m.hooks["experimental.idle"], undefined)
     })
   })
 })
