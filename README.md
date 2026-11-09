@@ -1,5 +1,7 @@
 # opencode-plugin-memory
 
+[![npm version](https://img.shields.io/npm/v/@chncaesar/opencode-plugin-memory)](https://www.npmjs.com/package/@chncaesar/opencode-plugin-memory)
+
 Project-scoped persistent memory for [OpenCode](https://opencode.ai). The LLM autonomously saves, updates, and deletes knowledge across sessions, and memories are kept consistent as they age. No cloud dependency, no vector database.
 
 ## How it works
@@ -14,13 +16,11 @@ Architecture: Claude Code–style hot-path for writes. The LLM decides what to r
 
 ## Installation
 
-Install the published package:
+Requires OpenCode 1.x or 2.x. Current version: `0.2.1`.
 
 ```bash
 npm i @chncaesar/opencode-plugin-memory
 ```
-
-Restart OpenCode afterwards: plugins are loaded per server process. If the npm package is older than this repository, use the local-clone option below.
 
 Then add it to your OpenCode configuration:
 
@@ -38,6 +38,8 @@ Then add it to your OpenCode configuration:
   ["@chncaesar/opencode-plugin-memory", { "maxSummaryChars": 3000 }]
 ]
 ```
+
+After installing or upgrading, fully quit and restart OpenCode — plugins are loaded once per server process. OpenCode also caches npm plugin packages, so an upgrade can keep loading the old copy; if the new version does not take effect, delete the folder named after this package inside `~/.cache/opencode/packages/` and restart.
 
 ## Configuration
 
@@ -116,6 +118,16 @@ The system prompt and tool description guide the LLM to call `memory_add` when:
 - A memory needs correcting, replacing, or removing because it went stale or conflicts with new information
 
 Unscoped corrections and preferences are treated as durable by default; the user does not need to say "remember this". Instructions explicitly limited to the current answer, task, file, or one-time situation are not saved. The same complete policy and few-shot examples are injected whether the memory store is empty or already contains entries.
+
+## What's new in 0.2.1
+
+First npm release after `0.1.1`. It bundles the 0.2.x work:
+
+- **Dual plugin entry.** The package's default export is `{ id, server, setup }`, so the same tarball loads under both the OpenCode 1.x loader and the 2.x loader. Configuration syntax is unchanged.
+- **`auditModel` option** (OpenCode 2.x). Pin the model used by the background audit instead of relying on the host default.
+- **Memory evolution.** `memory_add` with `supersedes` archives the replaced entry in one step, and archived entries record why and what replaced them.
+- **Model-judged consistency.** The audit reports duplicate, refinement and contradiction pairs with hash-scoped caching, dismissals, and an immediate check via `memory_review` with `refresh: true`.
+- **Writing policy tightening.** Entries must be one coherent rule, and titles must match their body.
 
 ## Development
 
