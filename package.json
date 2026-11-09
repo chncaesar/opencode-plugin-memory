@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@chncaesar/opencode-plugin-memory",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Project-scoped persistent memory plugin for OpenCode — LLM-directed add/update/delete plus a model-judged background consistency audit",
   "type": "module",
   "license": "MIT",
