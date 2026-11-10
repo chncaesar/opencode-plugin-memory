@@ -1,9 +1,23 @@
 import type { MemoryEntry, MemoryStore } from "./types.js";
 /**
- * Resolve the .opencode/memory directory for a given project root.
+ * Resolve the machine-local `.opencode/memory` directory for a given project
+ * root. Holds the auto-generated files only (`memory_summary.md`, `review.json`,
+ * `plugin.log`) — not the committable store.
  */
 export declare function memoryDir(projectDir: string): string;
-export declare function memoryFilePath(projectDir: string): string;
+/**
+ * Resolve the shared (committable) memory store directory. Defaults to
+ * `.agents/memory`; `override` is a relative directory name (e.g. `"memory"`)
+ * from the project root.
+ */
+export declare function storeDir(projectDir: string, override?: string): string;
+/**
+ * Validate a user-supplied `storeDir` override. Returns the value when it is a
+ * non-empty relative path that stays inside the project root (no `..` segment,
+ * not absolute); otherwise `undefined` (callers fall back to the default).
+ */
+export declare function validStoreDir(value: unknown): string | undefined;
+export declare function memoryFilePath(projectDir: string, storeDirOverride?: string): string;
 export declare function summaryFilePath(projectDir: string): string;
 /**
  * Parse the raw MEMORY.md text into a MemoryStore.
@@ -35,11 +49,28 @@ export declare function serializeMemory(store: MemoryStore): string;
 /**
  * Read and parse MEMORY.md, returning an empty store if the file does not exist.
  */
-export declare function readStore(projectDir: string): Promise<MemoryStore>;
+export declare function readStore(projectDir: string, storeDirOverride?: string): Promise<MemoryStore>;
+/**
+ * Thrown when the store cannot be written because its path is unwritable or
+ * read-only (e.g. projectDir is `/` or a read-only filesystem). Carries a
+ * clean, user-facing message; tools catch it and return that message instead of
+ * surfacing a raw EACCES.
+ */
+export declare class StoreWriteError extends Error {
+    constructor(message: string, cause?: unknown);
+}
 /**
  * Write the store back to MEMORY.md, creating the directory if needed.
+ * Unwritable/read-only paths raise a descriptive StoreWriteError.
  */
-export declare function writeStore(projectDir: string, store: MemoryStore): Promise<void>;
+export declare function writeStore(projectDir: string, store: MemoryStore, storeDirOverride?: string): Promise<void>;
+/**
+ * One-time migration: if the shared store file does not exist but the legacy
+ * `.opencode/memory/MEMORY.md` does, move it into place (creating the target
+ * directory first). No-op when the new file already exists or there is no
+ * legacy file. Throws on unexpected I/O errors; callers log and swallow.
+ */
+export declare function migrateLegacyStore(projectDir: string, storeDirOverride?: string): Promise<void>;
 /**
  * Add a new entry and return the assigned ID.
  */

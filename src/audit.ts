@@ -152,7 +152,7 @@ export async function runAudit(deps: AuditDeps): Promise<AuditOutcome> {
   if (!config.backgroundAudit) return "disabled"
 
   try {
-    const store = await readStore(directory)
+    const store = await readStore(directory, config.storeDir)
     const active = activeEntries(store)
     const state = await readReviewState(directory)
     const hash = hashActive(store)
@@ -194,7 +194,7 @@ export async function runAudit(deps: AuditDeps): Promise<AuditOutcome> {
 
     // If memories changed while the model was working, the verdict may describe
     // text that no longer exists. Keep lastHash as is so the next idle re-audits.
-    const fresh = await readStore(directory)
+    const fresh = await readStore(directory, config.storeDir)
     if (hashActive(fresh) !== hash) {
       await markAttempt(directory, now())
       await logger.info("audit", "discarded: memories changed during audit")

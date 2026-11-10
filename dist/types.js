@@ -4,5 +4,6 @@ export const DEFAULT_CONFIG = {
     staleDays: 90,
     backgroundAudit: true,
     auditIntervalMinutes: 60,
+    storeDir: ".agents/memory",
 };
 //# sourceMappingURL=types.js.map

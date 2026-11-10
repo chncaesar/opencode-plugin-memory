@@ -15,7 +15,8 @@ export type ToolDeps = {
 };
 /**
  * Create all five memory tools bound to the given plugin config and logger.
- * Each tool reads and writes from `<projectDir>/.opencode/memory/MEMORY.md`.
+ * Each tool reads and writes the shared store at `<projectDir>/<storeDir>/MEMORY.md`
+ * (default `.agents/memory`); machine-local files stay under `.opencode/memory/`.
  */
 export declare function createMemoryTools(config: PluginConfig, logger: Logger, deps?: ToolDeps): MemoryToolSet;
 export {};

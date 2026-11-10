@@ -8,7 +8,7 @@ Project-scoped persistent memory for [OpenCode](https://opencode.ai). The LLM au
 
 - Five tools (`memory_add`, `memory_update`, `memory_delete`, `memory_read`, `memory_review`) are registered with OpenCode and available to the LLM during every session
 - A compact summary of all active memories is injected into every system prompt automatically
-- Memory is stored as plain Markdown in `<projectDir>/.opencode/memory/MEMORY.md` — human-readable and inspectable at any time
+- Memory is stored as plain Markdown in `<projectDir>/.agents/memory/MEMORY.md` — human-readable, inspectable, and safe to commit
 - When a new memory may overlap an existing one, the LLM can request an immediate model-judged check with `memory_review` and `refresh: true`
 - An optional background audit runs after a session goes idle and records possible conflicts for review. It never edits memory itself.
 
@@ -50,6 +50,7 @@ After installing or upgrading, fully quit and restart OpenCode — plugins are l
 | `staleDays` | `number` | `90` | Entries not touched for this long are listed as "aging" in `memory_review`. Informational only; nothing is archived. |
 | `backgroundAudit` | `boolean` | `true` | Run the semantic consistency audit after sessions go idle. |
 | `auditIntervalMinutes` | `number` | `60` | Minimum minutes between two audits. |
+| `storeDir` | `string` | `.agents/memory` | Directory (relative to the project root) holding the shared `MEMORY.md`. Must be a relative path inside the project — `..`, absolute, and empty values are ignored. |
 | `auditModel` | `string` | host default | OpenCode 2.x only. Model for the background audit, as `"providerID/modelID"` (e.g. `"bailian-payg/qwen3.7-plus"`). Set it if the host default model is unavailable to you. |
 
 ```jsonc
@@ -61,17 +62,29 @@ After installing or upgrading, fully quit and restart OpenCode — plugins are l
 
 ## Storage
 
-The plugin creates `.opencode/memory/` automatically on first write — no manual setup needed.
+Storage is split into a **shared** store (safe to commit) and **machine-local** auto-generated files. Both directories are created automatically on first write — no manual setup needed.
 
 ```
 <projectDir>/
-  .opencode/
+  .agents/
     memory/
-      MEMORY.md          # main store — LLM writes here, you can edit too
+      MEMORY.md          # shared store — LLM writes here, you can edit too, and it's safe to commit
+  .opencode/
+    memory/              # machine-local — gitignore this
       memory_summary.md  # compact index — auto-generated, do not edit
       review.json        # audit findings and dismissals — auto-managed, do not edit
       plugin.log         # operation log (add/update/delete/audit + errors), if enableLog=true
 ```
+
+The shared store lives in `.agents/memory/` by default, so `.opencode/` (which is commonly gitignored) never hides your memories. Override the location with the `storeDir` option — for example `{ "storeDir": "memory" }` puts it at `<projectDir>/memory/MEMORY.md`.
+
+### Migration from the old location
+
+On first run, if `.agents/memory/MEMORY.md` does not exist but the legacy `.opencode/memory/MEMORY.md` does, the plugin moves the legacy file into the new shared location (creating the directory as needed). If the new file already exists, nothing is moved. A failed migration is logged and never blocks startup.
+
+### Secret scanning
+
+Before `memory_add` and `memory_update` write anything, the plugin scans the title and content for credential patterns (AWS keys, GitHub/OpenAI/Anthropic tokens, private key blocks, connection strings, Stripe keys, JWTs, Slack tokens, generic API keys). If a pattern is found the write is rejected with a "Memory not saved" result naming the secret type — the value is never echoed — and the model is told to rewrite without credentials.
 
 Each entry looks like:
 

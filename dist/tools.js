@@ -2,12 +2,14 @@ import { tool } from "@opencode-ai/plugin/tool";
 import { MEMORY_WRITE_POLICY } from "./prompt.js";
 // Use the zod instance bundled with @opencode-ai/plugin to avoid version conflicts
 const z = tool.schema;
-import { readStore, writeStore, addEntry, addSupersedingEntry, updateEntry, archiveEntry, searchEntries, } from "./storage.js";
+import { readStore, writeStore, addEntry, addSupersedingEntry, updateEntry, archiveEntry, searchEntries, StoreWriteError, } from "./storage.js";
+import { detectSecrets } from "./secret.js";
 import { writeSummary } from "./summary.js";
 import { activeEntries, collectAttention, dismissItems, findAging, formatReview, readReviewState, writeReviewState, } from "./review.js";
 /**
  * Create all five memory tools bound to the given plugin config and logger.
- * Each tool reads and writes from `<projectDir>/.opencode/memory/MEMORY.md`.
+ * Each tool reads and writes the shared store at `<projectDir>/<storeDir>/MEMORY.md`
+ * (default `.agents/memory`); machine-local files stay under `.opencode/memory/`.
  */
 export function createMemoryTools(config, logger, deps = {}) {
     // ── memory_add ────────────────────────────────────────────────────────────
@@ -37,7 +39,15 @@ To REPLACE an existing memory, pass its ID in supersedes. The old entry is archi
         },
         async execute({ title, content, tags, supersedes }, context) {
             try {
-                const store = await readStore(context.directory);
+                const secrets = detectSecrets(`${title}\n${content}`);
+                if (secrets.length > 0) {
+                    await logger.info("memory_add", "rejected: secret scan");
+                    return {
+                        title: "Memory not saved",
+                        output: `The content appears to contain a credential (${secrets.join(", ")}). It was not saved. Rewrite without credentials — never store secrets or tokens in project memory.`,
+                    };
+                }
+                const store = await readStore(context.directory, config.storeDir);
                 let updated = store;
                 let id;
                 let archivedIds = [];
@@ -59,7 +69,7 @@ To REPLACE an existing memory, pass its ID in supersedes. The old entry is archi
                     updated = r.store;
                     id = r.id;
                 }
-                await writeStore(context.directory, updated);
+                await writeStore(context.directory, updated, config.storeDir);
                 await writeSummary(context.directory, updated, config.maxSummaryChars);
                 await logger.info("memory_add", `${id}: ${title}${archivedIds.length ? ` (supersedes ${archivedIds.join(", ")})` : ""}`);
                 const out = [`Saved as [${id}]: ${title}`, "", "Content:", content];
@@ -72,6 +82,10 @@ To REPLACE an existing memory, pass its ID in supersedes. The old entry is archi
                 return { title: `Memory saved: ${id}`, output: out.join("\n") };
             }
             catch (err) {
+                if (err instanceof StoreWriteError) {
+                    await logger.info("memory_add", "rejected: store not writable");
+                    return { title: "Memory not saved", output: err.message };
+                }
                 await logger.error("memory_add", err);
                 throw err;
             }
@@ -98,7 +112,16 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
         },
         async execute({ id, title, content, tags }, context) {
             try {
-                const store = await readStore(context.directory);
+                const scanText = [title, content].filter((x) => x !== undefined).join("\n");
+                const secrets = detectSecrets(scanText);
+                if (secrets.length > 0) {
+                    await logger.info("memory_update", "rejected: secret scan");
+                    return {
+                        title: "Memory not saved",
+                        output: `The content appears to contain a credential (${secrets.join(", ")}). It was not saved. Rewrite without credentials — never store secrets or tokens in project memory.`,
+                    };
+                }
+                const store = await readStore(context.directory, config.storeDir);
                 const before = store.entries.find((e) => e.id === id && !e.archived);
                 const updated = updateEntry(store, id, {
                     ...(title !== undefined ? { title } : {}),
@@ -112,7 +135,7 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
                         output: `No active memory with ID ${id}. Use memory_read to list all active memories.`,
                     };
                 }
-                await writeStore(context.directory, updated);
+                await writeStore(context.directory, updated, config.storeDir);
                 await writeSummary(context.directory, updated, config.maxSummaryChars);
                 const entry = updated.entries.find((e) => e.id === id);
                 const changed = before && (before.title !== entry.title || before.content !== entry.content);
@@ -125,6 +148,10 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
                 };
             }
             catch (err) {
+                if (err instanceof StoreWriteError) {
+                    await logger.info("memory_update", "rejected: store not writable");
+                    return { title: "Memory not saved", output: err.message };
+                }
                 await logger.error("memory_update", err);
                 throw err;
             }
@@ -155,7 +182,7 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
         },
         async execute({ id, reason, superseded_by }, context) {
             try {
-                const store = await readStore(context.directory);
+                const store = await readStore(context.directory, config.storeDir);
                 if (superseded_by) {
                     if (superseded_by === id || !store.entries.some((e) => e.id === superseded_by && !e.archived)) {
                         return {
@@ -175,7 +202,7 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
                         output: `No active memory with ID ${id}. Use memory_read to list all active memories.`,
                     };
                 }
-                await writeStore(context.directory, updated);
+                await writeStore(context.directory, updated, config.storeDir);
                 await writeSummary(context.directory, updated, config.maxSummaryChars);
                 const reasonNote = reason ? ` (reason: ${reason})` : "";
                 const linkNote = superseded_by ? ` (superseded by ${superseded_by})` : "";
@@ -190,6 +217,10 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
                 };
             }
             catch (err) {
+                if (err instanceof StoreWriteError) {
+                    await logger.info("memory_delete", "rejected: store not writable");
+                    return { title: "Memory not saved", output: err.message };
+                }
                 await logger.error("memory_delete", err);
                 throw err;
             }
@@ -217,7 +248,7 @@ Returns all active entries, or only those matching the search query. Archived en
                 .describe("Also list archived entries with their archive date, reason and replacement. Default false."),
         },
         async execute({ query, include_archived }, context) {
-            const store = await readStore(context.directory);
+            const store = await readStore(context.directory, config.storeDir);
             const entries = query ? searchEntries(store, query) : store.entries.filter((e) => !e.archived);
             const q = query?.toLowerCase();
             const archived = include_archived
@@ -301,7 +332,7 @@ For each item decide, then act with the other memory tools: merge or replace wit
                         notes.push(`Audit run: ${await deps.runAuditNow()}.`);
                     }
                 }
-                const store = await readStore(context.directory);
+                const store = await readStore(context.directory, config.storeDir);
                 let state = await readReviewState(context.directory);
                 if (dismiss && dismiss.length > 0) {
                     const out = dismissItems(store, state, dismiss);

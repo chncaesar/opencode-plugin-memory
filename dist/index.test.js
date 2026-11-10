@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
-import { parseAuditModel, server, setup } from "./plugin.js";
+import { parseAuditModel, resolveConfig, server, setup } from "./plugin.js";
 import defaultExport from "./index.js";
 import { addEntry, writeStore } from "./storage.js";
 import { emptyReviewState, hashEntries, writeReviewState } from "./review.js";
@@ -41,6 +41,20 @@ function seedStore(dir) {
     s = addEntry(s, "Rule two", "two").store;
     return writeStore(dir, s);
 }
+describe("resolveConfig storeDir", () => {
+    it("defaults to .agents/memory", () => {
+        assert.equal(resolveConfig().storeDir, ".agents/memory");
+        assert.equal(resolveConfig({}).storeDir, ".agents/memory");
+    });
+    it("accepts a relative override", () => {
+        assert.equal(resolveConfig({ storeDir: "memory" }).storeDir, "memory");
+    });
+    it("rejects .., absolute and empty values", () => {
+        assert.equal(resolveConfig({ storeDir: "../escape" }).storeDir, ".agents/memory");
+        assert.equal(resolveConfig({ storeDir: "/abs/path" }).storeDir, ".agents/memory");
+        assert.equal(resolveConfig({ storeDir: "" }).storeDir, ".agents/memory");
+    });
+});
 describe("plugin entry", () => {
     it("registers five tools, config, event and system transform hooks", async () => {
         await withDir(async (dir) => {

@@ -24,20 +24,28 @@ src/
   audit.ts        Background audit: prompt, parse, guards, scheduler
   auditAgent.ts   Registers the restricted `memory-audit` agent
   prompt.ts       Shared memory-writing policy and behavior examples
+  secret.ts       Credential-pattern scanning that blocks secret-bearing writes
   summary.ts      memory_summary.md builder and system-prompt block
   types.ts        MemoryEntry, MemoryStore, PluginConfig types
 ```
 
 ## Storage Format
 
-All files live under `<projectDir>/.opencode/memory/`:
+Storage is split into a shared (committable) store and machine-local auto-generated files.
 
-- `MEMORY.md` — main store, human-readable, LLM-writable
+Shared store (safe to commit):
+- `<projectDir>/.agents/memory/MEMORY.md` — main store, human-readable, LLM-writable. Location overridden by the `storeDir` option (a relative path inside the project).
+
+Machine-local (under `<projectDir>/.opencode/memory/`, gitignore it):
 - `memory_summary.md` — compact index injected into system prompt (auto-generated, never edit manually)
 - `review.json` — audit findings and dismissals, hash-scoped to the entries they describe (auto-managed)
 - `plugin.log` — append-only operation log (created when `enableLog=true`, which is the default)
 
-The `.opencode/memory/` directory is created automatically on first write — no manual setup needed.
+Both directories are created automatically on first write — no manual setup needed.
+
+One-time migration: at plugin init (both the V1 `server` and V2 `setup` entries), if `.agents/memory/MEMORY.md` does not exist but the legacy `.opencode/memory/MEMORY.md` does, the legacy file is `fs.rename`d into the shared location (target dir created first). If the new file already exists, nothing is moved. Migration failures are caught and logged, never fatal.
+
+Secret scanning: `memory_add` and `memory_update` scan `title` + `content` for credential patterns (see `src/secret.ts`) before any write. A match rejects the write with a "Memory not saved" result naming the secret type (never the value) and telling the model to rewrite without credentials. Logged with detail `rejected: secret scan`.
 
 ### MEMORY.md structure
 
@@ -128,6 +136,7 @@ Available options (all optional):
 - `staleDays` (number, default 90): Age threshold for the informational "aging" list in `memory_review`.
 - `backgroundAudit` (boolean, default true): Run the consistency audit after sessions go idle.
 - `auditIntervalMinutes` (number, default 60): Minimum minutes between audits.
+- `storeDir` (string, default `.agents/memory`): Directory (relative to the project root) holding the shared `MEMORY.md`. Must stay inside the project — `..`, absolute, and empty values are ignored.
 
 ## Key Implementation Details
 

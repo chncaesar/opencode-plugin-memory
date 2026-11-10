@@ -1,5 +1,8 @@
 import { describe, it } from "node:test"
 import assert from "node:assert/strict"
+import fs from "fs/promises"
+import os from "os"
+import path from "path"
 import {
   parseMemory,
   serializeMemory,
@@ -9,6 +12,13 @@ import {
   addSupersedingEntry,
   resolveSuccessor,
   searchEntries,
+  storeDir,
+  memoryFilePath,
+  validStoreDir,
+  writeStore,
+  readStore,
+  migrateLegacyStore,
+  StoreWriteError,
 } from "./storage.js"
 import type { MemoryStore } from "./types.js"
 
@@ -501,5 +511,113 @@ describe("addSupersedingEntry", () => {
       ],
     }
     assert.ok(resolveSuccessor(store, "MEM-001"))
+  })
+})
+
+// ─── store paths ─────────────────────────────────────────────────────────────
+
+async function withDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mem-store-"))
+  try {
+    return await fn(dir)
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+}
+
+describe("storeDir", () => {
+  it("defaults to .agents/memory", () => {
+    assert.equal(storeDir("/proj"), path.join("/proj", ".agents/memory"))
+    assert.equal(memoryFilePath("/proj"), path.join("/proj", ".agents/memory/MEMORY.md"))
+  })
+
+  it("honours a relative override", () => {
+    assert.equal(storeDir("/proj", "memory"), path.join("/proj", "memory"))
+    assert.equal(memoryFilePath("/proj", "memory"), path.join("/proj", "memory/MEMORY.md"))
+  })
+})
+
+describe("validStoreDir", () => {
+  it("accepts relative paths", () => {
+    assert.equal(validStoreDir("memory"), "memory")
+    assert.equal(validStoreDir(".agents/memory"), ".agents/memory")
+  })
+
+  it("rejects .., absolute and empty values", () => {
+    assert.equal(validStoreDir("../escape"), undefined)
+    assert.equal(validStoreDir("a/../../b"), undefined)
+    assert.equal(validStoreDir("/abs/path"), undefined)
+    assert.equal(validStoreDir(""), undefined)
+    assert.equal(validStoreDir("   "), undefined)
+    assert.equal(validStoreDir(42), undefined)
+    assert.equal(validStoreDir(undefined), undefined)
+  })
+})
+
+describe("writeStore paths", () => {
+  it("writes the store to .agents/memory/MEMORY.md by default", async () => {
+    await withDir(async (dir) => {
+      await writeStore(dir, { entries: [], nextSeq: 1 })
+      const text = await fs.readFile(path.join(dir, ".agents/memory/MEMORY.md"), "utf8")
+      assert.match(text, /# OpenCode Memory/)
+      assert.equal((await readStore(dir)).entries.length, 0)
+    })
+  })
+
+  it("writes to a custom relative dir when overridden", async () => {
+    await withDir(async (dir) => {
+      await writeStore(dir, { entries: [], nextSeq: 1 }, "memory")
+      await fs.access(path.join(dir, "memory/MEMORY.md"))
+      assert.equal((await readStore(dir, "memory")).entries.length, 0)
+    })
+  })
+})
+
+describe("migrateLegacyStore", () => {
+  it("renames a legacy store into the shared location when the new file is absent", async () => {
+    await withDir(async (dir) => {
+      await fs.mkdir(path.join(dir, ".opencode/memory"), { recursive: true })
+      await fs.writeFile(path.join(dir, ".opencode/memory/MEMORY.md"), "# OpenCode Memory\n<!-- nextSeq: 3 -->\n", "utf8")
+      await migrateLegacyStore(dir)
+      const moved = await fs.readFile(path.join(dir, ".agents/memory/MEMORY.md"), "utf8")
+      assert.match(moved, /nextSeq: 3/)
+      await assert.rejects(fs.access(path.join(dir, ".opencode/memory/MEMORY.md")))
+    })
+  })
+
+  it("leaves both files untouched when the new store already exists", async () => {
+    await withDir(async (dir) => {
+      await fs.mkdir(path.join(dir, ".opencode/memory"), { recursive: true })
+      await fs.writeFile(path.join(dir, ".opencode/memory/MEMORY.md"), "legacy", "utf8")
+      await fs.mkdir(path.join(dir, ".agents/memory"), { recursive: true })
+      await fs.writeFile(path.join(dir, ".agents/memory/MEMORY.md"), "new", "utf8")
+      await migrateLegacyStore(dir)
+      assert.equal(await fs.readFile(path.join(dir, ".agents/memory/MEMORY.md"), "utf8"), "new")
+      assert.equal(await fs.readFile(path.join(dir, ".opencode/memory/MEMORY.md"), "utf8"), "legacy")
+    })
+  })
+
+  it("is a no-op when there is no legacy store", async () => {
+    await withDir(async (dir) => {
+      await migrateLegacyStore(dir)
+      await assert.rejects(fs.access(path.join(dir, ".agents/memory/MEMORY.md")))
+    })
+  })
+})
+
+describe("writeStore error handling", () => {
+  it("throws a clean StoreWriteError when the store path is not writable", async () => {
+    // A projectDir that is a file (not a directory) makes the mkdir fail with
+    // ENOTDIR, which writeStore maps to a user-facing StoreWriteError.
+    const file = path.join(os.tmpdir(), `mem-notdir-${process.pid}`)
+    await fs.writeFile(file, "x", "utf8")
+    try {
+      await assert.rejects(
+        writeStore(file, { entries: [], nextSeq: 1 }),
+        (err: unknown) => err instanceof StoreWriteError && /not writable/.test((err as Error).message),
+      )
+    } finally {
+      await fs.rm(file, { force: true })
+    }
   })
 })

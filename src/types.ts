@@ -67,6 +67,13 @@ export type PluginConfig = {
    * @default 60
    */
   auditIntervalMinutes: number
+  /**
+   * Directory (relative to the project root) holding the shared, committable
+   * memory store `MEMORY.md`. Must be a non-empty relative path that stays
+   * inside the project (no `..`, not absolute).
+   * @default ".agents/memory"
+   */
+  storeDir: string
 }
 
 export const DEFAULT_CONFIG: PluginConfig = {
@@ -75,4 +82,5 @@ export const DEFAULT_CONFIG: PluginConfig = {
   staleDays: 90,
   backgroundAudit: true,
   auditIntervalMinutes: 60,
+  storeDir: ".agents/memory",
 }

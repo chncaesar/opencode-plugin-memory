@@ -19,9 +19,9 @@ export declare function resolveConfig(options?: PluginOptions): PluginConfig;
  * A background audit runs after sessions go idle and records possible memory
  * conflicts in review.json; it never edits MEMORY.md.
  *
- * Storage: <projectDir>/.opencode/memory/MEMORY.md
- * Summary: <projectDir>/.opencode/memory/memory_summary.md
- * Review:  <projectDir>/.opencode/memory/review.json
+ * Storage: <projectDir>/.agents/memory/MEMORY.md (committable; `storeDir` overrides)
+ * Summary: <projectDir>/.opencode/memory/memory_summary.md (machine-local)
+ * Review:  <projectDir>/.opencode/memory/review.json (machine-local)
  */
 export declare const server: Plugin;
 /** Minimal structural view of the V2 plugin context; only what this plugin uses. */

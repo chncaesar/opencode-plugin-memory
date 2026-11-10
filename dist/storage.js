@@ -1,22 +1,52 @@
 import fs from "fs/promises";
 import path from "path";
-// File names inside the project memory directory
+// Machine-local files (never committed) live under `.opencode/memory/`.
 const MEMORY_DIR = ".opencode/memory";
 const MEMORY_FILE = "MEMORY.md";
 const SUMMARY_FILE = "memory_summary.md";
+// The shared, committable store lives in its own directory (`.agents/memory` by
+// default) so it is not swallowed by `.opencode/` gitignores.
+const DEFAULT_STORE_DIR = ".agents/memory";
 // Section headings in MEMORY.md
 const ACTIVE_HEADING = "## Active";
 const ARCHIVED_HEADING = "## Archived";
 // Entry block separator: ### [MEM-NNN] Title
 const ENTRY_HEADING_RE = /^### \[(MEM-\d+)\] (.+)$/;
 /**
- * Resolve the .opencode/memory directory for a given project root.
+ * Resolve the machine-local `.opencode/memory` directory for a given project
+ * root. Holds the auto-generated files only (`memory_summary.md`, `review.json`,
+ * `plugin.log`) — not the committable store.
  */
 export function memoryDir(projectDir) {
     return path.join(projectDir, MEMORY_DIR);
 }
-export function memoryFilePath(projectDir) {
-    return path.join(memoryDir(projectDir), MEMORY_FILE);
+/**
+ * Resolve the shared (committable) memory store directory. Defaults to
+ * `.agents/memory`; `override` is a relative directory name (e.g. `"memory"`)
+ * from the project root.
+ */
+export function storeDir(projectDir, override) {
+    return path.join(projectDir, override && override !== "" ? override : DEFAULT_STORE_DIR);
+}
+/**
+ * Validate a user-supplied `storeDir` override. Returns the value when it is a
+ * non-empty relative path that stays inside the project root (no `..` segment,
+ * not absolute); otherwise `undefined` (callers fall back to the default).
+ */
+export function validStoreDir(value) {
+    if (typeof value !== "string")
+        return undefined;
+    const trimmed = value.trim();
+    if (trimmed === "")
+        return undefined;
+    if (path.isAbsolute(trimmed))
+        return undefined;
+    if (trimmed.split(/[\\/]+/).some((seg) => seg === ".."))
+        return undefined;
+    return trimmed;
+}
+export function memoryFilePath(projectDir, storeDirOverride) {
+    return path.join(storeDir(projectDir, storeDirOverride), MEMORY_FILE);
 }
 export function summaryFilePath(projectDir) {
     return path.join(memoryDir(projectDir), SUMMARY_FILE);
@@ -191,8 +221,8 @@ function serializeEntry(e) {
 /**
  * Read and parse MEMORY.md, returning an empty store if the file does not exist.
  */
-export async function readStore(projectDir) {
-    const filePath = memoryFilePath(projectDir);
+export async function readStore(projectDir, storeDirOverride) {
+    const filePath = memoryFilePath(projectDir, storeDirOverride);
     try {
         const text = await fs.readFile(filePath, "utf8");
         return parseMemory(text);
@@ -205,12 +235,62 @@ export async function readStore(projectDir) {
     }
 }
 /**
- * Write the store back to MEMORY.md, creating the directory if needed.
+ * Thrown when the store cannot be written because its path is unwritable or
+ * read-only (e.g. projectDir is `/` or a read-only filesystem). Carries a
+ * clean, user-facing message; tools catch it and return that message instead of
+ * surfacing a raw EACCES.
  */
-export async function writeStore(projectDir, store) {
-    const dir = memoryDir(projectDir);
-    await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(memoryFilePath(projectDir), serializeMemory(store), "utf8");
+export class StoreWriteError extends Error {
+    constructor(message, cause) {
+        super(message, cause === undefined ? undefined : { cause });
+        this.name = "StoreWriteError";
+    }
+}
+/**
+ * Write the store back to MEMORY.md, creating the directory if needed.
+ * Unwritable/read-only paths raise a descriptive StoreWriteError.
+ */
+export async function writeStore(projectDir, store, storeDirOverride) {
+    const dir = storeDir(projectDir, storeDirOverride);
+    const filePath = memoryFilePath(projectDir, storeDirOverride);
+    try {
+        await fs.mkdir(dir, { recursive: true });
+        await fs.writeFile(filePath, serializeMemory(store), "utf8");
+    }
+    catch (err) {
+        if (isNodeError(err) &&
+            (err.code === "EACCES" || err.code === "EPERM" || err.code === "EROFS" || err.code === "ENOTDIR")) {
+            throw new StoreWriteError(`Cannot save memory: the store path "${filePath}" is not writable. Memory is project-scoped, so OpenCode must run inside a writable project directory (not "/" or a read-only filesystem).`, err);
+        }
+        throw err;
+    }
+}
+/**
+ * One-time migration: if the shared store file does not exist but the legacy
+ * `.opencode/memory/MEMORY.md` does, move it into place (creating the target
+ * directory first). No-op when the new file already exists or there is no
+ * legacy file. Throws on unexpected I/O errors; callers log and swallow.
+ */
+export async function migrateLegacyStore(projectDir, storeDirOverride) {
+    const legacy = path.join(memoryDir(projectDir), MEMORY_FILE);
+    const target = memoryFilePath(projectDir, storeDirOverride);
+    if (await fileExists(target))
+        return;
+    if (!(await fileExists(legacy)))
+        return;
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.rename(legacy, target);
+}
+async function fileExists(p) {
+    try {
+        await fs.access(p);
+        return true;
+    }
+    catch (err) {
+        if (isNodeError(err) && err.code === "ENOENT")
+            return false;
+        throw err;
+    }
 }
 // ─── CRUD operations ─────────────────────────────────────────────────────────
 /**

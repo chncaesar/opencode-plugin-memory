@@ -78,6 +78,30 @@ describe("memory_add", () => {
             assert.match(await fs.readFile(path.join(dir, ".opencode/memory/memory_summary.md"), "utf8"), /Hello/);
         });
     });
+    it("rejects content containing a credential pattern and writes nothing", async () => {
+        await withDir(async (dir) => {
+            const token = `ghp_${"a".repeat(36)}`;
+            const r = await run(tools.memory_add, { title: "leak", content: `my token is ${token}` }, dir);
+            assert.equal(r.title, "Memory not saved");
+            assert.match(r.output, /GitHub token/);
+            assert.doesNotMatch(r.output, new RegExp(token));
+            await assert.rejects(fs.access(path.join(dir, ".agents/memory/MEMORY.md")));
+            assert.ok(lines.some((l) => l.startsWith("memory_add") && l.includes("secret scan")));
+        });
+    });
+    it("returns a clean message when the store directory is not writable", async () => {
+        const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mem-tool-ro-"));
+        try {
+            await fs.chmod(dir, 0o555);
+            const r = await run(tools.memory_add, { title: "t", content: "c" }, dir);
+            assert.equal(r.title, "Memory not saved");
+            assert.match(r.output, /not writable/);
+        }
+        finally {
+            await fs.chmod(dir, 0o755);
+            await fs.rm(dir, { recursive: true, force: true });
+        }
+    });
 });
 describe("memory_delete", () => {
     it("stores the reason and replacement on the archived entry", async () => {

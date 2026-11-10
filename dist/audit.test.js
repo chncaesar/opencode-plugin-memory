@@ -256,9 +256,9 @@ describe("runAudit", () => {
         await withDir(async (dir) => {
             const s = mkStore("A", "B");
             await writeStore(dir, s);
-            const before = await fs.readFile(path.join(dir, ".opencode/memory/MEMORY.md"), "utf8");
+            const before = await fs.readFile(path.join(dir, ".agents/memory/MEMORY.md"), "utf8");
             await runAudit({ directory: dir, config: cfg(), logger: quietLogger, call: async () => reply });
-            assert.equal(await fs.readFile(path.join(dir, ".opencode/memory/MEMORY.md"), "utf8"), before);
+            assert.equal(await fs.readFile(path.join(dir, ".agents/memory/MEMORY.md"), "utf8"), before);
             assert.equal((await readStore(dir)).entries.length, 2);
         });
     });

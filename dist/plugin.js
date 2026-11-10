@@ -1,7 +1,7 @@
 import { DEFAULT_CONFIG } from "./types.js";
 import { createMemoryTools } from "./tools.js";
 import { buildSystemPrompt } from "./summary.js";
-import { readStore } from "./storage.js";
+import { migrateLegacyStore, readStore, validStoreDir } from "./storage.js";
 import { createLogger } from "./logging.js";
 import { collectAttention, nudgeLine, readReviewState } from "./review.js";
 import { createAuditScheduler, createSdkModelCall } from "./audit.js";
@@ -34,6 +34,7 @@ export function resolveConfig(options) {
         auditIntervalMinutes: typeof raw["auditIntervalMinutes"] === "number" && raw["auditIntervalMinutes"] > 0
             ? raw["auditIntervalMinutes"]
             : DEFAULT_CONFIG.auditIntervalMinutes,
+        storeDir: validStoreDir(raw["storeDir"]) ?? DEFAULT_CONFIG.storeDir,
     };
 }
 /**
@@ -47,14 +48,22 @@ export function resolveConfig(options) {
  * A background audit runs after sessions go idle and records possible memory
  * conflicts in review.json; it never edits MEMORY.md.
  *
- * Storage: <projectDir>/.opencode/memory/MEMORY.md
- * Summary: <projectDir>/.opencode/memory/memory_summary.md
- * Review:  <projectDir>/.opencode/memory/review.json
+ * Storage: <projectDir>/.agents/memory/MEMORY.md (committable; `storeDir` overrides)
+ * Summary: <projectDir>/.opencode/memory/memory_summary.md (machine-local)
+ * Review:  <projectDir>/.opencode/memory/review.json (machine-local)
  */
 export const server = async (input, options) => {
     const config = resolveConfig(options);
     const directory = input.directory;
     const logger = createLogger(directory, config.enableLog);
+    // One-time migration of a legacy `.opencode/memory/MEMORY.md` into the new
+    // shared store location. Failure is logged, never fatal.
+    try {
+        await migrateLegacyStore(directory, config.storeDir);
+    }
+    catch (err) {
+        await logger.error("migration", err);
+    }
     // Throwaway sessions created by the background audit. Hooks ignore them so
     // the audit neither injects memory into itself nor triggers further audits.
     const auditSessions = new Set();
@@ -89,7 +98,7 @@ export const server = async (input, options) => {
         "experimental.chat.system.transform": async (hookInput, output) => {
             if (hookInput.sessionID && auditSessions.has(hookInput.sessionID))
                 return;
-            const store = await readStore(directory);
+            const store = await readStore(directory, config.storeDir);
             const nudge = nudgeLine(collectAttention(store, await readReviewState(directory)));
             output.system.push(buildSystemPrompt(store, config.maxSummaryChars, nudge));
         },
@@ -122,6 +131,14 @@ export async function setup(ctx) {
     const auditModel = parseAuditModel(ctx.options?.["auditModel"]);
     const directory = ctx.location.directory;
     const logger = createLogger(directory, config.enableLog);
+    // One-time migration of a legacy `.opencode/memory/MEMORY.md` into the new
+    // shared store location. Failure is logged, never fatal.
+    try {
+        await migrateLegacyStore(directory, config.storeDir);
+    }
+    catch (err) {
+        await logger.error("migration", err);
+    }
     const call = async (system, prompt) => {
         let timer;
         const timeout = new Promise((_, reject) => {
@@ -157,7 +174,7 @@ export async function setup(ctx) {
         }
     }));
     registrations.push(await ctx.session.hook("context", async (event) => {
-        const store = await readStore(directory);
+        const store = await readStore(directory, config.storeDir);
         const nudge = nudgeLine(collectAttention(store, await readReviewState(directory)));
         event.system.push({ type: "text", text: buildSystemPrompt(store, config.maxSummaryChars, nudge) });
     }));
