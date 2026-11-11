@@ -10,6 +10,9 @@ author: unknown
 source: migrated from legacy MEMORY.md
 proposed_at: 2026-10-29
 approved_at: 2026-10-29
+superseded_by: mem-zTn7DIhb
+retired_at: 2026-11-11T09:13:13.137Z
+retired_reason: superseded
 ---
 Verified in OpenCode 1.18.29 source and with a live server probe.
 
