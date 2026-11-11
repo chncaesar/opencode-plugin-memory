@@ -9,19 +9,22 @@ import { type PluginConfig } from "./types.js";
  */
 export declare function resolveConfig(options?: PluginOptions): PluginConfig;
 /**
- * opencode-plugin-memory — project-scoped persistent memory
+ * opencode-plugin-memory — PR-gated project memory.
  *
- * Provides five tools (memory_add, memory_update, memory_delete, memory_read,
- * memory_review) and injects a compact memory summary into every system prompt
- * so the LLM always knows what has been remembered without needing to read the
- * full file.
+ * The agent only PROPOSES memories by writing files into `.memory/staging/`. A
+ * bot (see bot.ts) turns those into pull requests; a human merges them; merged
+ * memories live under `memory/active/` and are indexed in `memory/_summary.md`,
+ * which is the only memory content injected into the system prompt.
  *
- * A background audit runs after sessions go idle and records possible memory
- * conflicts in review.json; it never edits MEMORY.md.
+ * A background semantic audit runs after sessions go idle and asks a model to
+ * flag duplicate / refining / contradicting memories; each finding becomes a
+ * retirement proposal, which the bot turns into a PR.
  *
- * Storage: <projectDir>/.agents/memory/MEMORY.md (committable; `storeDir` overrides)
- * Summary: <projectDir>/.opencode/memory/memory_summary.md (machine-local)
- * Review:  <projectDir>/.opencode/memory/review.json (machine-local)
+ * Layout:
+ *   .memory/staging/   machine-local proposals (git-ignored)
+ *   memory/active/     merged truth
+ *   memory/retired/    retired memories
+ *   memory/_summary.md committed one-line-per-active index
  */
 export declare const server: Plugin;
 /** Minimal structural view of the V2 plugin context; only what this plugin uses. */

@@ -1,14 +1,25 @@
-import type { MemoryEntry, MemoryStore, PluginConfig } from "./types.js";
+import type { Memory, PluginConfig, RetiredReason } from "./types.js";
 import type { Logger } from "./logging.js";
-import { type Finding } from "./review.js";
 export declare const AUDIT_SYSTEM_PROMPT: string;
-export declare function buildAuditPrompt(entries: MemoryEntry[]): string;
+export declare function buildAuditPrompt(memories: Memory[]): string;
+export type AuditFinding = {
+    relation: "duplicate" | "refinement" | "contradiction";
+    /** ID of the active memory the audit proposes retiring. */
+    retire: string;
+    /** For a refinement, the broader active memory that subsumes the retired one. */
+    supersededBy?: string;
+    reason: string;
+};
 /**
  * Turn a model reply into validated findings. Anything malformed or referring
- * to unknown/archived IDs is dropped. Returns null when the reply is not a
- * usable audit result at all (so the caller can treat it as a failed run).
+ * to unknown IDs is dropped. Returns null when the reply is not a usable audit
+ * result at all (so the caller can treat it as a failed run).
  */
-export declare function parseAuditResponse(text: string, store: MemoryStore): Finding[] | null;
+export declare function parseAuditResponse(text: string, active: Memory[]): AuditFinding[] | null;
+/** Map a finding relation onto the fixed retirement vocabulary. */
+export declare function relationToReason(relation: AuditFinding["relation"]): RetiredReason;
+/** Stable hash of the active memories' text (order-independent). */
+export declare function activeHash(memories: Memory[]): string;
 /** Sends system + user text to a model and returns the reply text. Throws on failure. */
 export type ModelCall = (system: string, prompt: string) => Promise<string>;
 export type AuditOutcome = "disabled" | "skipped-unchanged" | "skipped-interval" | "skipped-too-few" | "skipped-too-many" | "discarded-changed" | "failed" | "done";
@@ -25,6 +36,9 @@ export type AuditDeps = {
  * Run one audit if the guards allow it. Never throws. Guards, in order:
  * enabled, at least two active entries, not too many entries, entries changed
  * since the last completed audit, minimum interval since the last attempt.
+ *
+ * On success, each finding becomes an `intent: retire` staging proposal (with
+ * `superseded_by` for refinements) so the bot can open a PR for it.
  */
 export declare function runAudit(deps: AuditDeps): Promise<AuditOutcome>;
 /** The slice of the OpenCode SDK client the audit uses. */

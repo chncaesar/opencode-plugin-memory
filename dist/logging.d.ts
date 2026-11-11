@@ -5,7 +5,8 @@ export type Logger = {
 };
 /**
  * Create a logger that appends structured entries to
- * <projectDir>/.opencode/memory/plugin.log.
+ * <projectDir>/.memory/plugin.log (machine-local; kept out of the committed
+ * `memory/` tree).
  *
  * When enabled=false, all methods are no-ops.
  */

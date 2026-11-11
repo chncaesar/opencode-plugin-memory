@@ -1,19 +1,9 @@
-import type { MemoryEntry, MemoryStore, PluginConfig } from "./types.js"
+import crypto from "crypto"
+import fs from "fs/promises"
+import path from "path"
+import type { Memory, PluginConfig, RetiredReason } from "./types.js"
 import type { Logger } from "./logging.js"
-import { readStore } from "./storage.js"
-import {
-  RELATIONS,
-  activeEntries,
-  clip,
-  findingKey,
-  hashActive,
-  hashEntries,
-  pruneState,
-  readReviewState,
-  writeReviewState,
-  type Finding,
-  type Relation,
-} from "./review.js"
+import { listActiveMemories, listStagedProposals, machineDir, writeProposal } from "./storage.js"
 import { AUDIT_AGENT_NAME } from "./auditAgent.js"
 
 /**
@@ -21,14 +11,18 @@ import { AUDIT_AGENT_NAME } from "./auditAgent.js"
  *
  * After a session goes idle, and only if the set of active memories changed
  * since the last audit and enough time has passed, a model is asked whether any
- * memories duplicate, refine or contradict each other. Findings go to
- * review.json and reach the main LLM through a one-line system-prompt hint and
- * the memory_review tool. The audit never edits MEMORY.md.
+ * memories duplicate, refine or contradict each other. Each finding becomes an
+ * `intent: retire` proposal in staging, which the bot turns into a PR — the
+ * human reviews and merges. There is no review.json: the PR is the durable
+ * record of the suggestion and its outcome.
+ *
+ * The audit never edits `memory/active/` or `_summary.md`.
  */
 
-// ─── Prompt and response handling ────────────────────────────────────────────
-
 const MAX_ACTIVE_ENTRIES = 200
+const AUDIT_STATE_FILE = "audit-state.json"
+
+// ─── Prompt and response handling ────────────────────────────────────────────
 
 export const AUDIT_SYSTEM_PROMPT = [
   "You audit a list of project memory entries for maintenance problems.",
@@ -36,17 +30,29 @@ export const AUDIT_SYSTEM_PROMPT = [
   "refine each other (one is a more specific or more general version of the other),",
   "or contradict each other (cannot both be followed).",
   "Entries about different topics are NOT findings. Entries on the same topic that are compatible are NOT findings.",
+  "For each finding also name the single entry that should be retired (the weaker, narrower, or stale one).",
+  'For a refinement, also give "superseded_by" — the broader entry that subsumes the retired one.',
   "Do not call any tools. Reply with a single JSON object and nothing else, in this shape:",
-  '{"findings":[{"ids":["MEM-001","MEM-004"],"relation":"duplicate|refinement|contradiction","reason":"one short sentence in the entries\' language"}]}',
+  '{"findings":[{"relation":"duplicate|refinement|contradiction","retire":"mem-XXXX","superseded_by":"mem-YYYY","reason":"one short sentence in the entries\' language"}]}',
+  '"superseded_by" is required for "refinement" and optional otherwise.',
   'If there are no problems reply {"findings":[]}.',
 ].join("\n")
 
-export function buildAuditPrompt(entries: MemoryEntry[]): string {
-  const blocks = entries.map((e) => {
-    const tags = e.tags && e.tags.length > 0 ? ` tags: ${e.tags.join(", ")}` : ""
-    return `[${e.id}] ${e.title}${tags}\n${e.content}`
+export function buildAuditPrompt(memories: Memory[]): string {
+  const blocks = memories.map((m) => {
+    const tags = m.tags && m.tags.length > 0 ? ` tags: ${m.tags.join(", ")}` : ""
+    return `[${m.id}] ${m.title}${tags}\n${m.body}`
   })
   return `Memory entries:\n\n${blocks.join("\n\n---\n\n")}`
+}
+
+export type AuditFinding = {
+  relation: "duplicate" | "refinement" | "contradiction"
+  /** ID of the active memory the audit proposes retiring. */
+  retire: string
+  /** For a refinement, the broader active memory that subsumes the retired one. */
+  supersededBy?: string
+  reason: string
 }
 
 /** Pull the first balanced {...} object out of a model reply (tolerates prose and code fences). */
@@ -80,40 +86,82 @@ function extractJsonObject(text: string): unknown {
   return null
 }
 
+const RELATIONS = ["duplicate", "refinement", "contradiction"] as const
+
 /**
  * Turn a model reply into validated findings. Anything malformed or referring
- * to unknown/archived IDs is dropped. Returns null when the reply is not a
- * usable audit result at all (so the caller can treat it as a failed run).
+ * to unknown IDs is dropped. Returns null when the reply is not a usable audit
+ * result at all (so the caller can treat it as a failed run).
  */
-export function parseAuditResponse(text: string, store: MemoryStore): Finding[] | null {
+export function parseAuditResponse(text: string, active: Memory[]): AuditFinding[] | null {
   const obj = extractJsonObject(text)
   if (!obj || typeof obj !== "object") return null
   const list = (obj as Record<string, unknown>)["findings"]
   if (!Array.isArray(list)) return null
 
-  const active = new Map(activeEntries(store).map((e) => [e.id, e]))
+  const activeIds = new Set(active.map((m) => m.id))
   const seen = new Set<string>()
-  const out: Finding[] = []
+  const out: AuditFinding[] = []
   for (const raw of list) {
     if (!raw || typeof raw !== "object") continue
     const r = raw as Record<string, unknown>
-    const ids = Array.isArray(r["ids"]) ? [...new Set(r["ids"].filter((i): i is string => typeof i === "string"))] : []
     const relation = r["relation"]
-    if (ids.length < 2 || !ids.every((i) => active.has(i))) continue
+    const retire = r["retire"]
     if (typeof relation !== "string" || !(RELATIONS as readonly string[]).includes(relation)) continue
-    const sorted = ids.sort()
-    const key = findingKey(sorted)
-    if (seen.has(key)) continue
-    seen.add(key)
-    const reason = typeof r["reason"] === "string" ? r["reason"].replace(/\s+/g, " ").trim() : ""
-    out.push({
-      ids: sorted,
-      relation: relation as Relation,
-      reason: clip(reason, 240),
-      hash: hashEntries(sorted.map((i) => active.get(i)!)),
-    })
+    if (typeof retire !== "string" || !activeIds.has(retire)) continue
+    if (seen.has(retire)) continue
+    seen.add(retire)
+
+    const finding: AuditFinding = {
+      relation: relation as AuditFinding["relation"],
+      retire,
+      reason: typeof r["reason"] === "string" ? r["reason"].replace(/\s+/g, " ").trim() : "",
+    }
+    const by = r["superseded_by"]
+    if (typeof by === "string" && by !== retire && activeIds.has(by)) finding.supersededBy = by
+    out.push(finding)
   }
   return out
+}
+
+/** Map a finding relation onto the fixed retirement vocabulary. */
+export function relationToReason(relation: AuditFinding["relation"]): RetiredReason {
+  if (relation === "duplicate") return "duplicate"
+  if (relation === "contradiction") return "wrong"
+  return "superseded"
+}
+
+// ─── Guard state (machine-local; the durable record is the PR, not this) ────
+
+type AuditState = { lastHash: string; lastAuditAt: string }
+
+function auditStatePath(projectDir: string): string {
+  return path.join(machineDir(projectDir), AUDIT_STATE_FILE)
+}
+
+async function readAuditState(projectDir: string): Promise<AuditState> {
+  try {
+    const parsed = JSON.parse(await fs.readFile(auditStatePath(projectDir), "utf8")) as Record<string, unknown>
+    return {
+      lastHash: typeof parsed["lastHash"] === "string" ? parsed["lastHash"] : "",
+      lastAuditAt: typeof parsed["lastAuditAt"] === "string" ? parsed["lastAuditAt"] : "",
+    }
+  } catch {
+    return { lastHash: "", lastAuditAt: "" }
+  }
+}
+
+async function writeAuditState(projectDir: string, state: AuditState): Promise<void> {
+  await fs.mkdir(machineDir(projectDir), { recursive: true })
+  await fs.writeFile(auditStatePath(projectDir), JSON.stringify(state, null, 2) + "\n", "utf8")
+}
+
+/** Stable hash of the active memories' text (order-independent). */
+export function activeHash(memories: Memory[]): string {
+  const parts = memories
+    .map((m) => JSON.stringify([m.id, m.title, m.body, [...(m.tags ?? [])].sort()]))
+    .sort()
+  return crypto.createHash("sha1").update(parts.join("\n")).digest("hex")
 }
 
 // ─── One audit run ───────────────────────────────────────────────────────────
@@ -145,6 +193,9 @@ export type AuditDeps = {
  * Run one audit if the guards allow it. Never throws. Guards, in order:
  * enabled, at least two active entries, not too many entries, entries changed
  * since the last completed audit, minimum interval since the last attempt.
+ *
+ * On success, each finding becomes an `intent: retire` staging proposal (with
+ * `superseded_by` for refinements) so the bot can open a PR for it.
  */
 export async function runAudit(deps: AuditDeps): Promise<AuditOutcome> {
   const { directory, config, logger, call } = deps
@@ -152,15 +203,12 @@ export async function runAudit(deps: AuditDeps): Promise<AuditOutcome> {
   if (!config.backgroundAudit) return "disabled"
 
   try {
-    const store = await readStore(directory, config.storeDir)
-    const active = activeEntries(store)
-    const state = await readReviewState(directory)
-    const hash = hashActive(store)
+    const active = await listActiveMemories(directory)
+    const state = await readAuditState(directory)
+    const hash = activeHash(active)
 
     if (active.length < 2) {
-      if (state.findings.length > 0 || state.lastHash !== hash) {
-        await writeReviewState(directory, { ...state, findings: [], lastHash: hash })
-      }
+      if (state.lastHash !== hash) await writeAuditState(directory, { lastHash: hash, lastAuditAt: state.lastAuditAt })
       return "skipped-too-few"
     }
     if (active.length > MAX_ACTIVE_ENTRIES) {
@@ -185,7 +233,7 @@ export async function runAudit(deps: AuditDeps): Promise<AuditOutcome> {
       return "failed"
     }
 
-    const findings = parseAuditResponse(reply, store)
+    const findings = parseAuditResponse(reply, active)
     if (findings === null) {
       await markAttempt(directory, now())
       await logger.error("audit", "unparsable audit reply: " + clip(reply, 200))
@@ -193,20 +241,38 @@ export async function runAudit(deps: AuditDeps): Promise<AuditOutcome> {
     }
 
     // If memories changed while the model was working, the verdict may describe
-    // text that no longer exists. Keep lastHash as is so the next idle re-audits.
-    const fresh = await readStore(directory, config.storeDir)
-    if (hashActive(fresh) !== hash) {
+    // text that no longer exists. Leave lastHash as is so the next idle re-audits.
+    const fresh = await listActiveMemories(directory)
+    if (activeHash(fresh) !== hash) {
       await markAttempt(directory, now())
       await logger.info("audit", "discarded: memories changed during audit")
       return "discarded-changed"
     }
 
-    const latest = await readReviewState(directory)
-    await writeReviewState(
-      directory,
-      pruneState(fresh, { ...latest, findings, lastHash: hash, lastAuditAt: now().toISOString() }),
-    )
-    await logger.info("audit", `${findings.length} finding(s) over ${active.length} entries`)
+    // Emit a retire proposal per finding, skipping any already proposed.
+    const staged = await listStagedProposals(directory)
+    const alreadyProposed = new Set(staged.filter((p) => p.intent === "retire").map((p) => p.id))
+    const titleById = new Map(active.map((m) => [m.id, m.title]))
+    let emitted = 0
+    for (const f of findings) {
+      if (alreadyProposed.has(f.retire)) continue
+      const memory: Memory = {
+        id: f.retire,
+        title: titleById.get(f.retire) ?? f.retire,
+        body: "",
+        author: "unknown",
+        source: `background audit — ${f.relation}: ${f.reason || "(no reason given)"}`,
+        proposedAt: now().toISOString(),
+        intent: "retire",
+        retiredReason: relationToReason(f.relation),
+      }
+      if (f.supersededBy) memory.supersededBy = f.supersededBy
+      await writeProposal(directory, memory)
+      emitted++
+    }
+
+    await writeAuditState(directory, { lastHash: hash, lastAuditAt: now().toISOString() })
+    await logger.info("audit", `${findings.length} finding(s) → ${emitted} proposal(s) over ${active.length} entries`)
     return "done"
   } catch (err) {
     await logger.error("audit", err)
@@ -215,11 +281,11 @@ export async function runAudit(deps: AuditDeps): Promise<AuditOutcome> {
 }
 
 async function markAttempt(directory: string, at: Date): Promise<void> {
-  const state = await readReviewState(directory)
-  await writeReviewState(directory, { ...state, lastAuditAt: at.toISOString() })
+  const state = await readAuditState(directory)
+  await writeAuditState(directory, { ...state, lastAuditAt: at.toISOString() })
 }
 
-// ─── SDK-backed model call ───────────────────────────────────────────────────
+// ─── SDK-backed model call (V1) ──────────────────────────────────────────────
 
 /** The slice of the OpenCode SDK client the audit uses. */
 export type AuditClient = {
@@ -339,4 +405,8 @@ export function createAuditScheduler(deps: AuditDeps, auditSessions: Set<string>
       while (current) await current.catch(() => undefined)
     },
   }
+}
+
+function clip(text: string, max: number): string {
+  return text.length <= max ? text : text.slice(0, max) + " …"
 }

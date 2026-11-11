@@ -3,9 +3,8 @@ import assert from "node:assert/strict";
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
-import { createMemoryTools } from "./tools.js";
-import { readStore, writeStore, addEntry } from "./storage.js";
-import { readReviewState, writeReviewState, emptyReviewState, hashEntries } from "./review.js";
+import { createMemoryTools, mapRetireReason } from "./tools.js";
+import { activeDir, listActiveMemories, listStagedProposals, writeMemoryFile } from "./storage.js";
 import { DEFAULT_CONFIG } from "./types.js";
 const lines = [];
 const logger = {
@@ -27,74 +26,89 @@ async function withDir(fn) {
         await fs.rm(dir, { recursive: true, force: true });
     }
 }
-async function seed(dir, ...items) {
-    let s = { entries: [], nextSeq: 1 };
-    for (const [t, c, tags] of items)
-        s = addEntry(s, t, c, tags).store;
-    await writeStore(dir, s);
-    return s;
+function activeMemory(id, title, body, approvedAt = "2026-01-01") {
+    return { id, title, body, proposedAt: "2026-01-01", approvedAt };
 }
-describe("memory_add", () => {
-    it("does not rank or list related memories — similarity is the model's job", async () => {
+async function seed(dir, ...memories) {
+    for (const m of memories)
+        await writeMemoryFile(activeDir(dir), m);
+}
+describe("mapRetireReason", () => {
+    it("maps free text onto the fixed vocabulary, defaulting to stale", () => {
+        assert.equal(mapRetireReason("this is wrong now"), "wrong");
+        assert.equal(mapRetireReason("a duplicate of another"), "duplicate");
+        assert.equal(mapRetireReason("useless"), "useless");
+        assert.equal(mapRetireReason("replaced by X"), "superseded");
+        assert.equal(mapRetireReason("outdated"), "stale");
+        assert.equal(mapRetireReason(undefined), "stale");
+        assert.equal(mapRetireReason("random words"), "stale");
+    });
+});
+describe("memory_propose", () => {
+    it("writes a staging proposal and does not touch active", async () => {
         await withDir(async (dir) => {
-            await seed(dir, ["WebFetch 必须走 subagent，避免 context 膨胀", "当 webfetch 的目的是提取信息，必须用 Task subagent 做。"], ["SQLite 字段命名", "不得用保留关键字"]);
-            const r = await run(tools.memory_add, { title: "WebFetch: always delegate to a subagent", content: "Delegate page fetching." }, dir);
-            assert.match(r.output, /Saved as \[MEM-003\]/);
-            assert.doesNotMatch(r.output, /Related existing memories/);
-            assert.doesNotMatch(r.output, /overlap \d/);
-            assert.match(r.output, /memory_review with refresh=true/);
+            const r = await run(tools.memory_propose, { title: "New rule", content: "Body text." }, dir);
+            assert.match(r.title, /Memory proposed/);
+            assert.match(r.output, /Proposed \[mem-/);
+            assert.match(r.output, /proposal only/);
+            const staged = await listStagedProposals(dir);
+            assert.equal(staged.length, 1);
+            assert.equal(staged[0].title, "New rule");
+            assert.equal(staged[0].intent, "propose");
+            assert.equal(staged[0].body, "Body text.");
+            assert.equal((await listActiveMemories(dir)).length, 0);
         });
     });
-    it("omits the refresh hint when this is the first memory", async () => {
-        await withDir(async (dir) => {
-            assert.doesNotMatch((await run(tools.memory_add, { title: "First", content: "c" }, dir)).output, /refresh=true/);
-        });
-    });
-    it("supersedes: archives the old entry with a link and reports it", async () => {
-        await withDir(async (dir) => {
-            await seed(dir, ["Old rule", "old"], ["Other", "o"]);
-            const r = await run(tools.memory_add, { title: "New rule", content: "new", supersedes: ["MEM-001"] }, dir);
-            assert.match(r.output, /Archived \(superseded by MEM-003\): MEM-001/);
-            const store = await readStore(dir);
-            const old = store.entries.find((e) => e.id === "MEM-001");
-            assert.equal(old.archived, true);
-            assert.equal(old.supersededBy, "MEM-003");
-        });
-    });
-    it("supersedes with a bad id saves nothing", async () => {
-        await withDir(async (dir) => {
-            await seed(dir, ["Old rule", "old"]);
-            const r = await run(tools.memory_add, { title: "New", content: "n", supersedes: ["MEM-001", "MEM-042"] }, dir);
-            assert.equal(r.title, "Memory not saved");
-            assert.match(r.output, /MEM-042/);
-            const store = await readStore(dir);
-            assert.equal(store.entries.length, 1);
-            assert.equal(store.entries[0].archived, false);
-        });
-    });
-    it("writes the summary file", async () => {
-        await withDir(async (dir) => {
-            await run(tools.memory_add, { title: "Hello", content: "c" }, dir);
-            assert.match(await fs.readFile(path.join(dir, ".opencode/memory/memory_summary.md"), "utf8"), /Hello/);
-        });
-    });
-    it("rejects content containing a credential pattern and writes nothing", async () => {
+    it("rejects content containing a credential and writes nothing", async () => {
         await withDir(async (dir) => {
             const token = `ghp_${"a".repeat(36)}`;
-            const r = await run(tools.memory_add, { title: "leak", content: `my token is ${token}` }, dir);
-            assert.equal(r.title, "Memory not saved");
+            const r = await run(tools.memory_propose, { title: "leak", content: `my token is ${token}` }, dir);
+            assert.equal(r.title, "Memory not proposed");
             assert.match(r.output, /GitHub token/);
             assert.doesNotMatch(r.output, new RegExp(token));
-            await assert.rejects(fs.access(path.join(dir, ".agents/memory/MEMORY.md")));
-            assert.ok(lines.some((l) => l.startsWith("memory_add") && l.includes("secret scan")));
+            assert.equal((await listStagedProposals(dir)).length, 0);
         });
     });
-    it("returns a clean message when the store directory is not writable", async () => {
+    it("skips when a duplicate title already exists in active", async () => {
+        await withDir(async (dir) => {
+            await seed(dir, activeMemory("mem-aaaa0001", "Use int for money", "cents"));
+            const r = await run(tools.memory_propose, { title: "Use int for money", content: "different body" }, dir);
+            assert.equal(r.title, "Memory not proposed");
+            assert.match(r.output, /duplicate/);
+            assert.equal((await listStagedProposals(dir)).length, 0);
+        });
+    });
+    it("skips when a duplicate content already exists in staging", async () => {
+        await withDir(async (dir) => {
+            await seed(dir, activeMemory("mem-aaaa0001", "Other title", "same body text"));
+            const r = await run(tools.memory_propose, { title: "Another title", content: "same body text" }, dir);
+            assert.equal(r.title, "Memory not proposed");
+            assert.equal((await listStagedProposals(dir)).length, 0);
+        });
+    });
+    it("rejects supersedes ids that are not active", async () => {
+        await withDir(async (dir) => {
+            await seed(dir, activeMemory("mem-aaaa0001", "A", "a"));
+            const r = await run(tools.memory_propose, { title: "New", content: "n", supersedes: ["mem-bbbb0002"] }, dir);
+            assert.equal(r.title, "Memory not proposed");
+            assert.match(r.output, /mem-bbbb0002/);
+            assert.equal((await listStagedProposals(dir)).length, 0);
+        });
+    });
+    it("records supersedes on a proposal when the ids are active", async () => {
+        await withDir(async (dir) => {
+            await seed(dir, activeMemory("mem-aaaa0001", "Old", "old"));
+            await run(tools.memory_propose, { title: "New", content: "n", supersedes: ["mem-aaaa0001"] }, dir);
+            const staged = await listStagedProposals(dir);
+            assert.deepEqual(staged[0].supersedes, ["mem-aaaa0001"]);
+        });
+    });
+    it("returns a clean message when staging is not writable", async () => {
         const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mem-tool-ro-"));
         try {
             await fs.chmod(dir, 0o555);
-            const r = await run(tools.memory_add, { title: "t", content: "c" }, dir);
-            assert.equal(r.title, "Memory not saved");
+            const r = await run(tools.memory_propose, { title: "t", content: "c" }, dir);
+            assert.equal(r.title, "Memory not proposed");
             assert.match(r.output, /not writable/);
         }
         finally {
@@ -103,157 +117,97 @@ describe("memory_add", () => {
         }
     });
 });
-describe("memory_delete", () => {
-    it("stores the reason and replacement on the archived entry", async () => {
+describe("memory_update", () => {
+    it("proposes a supersession and leaves the target active", async () => {
         await withDir(async (dir) => {
-            await seed(dir, ["A", "a"], ["B", "b"]);
-            const r = await run(tools.memory_delete, { id: "MEM-001", reason: "merged into B", superseded_by: "MEM-002" }, dir);
-            assert.match(r.output, /Reason: merged into B/);
-            const e = (await readStore(dir)).entries.find((x) => x.id === "MEM-001");
-            assert.equal(e.archivedReason, "merged into B");
-            assert.equal(e.supersededBy, "MEM-002");
-            assert.ok(lines.some((l) => l.startsWith("memory_delete MEM-001") && l.includes("merged into B")));
-        });
-    });
-    it("rejects a superseded_by that is missing or the same entry", async () => {
-        await withDir(async (dir) => {
-            await seed(dir, ["A", "a"]);
-            for (const sb of ["MEM-009", "MEM-001"]) {
-                assert.equal((await run(tools.memory_delete, { id: "MEM-001", superseded_by: sb }, dir)).title, "Memory not archived");
-            }
-            assert.equal((await readStore(dir)).entries[0].archived, false);
+            await seed(dir, activeMemory("mem-aaaa0001", "Old title", "old body"));
+            const r = await run(tools.memory_update, { id: "mem-aaaa0001", content: "new body" }, dir);
+            assert.match(r.title, /Memory update proposed/);
+            const staged = await listStagedProposals(dir);
+            assert.equal(staged.length, 1);
+            assert.deepEqual(staged[0].supersedes, ["mem-aaaa0001"]);
+            assert.equal(staged[0].body, "new body");
+            assert.equal(staged[0].title, "Old title");
+            // target is untouched
+            const active = await listActiveMemories(dir);
+            assert.equal(active.length, 1);
+            assert.equal(active[0].body, "old body");
         });
     });
     it("reports an unknown id", async () => {
         await withDir(async (dir) => {
-            assert.equal((await run(tools.memory_delete, { id: "MEM-005" }, dir)).title, "Memory not found");
+            const r = await run(tools.memory_update, { id: "mem-zzzz0009", content: "x" }, dir);
+            assert.equal(r.title, "Memory not found");
         });
     });
 });
-describe("memory_update", () => {
-    it("logs the previous text when content changes", async () => {
+describe("memory_delete", () => {
+    it("proposes a retirement and leaves the target active", async () => {
         await withDir(async (dir) => {
-            await seed(dir, ["Title", "old body"]);
-            lines.length = 0;
-            await run(tools.memory_update, { id: "MEM-001", content: "new body" }, dir);
-            const log = lines.find((l) => l.startsWith("memory_update MEM-001"));
-            assert.match(log, /previous=/);
-            assert.match(log, /old body/);
+            await seed(dir, activeMemory("mem-aaaa0001", "To remove", "body"));
+            const r = await run(tools.memory_delete, { id: "mem-aaaa0001", reason: "this is wrong now" }, dir);
+            assert.match(r.title, /retirement proposed/);
+            const staged = await listStagedProposals(dir);
+            assert.equal(staged.length, 1);
+            assert.equal(staged[0].intent, "retire");
+            assert.equal(staged[0].id, "mem-aaaa0001");
+            assert.equal(staged[0].retiredReason, "wrong");
+            assert.equal(staged[0].body, "");
+            assert.equal((await listActiveMemories(dir)).length, 1);
         });
     });
-    it("with only an id, re-confirms: bumps updated, leaves text alone", async () => {
+    it("reports an unknown id", async () => {
         await withDir(async (dir) => {
-            const s = await seed(dir, ["Title", "body"]);
-            s.entries[0] = { ...s.entries[0], added: "2025-01-01" };
-            await writeStore(dir, s);
-            lines.length = 0;
-            await run(tools.memory_update, { id: "MEM-001" }, dir);
-            const e = (await readStore(dir)).entries[0];
-            assert.equal(e.title, "Title");
-            assert.equal(e.content, "body");
-            assert.equal(e.added, "2025-01-01");
-            assert.equal(e.updated, new Date().toISOString().slice(0, 10));
-            assert.ok(lines.some((l) => l.includes("reconfirmed")));
+            assert.equal((await run(tools.memory_delete, { id: "mem-zzzz0009" }, dir)).title, "Memory not found");
         });
     });
 });
 describe("memory_read", () => {
-    it("hides archived entries by default and shows reason/successor on request", async () => {
+    it("shows active bodies, pending proposals, and retired only on request", async () => {
         await withDir(async (dir) => {
-            await seed(dir, ["Old thing", "old"], ["New thing", "new"]);
-            await run(tools.memory_delete, { id: "MEM-001", reason: "replaced", superseded_by: "MEM-002" }, dir);
-            assert.doesNotMatch((await run(tools.memory_read, {}, dir)).output, /Old thing/);
-            const full = await run(tools.memory_read, { include_archived: true }, dir);
-            assert.match(full.output, /Old thing/);
-            assert.match(full.output, /reason: replaced/);
-            assert.match(full.output, /superseded by MEM-002/);
+            await seed(dir, activeMemory("mem-aaaa0001", "Active one", "active body"));
+            await run(tools.memory_propose, { title: "Pending", content: "pending body" }, dir);
+            await run(tools.memory_delete, { id: "mem-aaaa0001" }, dir);
+            const out = await run(tools.memory_read, {}, dir);
+            assert.match(out.output, /Active one/);
+            assert.match(out.output, /active body/);
+            assert.match(out.output, /Pending/);
+            assert.match(out.output, /not yet merged/);
+            // retired only with include_retired (nothing is retired yet here)
+            const withRetired = await run(tools.memory_read, { include_retired: true }, dir);
+            assert.match(withRetired.output, /Retired memories/);
         });
     });
-    it("filters archived entries by query too", async () => {
+    it("filters by query", async () => {
         await withDir(async (dir) => {
-            await seed(dir, ["Alpha", "a"], ["Beta", "b"]);
-            await run(tools.memory_delete, { id: "MEM-001" }, dir);
-            await run(tools.memory_delete, { id: "MEM-002" }, dir);
-            const r = await run(tools.memory_read, { query: "alpha", include_archived: true }, dir);
-            assert.match(r.output, /Alpha/);
-            assert.doesNotMatch(r.output, /Beta/);
+            await seed(dir, activeMemory("mem-aaaa0001", "Alpha", "a"), activeMemory("mem-bbbb0002", "Beta", "b"));
+            const out = await run(tools.memory_read, { query: "alpha" }, dir);
+            assert.match(out.output, /Alpha/);
+            assert.doesNotMatch(out.output, /Beta/);
         });
     });
 });
 describe("memory_review", () => {
-    it("shows a placeholder, then honours dismiss", async () => {
+    it("lists active, pending, and aging entries, read-only", async () => {
         await withDir(async (dir) => {
-            await seed(dir, ["plugin load check", "t", ["test"]], ["Real rule", "r"]);
-            assert.match((await run(tools.memory_review, {}, dir)).output, /key: MEM-001/);
-            const after = await run(tools.memory_review, { dismiss: ["MEM-001"] }, dir);
-            assert.match(after.output, /Dismissed: MEM-001/);
-            assert.doesNotMatch(after.output, /key: MEM-001/);
-        });
-    });
-    it("shows an audit finding with full text and removes it once an entry is edited", async () => {
-        await withDir(async (dir) => {
-            const s = await seed(dir, ["Rule one", "text one"], ["Rule two", "text two"]);
-            await writeReviewState(dir, {
-                ...emptyReviewState(),
-                findings: [{ ids: ["MEM-001", "MEM-002"], relation: "contradiction", reason: "they disagree", hash: hashEntries(s.entries) }],
-            });
-            const shown = await run(tools.memory_review, {}, dir);
-            assert.match(shown.output, /they disagree/);
-            assert.match(shown.output, /text one/);
-            assert.match(shown.output, /text two/);
-            await run(tools.memory_update, { id: "MEM-002", content: "text two, revised" }, dir);
-            assert.doesNotMatch((await run(tools.memory_review, {}, dir)).output, /they disagree/);
-        });
-    });
-    it("ignores unknown dismiss keys", async () => {
-        await withDir(async (dir) => {
-            await seed(dir, ["A", "a"]);
-            const r = await run(tools.memory_review, { dismiss: ["MEM-8+MEM-9"] }, dir);
-            assert.match(r.output, /Not a current review item/);
-            assert.equal((await readReviewState(dir)).dismissed.length, 0);
-        });
-    });
-    it("lists aging entries", async () => {
-        await withDir(async (dir) => {
-            const s = await seed(dir, ["Ancient", "a"]);
-            s.entries[0] = { ...s.entries[0], added: "2020-01-01" };
-            await writeStore(dir, s);
+            await seed(dir, activeMemory("mem-aaaa0001", "Fresh", "f", "2026-11-01"), activeMemory("mem-bbbb0002", "Ancient", "a", "2020-01-01"));
+            await run(tools.memory_propose, { title: "Pending", content: "p" }, dir);
             const r = await run(tools.memory_review, {}, dir);
-            assert.match(r.output, /Aging entries/);
+            assert.match(r.output, /Active memories/);
+            assert.match(r.output, /\[mem-aaaa0001\] Fresh/);
+            assert.match(r.output, /Pending proposals — not yet merged/);
+            assert.match(r.output, /Aging memories/);
             assert.match(r.output, /Ancient/);
         });
     });
-    it("refresh runs the audit and shows the findings it produced", async () => {
+    it("lists retired entries on request", async () => {
         await withDir(async (dir) => {
-            const s = await seed(dir, ["Rule one", "text one"], ["Rule two", "text two"]);
-            let ran = 0;
-            const withAudit = createMemoryTools(DEFAULT_CONFIG, logger, {
-                runAuditNow: async () => {
-                    ran++;
-                    await writeReviewState(dir, {
-                        ...emptyReviewState(),
-                        findings: [{ ids: ["MEM-001", "MEM-002"], relation: "duplicate", reason: "same rule", hash: hashEntries(s.entries) }],
-                    });
-                    return "done";
-                },
-            });
-            const r = await run(withAudit.memory_review, { refresh: true }, dir);
-            assert.equal(ran, 1);
-            assert.match(r.output, /Audit run: done/);
-            assert.match(r.output, /same rule/);
-            assert.match(r.output, /text one/);
-        });
-    });
-    it("refresh is a no-op note when the audit is disabled", async () => {
-        await withDir(async (dir) => {
-            await seed(dir, ["A", "a"], ["B", "b"]);
-            let ran = 0;
-            const disabled = createMemoryTools({ ...DEFAULT_CONFIG, backgroundAudit: false }, logger, {
-                runAuditNow: async () => { ran++; return "done"; },
-            });
-            const r = await run(disabled.memory_review, { refresh: true }, dir);
-            assert.equal(ran, 0);
-            assert.match(r.output, /Background audit is disabled/);
+            await seed(dir, activeMemory("mem-aaaa0001", "Active", "a"));
+            await run(tools.memory_delete, { id: "mem-aaaa0001", reason: "stale" }, dir);
+            const r = await run(tools.memory_review, { include_retired: true }, dir);
+            // nothing has actually moved to retired/ yet (it is a proposal)
+            assert.match(r.output, /Retired memories/);
+            assert.doesNotMatch(r.output, /Active \(retired\)/);
         });
     });
 });

@@ -1,10 +1,11 @@
 import fs from "fs/promises";
 import path from "path";
-import { memoryDir } from "./storage.js";
+import { machineDir } from "./storage.js";
 const LOG_FILE = "plugin.log";
 /**
  * Create a logger that appends structured entries to
- * <projectDir>/.opencode/memory/plugin.log.
+ * <projectDir>/.memory/plugin.log (machine-local; kept out of the committed
+ * `memory/` tree).
  *
  * When enabled=false, all methods are no-ops.
  */
@@ -15,12 +16,12 @@ export function createLogger(projectDir, enabled) {
             async error() { },
         };
     }
-    const logPath = path.join(memoryDir(projectDir), LOG_FILE);
+    const logPath = path.join(machineDir(projectDir), LOG_FILE);
     async function append(level, action, detail) {
         const ts = new Date().toISOString();
         const line = `${ts} [${level}] ${action}${detail ? " — " + detail : ""}\n`;
         try {
-            await fs.mkdir(memoryDir(projectDir), { recursive: true });
+            await fs.mkdir(machineDir(projectDir), { recursive: true });
             await fs.appendFile(logPath, line, "utf8");
         }
         catch {

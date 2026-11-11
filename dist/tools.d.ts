@@ -1,23 +1,20 @@
 import type { ToolDefinition } from "@opencode-ai/plugin/tool";
-import type { PluginConfig } from "./types.js";
+import type { PluginConfig, RetiredReason } from "./types.js";
 import type { Logger } from "./logging.js";
 type MemoryToolSet = {
-    memory_add: ToolDefinition;
+    memory_propose: ToolDefinition;
     memory_update: ToolDefinition;
     memory_delete: ToolDefinition;
     memory_read: ToolDefinition;
     memory_review: ToolDefinition;
 };
-import type { AuditOutcome } from "./audit.js";
-export type ToolDeps = {
-    /** Runs a forced audit (bypasses the interval) and returns its outcome. */
-    runAuditNow?: () => Promise<AuditOutcome>;
-};
+/** Map a free-text retirement reason onto the fixed vocabulary (default `stale`). */
+export declare function mapRetireReason(reason?: string): RetiredReason;
 /**
- * Create all five memory tools bound to the given plugin config and logger.
- * Each tool reads and writes the shared store at `<projectDir>/<storeDir>/MEMORY.md`
- * (default `.agents/memory`); machine-local files stay under `.opencode/memory/`.
+ * Create the five memory tools bound to the given plugin config and logger.
+ * Each tool only ever PROPOSES: it writes a file into `.memory/staging/`. The
+ * merged store under `memory/active/` is never edited by any tool.
  */
-export declare function createMemoryTools(config: PluginConfig, logger: Logger, deps?: ToolDeps): MemoryToolSet;
+export declare function createMemoryTools(config: PluginConfig, logger: Logger): MemoryToolSet;
 export {};
 //# sourceMappingURL=tools.d.ts.map

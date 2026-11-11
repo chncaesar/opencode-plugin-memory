@@ -1,252 +1,228 @@
 import fs from "fs/promises"
 import path from "path"
-import type { MemoryEntry, MemoryStore } from "./types.js"
+import crypto from "crypto"
+import { execFile } from "child_process"
+import { parseFrontmatter, serializeFrontmatter, type Frontmatter } from "./frontmatter.js"
+import { INTENTS, RETIRED_REASONS, type Intent, type Memory, type MemoryStatus, type RetiredReason } from "./types.js"
 
-// Machine-local files (never committed) live under `.opencode/memory/`.
-const MEMORY_DIR = ".opencode/memory"
-const MEMORY_FILE = "MEMORY.md"
-const SUMMARY_FILE = "memory_summary.md"
+// ─── Paths ──────────────────────────────────────────────────────────────────
+//
+// State is positional: the folder a file lives in is its status.
+//   .memory/staging/     machine-local, git-ignored; the agent writes proposals here
+//   memory/active/       merged truth; the only memories injected into context
+//   memory/retired/      removed memories, with reason and provenance
+//   memory/_summary.md   committed index, one line per active memory
 
-// The shared, committable store lives in its own directory (`.agents/memory` by
-// default) so it is not swallowed by `.opencode/` gitignores.
-const DEFAULT_STORE_DIR = ".agents/memory"
+const MACHINE_DIR = ".memory"
+const STAGING_DIR = ".memory/staging"
+const MEMORY_ROOT = "memory"
+const ACTIVE_DIR = "memory/active"
+const RETIRED_DIR = "memory/retired"
+const SUMMARY_FILE = "_summary.md"
+const MIGRATION_FILE = ".migration.json"
 
-// Section headings in MEMORY.md
-const ACTIVE_HEADING = "## Active"
-const ARCHIVED_HEADING = "## Archived"
-
-// Entry block separator: ### [MEM-NNN] Title
-const ENTRY_HEADING_RE = /^### \[(MEM-\d+)\] (.+)$/
-
-/**
- * Resolve the machine-local `.opencode/memory` directory for a given project
- * root. Holds the auto-generated files only (`memory_summary.md`, `review.json`,
- * `plugin.log`) — not the committable store.
- */
-export function memoryDir(projectDir: string): string {
-  return path.join(projectDir, MEMORY_DIR)
+/** Machine-local `.memory` directory (staging + plugin.log). */
+export function machineDir(projectDir: string): string {
+  return path.join(projectDir, MACHINE_DIR)
 }
 
-/**
- * Resolve the shared (committable) memory store directory. Defaults to
- * `.agents/memory`; `override` is a relative directory name (e.g. `"memory"`)
- * from the project root.
- */
-export function storeDir(projectDir: string, override?: string): string {
-  return path.join(projectDir, override && override !== "" ? override : DEFAULT_STORE_DIR)
+/** The git-ignored folder the agent writes proposals into. */
+export function stagingDir(projectDir: string): string {
+  return path.join(projectDir, STAGING_DIR)
 }
 
-/**
- * Validate a user-supplied `storeDir` override. Returns the value when it is a
- * non-empty relative path that stays inside the project root (no `..` segment,
- * not absolute); otherwise `undefined` (callers fall back to the default).
- */
-export function validStoreDir(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined
-  const trimmed = value.trim()
-  if (trimmed === "") return undefined
-  if (path.isAbsolute(trimmed)) return undefined
-  if (trimmed.split(/[\\/]+/).some((seg) => seg === "..")) return undefined
-  return trimmed
+/** The committed memory root (`memory/`), holding active/, retired/, _summary.md. */
+export function memoryRootDir(projectDir: string): string {
+  return path.join(projectDir, MEMORY_ROOT)
 }
 
-export function memoryFilePath(projectDir: string, storeDirOverride?: string): string {
-  return path.join(storeDir(projectDir, storeDirOverride), MEMORY_FILE)
+/** The committed active-memory directory. */
+export function activeDir(projectDir: string): string {
+  return path.join(projectDir, ACTIVE_DIR)
 }
 
+/** The committed retired-memory directory. */
+export function retiredDir(projectDir: string): string {
+  return path.join(projectDir, RETIRED_DIR)
+}
+
+/** The committed index file, a sibling of `memory/active/`. */
 export function summaryFilePath(projectDir: string): string {
-  return path.join(memoryDir(projectDir), SUMMARY_FILE)
+  return path.join(projectDir, MEMORY_ROOT, SUMMARY_FILE)
 }
 
-// ─── Parser ──────────────────────────────────────────────────────────────────
+/** The old-ID → new-ID mapping written by migration. */
+export function migrationFilePath(projectDir: string): string {
+  return path.join(projectDir, MEMORY_ROOT, MIGRATION_FILE)
+}
+
+// ─── Identity ───────────────────────────────────────────────────────────────
+
+const ID_RE = /^mem-[A-Za-z0-9_-]{8}$/
+
+/** True when `value` is a well-formed memory id (`mem-` + 8 base64url chars). */
+export function isMemoryId(value: string): boolean {
+  return ID_RE.test(value)
+}
 
 /**
- * Parse the raw MEMORY.md text into a MemoryStore.
- * Format contract:
- *
- *   # OpenCode Memory
- *   <!-- nextSeq: 3 -->
- *
- *   ## Active
- *
- *   ### [MEM-001] Title here
- *   - added: 2026-08-26
- *   - updated: 2026-08-27
- *   - tags: coding-style, workflow
- *   Body content (may span multiple lines).
- *
- *   ## Archived
- *
- *   ### [MEM-002] Old title
- *   - added: 2026-08-20
- *   - archived: true
- *   Old content.
+ * Generate a collision-free random id: `mem-` + 8 chars from
+ * `crypto.randomBytes(6).toString("base64url")`. No sequential counter.
  */
-export function parseMemory(text: string): MemoryStore {
-  const lines = text.split("\n")
-  const entries: MemoryEntry[] = []
-  let nextSeq = 1
-
-  // Extract nextSeq from metadata comment
-  for (const line of lines) {
-    const m = line.match(/<!--\s*nextSeq:\s*(\d+)\s*-->/)
-    if (m) {
-      nextSeq = parseInt(m[1] ?? "1", 10)
-      break
-    }
-  }
-
-  let inArchived = false
-  let currentEntry: Partial<MemoryEntry> | null = null
-  let bodyLines: string[] = []
-  // Metadata lines ("- key: value") are only recognised in the leading block
-  // directly after an entry heading. Once body text starts, a body line that
-  // happens to look like metadata stays body text.
-  let inMeta = false
-
-  const flushEntry = () => {
-    if (!currentEntry?.id || !currentEntry.title) return
-    const entry: MemoryEntry = {
-      id: currentEntry.id,
-      title: currentEntry.title,
-      content: bodyLines.join("\n").trim(),
-      added: currentEntry.added ?? today(),
-      archived: inArchived,
-    }
-    if (currentEntry.updated !== undefined) entry.updated = currentEntry.updated
-    if (currentEntry.tags !== undefined) entry.tags = currentEntry.tags
-    if (inArchived) {
-      if (currentEntry.archivedAt !== undefined) entry.archivedAt = currentEntry.archivedAt
-      if (currentEntry.archivedReason !== undefined) entry.archivedReason = currentEntry.archivedReason
-      if (currentEntry.supersededBy !== undefined) entry.supersededBy = currentEntry.supersededBy
-    }
-    entries.push(entry)
-    currentEntry = null
-    bodyLines = []
-  }
-
-  for (const line of lines) {
-    if (line.startsWith("## Active")) {
-      flushEntry()       // flush before changing section
-      inArchived = false
-      continue
-    }
-    if (line.startsWith("## Archived")) {
-      flushEntry()       // flush before changing section
-      inArchived = true
-      continue
-    }
-
-    const headingMatch = line.match(ENTRY_HEADING_RE)
-    if (headingMatch) {
-      flushEntry()
-      const id = headingMatch[1]
-      const title = headingMatch[2]
-      if (id && title) {
-        currentEntry = { id, title }
-      }
-      bodyLines = []
-      inMeta = true
-      continue
-    }
-
-    if (currentEntry) {
-      if (inMeta) {
-        const meta = line.match(/^- (added|updated|tags|archived|archived_at|archived_reason|superseded_by):\s*(.*)$/)
-        if (meta) {
-          const key = meta[1]
-          const val = (meta[2] ?? "").trim()
-          if (key === "added" && val) currentEntry.added = val
-          else if (key === "updated" && val) currentEntry.updated = val
-          else if (key === "tags" && val) {
-            currentEntry.tags = val.split(",").map((t) => t.trim()).filter(Boolean)
-          } else if (key === "archived_at" && val) currentEntry.archivedAt = val
-          else if (key === "archived_reason" && val) currentEntry.archivedReason = val
-          else if (key === "superseded_by" && val) currentEntry.supersededBy = val
-          // legacy "- archived: true" is implied by the section heading; ignored
-          continue
-        }
-        // Blank lines between metadata and body do not end the metadata block
-        if (line.trim() === "") {
-          continue
-        }
-        inMeta = false
-      }
-      bodyLines.push(line)
-    }
-  }
-  flushEntry()
-
-  return { entries, nextSeq }
+export function generateMemoryId(): string {
+  return "mem-" + crypto.randomBytes(6).toString("base64url")
 }
 
-// ─── Serialiser ──────────────────────────────────────────────────────────────
+// ─── Frontmatter ↔ Memory mapping ───────────────────────────────────────────
 
-/**
- * Serialize a MemoryStore back into MEMORY.md text.
- */
-export function serializeMemory(store: MemoryStore): string {
-  const active = store.entries.filter((e) => !e.archived)
-  const archived = store.entries.filter((e) => e.archived)
-
-  const lines: string[] = [
-    "# OpenCode Memory",
-    `<!-- nextSeq: ${store.nextSeq} -->`,
-    "<!-- auto-managed by opencode-plugin-memory — do not edit section headings -->",
-    "",
-    "## Active",
-    "",
-  ]
-
-  for (const e of active) {
-    lines.push(...serializeEntry(e))
-  }
-
-  lines.push("## Archived", "")
-
-  for (const e of archived) {
-    lines.push(...serializeEntry(e))
-  }
-
-  return lines.join("\n")
+function memoryToFrontmatter(memory: Memory): Frontmatter {
+  const fm: Frontmatter = { id: memory.id, title: memory.title }
+  if (memory.tags !== undefined) fm["tags"] = memory.tags
+  if (memory.author !== undefined) fm["author"] = memory.author
+  if (memory.source !== undefined) fm["source"] = memory.source
+  if (memory.proposedAt !== undefined) fm["proposed_at"] = memory.proposedAt
+  if (memory.approvedAt !== undefined) fm["approved_at"] = memory.approvedAt
+  if (memory.approvedBy !== undefined) fm["approved_by"] = memory.approvedBy
+  if (memory.supersedes !== undefined) fm["supersedes"] = memory.supersedes
+  if (memory.supersededBy !== undefined) fm["superseded_by"] = memory.supersededBy
+  if (memory.retiredAt !== undefined) fm["retired_at"] = memory.retiredAt
+  if (memory.retiredReason !== undefined) fm["retired_reason"] = memory.retiredReason
+  if (memory.relatedPr !== undefined) fm["related_pr"] = memory.relatedPr
+  if (memory.intent !== undefined) fm["intent"] = memory.intent
+  return fm
 }
 
-function serializeEntry(e: MemoryEntry): string[] {
-  const lines: string[] = [`### [${e.id}] ${e.title}`, `- added: ${e.added}`]
-  if (e.updated) lines.push(`- updated: ${e.updated}`)
-  if (e.tags && e.tags.length > 0) lines.push(`- tags: ${e.tags.join(", ")}`)
-  if (e.archived) {
-    if (e.archivedAt) lines.push(`- archived_at: ${e.archivedAt}`)
-    if (e.archivedReason) lines.push(`- archived_reason: ${oneLine(e.archivedReason)}`)
-    if (e.supersededBy) lines.push(`- superseded_by: ${e.supersededBy}`)
-  }
-  lines.push(e.content, "")
-  return lines
+function scalar(fm: Frontmatter, key: string): string | undefined {
+  const v = fm[key]
+  return typeof v === "string" ? v : undefined
 }
 
-// ─── I/O helpers ─────────────────────────────────────────────────────────────
+function stringArray(fm: Frontmatter, key: string): string[] | undefined {
+  const v = fm[key]
+  return Array.isArray(v) && v.every((x) => typeof x === "string") ? v : undefined
+}
 
-/**
- * Read and parse MEMORY.md, returning an empty store if the file does not exist.
- */
-export async function readStore(projectDir: string, storeDirOverride?: string): Promise<MemoryStore> {
-  const filePath = memoryFilePath(projectDir, storeDirOverride)
+function frontmatterToMemory(fm: Frontmatter): Memory | null {
+  const id = fm["id"]
+  const title = fm["title"]
+  if (typeof id !== "string" || !isMemoryId(id)) return null
+  if (typeof title !== "string") return null
+
+  const memory: Memory = { id, title, body: "" }
+
+  const tags = stringArray(fm, "tags")
+  const author = scalar(fm, "author")
+  const source = scalar(fm, "source")
+  const proposedAt = scalar(fm, "proposed_at")
+  const approvedAt = scalar(fm, "approved_at")
+  const approvedBy = scalar(fm, "approved_by")
+  const supersedes = stringArray(fm, "supersedes")
+  const supersededBy = scalar(fm, "superseded_by")
+  const retiredAt = scalar(fm, "retired_at")
+  const retiredReasonRaw = scalar(fm, "retired_reason")
+  const relatedPr = scalar(fm, "related_pr")
+  const intentRaw = scalar(fm, "intent")
+
+  if (tags !== undefined) memory.tags = tags
+  if (author !== undefined) memory.author = author
+  if (source !== undefined) memory.source = source
+  if (proposedAt !== undefined) memory.proposedAt = proposedAt
+  if (approvedAt !== undefined) memory.approvedAt = approvedAt
+  if (approvedBy !== undefined) memory.approvedBy = approvedBy
+  if (supersedes !== undefined) memory.supersedes = supersedes
+  if (supersededBy !== undefined) memory.supersededBy = supersededBy
+  if (retiredAt !== undefined) memory.retiredAt = retiredAt
+  if (retiredReasonRaw !== undefined && (RETIRED_REASONS as readonly string[]).includes(retiredReasonRaw)) {
+    memory.retiredReason = retiredReasonRaw as RetiredReason
+  }
+  if (relatedPr !== undefined) memory.relatedPr = relatedPr
+  if (intentRaw !== undefined && (INTENTS as readonly string[]).includes(intentRaw)) {
+    memory.intent = intentRaw as Intent
+  }
+  return memory
+}
+
+// ─── Read ───────────────────────────────────────────────────────────────────
+
+/** Serialize a memory into the full on-disk file text. */
+export function serializeMemory(memory: Memory): string {
+  return serializeFrontmatter(memoryToFrontmatter(memory), memory.body)
+}
+
+/** Read a single memory file; `null` if missing or invalid (bad/missing frontmatter). */
+export async function readMemoryFile(filePath: string): Promise<Memory | null> {
+  let text: string
   try {
-    const text = await fs.readFile(filePath, "utf8")
-    return parseMemory(text)
+    text = await fs.readFile(filePath, "utf8")
   } catch (err: unknown) {
-    if (isNodeError(err) && err.code === "ENOENT") {
-      return { entries: [], nextSeq: 1 }
-    }
+    if (isNodeError(err) && err.code === "ENOENT") return null
+    throw err
+  }
+  const parsed = parseFrontmatter(text)
+  if (!parsed) return null
+  const memory = frontmatterToMemory(parsed.frontmatter)
+  if (!memory) return null
+  memory.body = parsed.body
+  return memory
+}
+
+async function listFiles(dir: string): Promise<string[]> {
+  try {
+    const names = await fs.readdir(dir)
+    return names.filter((n) => n.startsWith("mem-") && n.endsWith(".md"))
+  } catch (err: unknown) {
+    if (isNodeError(err) && err.code === "ENOENT") return []
     throw err
   }
 }
 
+async function readMemories(dir: string): Promise<Memory[]> {
+  const files = await listFiles(dir)
+  const out: Memory[] = []
+  for (const name of files) {
+    const memory = await readMemoryFile(path.join(dir, name))
+    if (memory) out.push(memory)
+  }
+  return out
+}
+
+/** List merged (active) memories. */
+export function listActiveMemories(projectDir: string): Promise<Memory[]> {
+  return readMemories(activeDir(projectDir))
+}
+
+/** List retired memories. */
+export function listRetiredMemories(projectDir: string): Promise<Memory[]> {
+  return readMemories(retiredDir(projectDir))
+}
+
+/** List the agent's staged proposals. */
+export function listStagedProposals(projectDir: string): Promise<Memory[]> {
+  return readMemories(stagingDir(projectDir))
+}
+
+export type MemoryWithStatus = { memory: Memory; status: MemoryStatus }
+
+/** Read one memory by id from active, then retired, then staging. */
+export async function readMemoryById(projectDir: string, id: string): Promise<MemoryWithStatus | null> {
+  const locations: Array<[string, MemoryStatus]> = [
+    [activeDir(projectDir), "active"],
+    [retiredDir(projectDir), "retired"],
+    [stagingDir(projectDir), "staging"],
+  ]
+  for (const [dir, status] of locations) {
+    const memory = await readMemoryFile(path.join(dir, `${id}.md`))
+    if (memory) return { memory, status }
+  }
+  return null
+}
+
+// ─── Write ──────────────────────────────────────────────────────────────────
+
 /**
- * Thrown when the store cannot be written because its path is unwritable or
- * read-only (e.g. projectDir is `/` or a read-only filesystem). Carries a
- * clean, user-facing message; tools catch it and return that message instead of
- * surfacing a raw EACCES.
+ * Thrown when a proposal cannot be written because its staging path is
+ * unwritable or read-only. Carries a clean, user-facing message; tools catch it
+ * and return that message instead of surfacing a raw EACCES.
  */
 export class StoreWriteError extends Error {
   constructor(message: string, cause?: unknown) {
@@ -255,23 +231,27 @@ export class StoreWriteError extends Error {
   }
 }
 
+/** Write a memory file into `dir` (creating it). Used by migration and the bot. */
+export async function writeMemoryFile(dir: string, memory: Memory): Promise<void> {
+  await fs.mkdir(dir, { recursive: true })
+  await fs.writeFile(path.join(dir, `${memory.id}.md`), serializeMemory(memory), "utf8")
+}
+
 /**
- * Write the store back to MEMORY.md, creating the directory if needed.
- * Unwritable/read-only paths raise a descriptive StoreWriteError.
+ * Write a proposal file to `.memory/staging/`. Unwritable/read-only paths raise
+ * a descriptive StoreWriteError.
  */
-export async function writeStore(projectDir: string, store: MemoryStore, storeDirOverride?: string): Promise<void> {
-  const dir = storeDir(projectDir, storeDirOverride)
-  const filePath = memoryFilePath(projectDir, storeDirOverride)
+export async function writeProposal(projectDir: string, memory: Memory): Promise<void> {
+  const dir = stagingDir(projectDir)
   try {
-    await fs.mkdir(dir, { recursive: true })
-    await fs.writeFile(filePath, serializeMemory(store), "utf8")
+    await writeMemoryFile(dir, memory)
   } catch (err: unknown) {
     if (
       isNodeError(err) &&
       (err.code === "EACCES" || err.code === "EPERM" || err.code === "EROFS" || err.code === "ENOTDIR")
     ) {
       throw new StoreWriteError(
-        `Cannot save memory: the store path "${filePath}" is not writable. Memory is project-scoped, so OpenCode must run inside a writable project directory (not "/" or a read-only filesystem).`,
+        `Cannot save memory: the staging path "${path.join(dir, `${memory.id}.md`)}" is not writable. OpenCode must run inside a writable project directory (not "/" or a read-only filesystem).`,
         err,
       )
     }
@@ -279,212 +259,65 @@ export async function writeStore(projectDir: string, store: MemoryStore, storeDi
   }
 }
 
-/**
- * One-time migration: if the shared store file does not exist but the legacy
- * `.opencode/memory/MEMORY.md` does, move it into place (creating the target
- * directory first). No-op when the new file already exists or there is no
- * legacy file. Throws on unexpected I/O errors; callers log and swallow.
- */
-export async function migrateLegacyStore(projectDir: string, storeDirOverride?: string): Promise<void> {
-  const legacy = path.join(memoryDir(projectDir), MEMORY_FILE)
-  const target = memoryFilePath(projectDir, storeDirOverride)
+// ─── Moves (used by migration and the bot) ───────────────────────────────────
 
-  if (await fileExists(target)) return
-  if (!(await fileExists(legacy))) return
-
-  await fs.mkdir(path.dirname(target), { recursive: true })
-  await fs.rename(legacy, target)
+/** Move an active memory to `retired/`. */
+export async function moveToRetired(projectDir: string, id: string): Promise<void> {
+  const from = path.join(activeDir(projectDir), `${id}.md`)
+  const to = path.join(retiredDir(projectDir), `${id}.md`)
+  await fs.mkdir(retiredDir(projectDir), { recursive: true })
+  await fs.rename(from, to)
 }
 
-async function fileExists(p: string): Promise<boolean> {
-  try {
-    await fs.access(p)
-    return true
-  } catch (err: unknown) {
-    if (isNodeError(err) && err.code === "ENOENT") return false
-    throw err
-  }
+/** Move a retired memory back to `active/`. */
+export async function moveToActive(projectDir: string, id: string): Promise<void> {
+  const from = path.join(retiredDir(projectDir), `${id}.md`)
+  const to = path.join(activeDir(projectDir), `${id}.md`)
+  await fs.mkdir(activeDir(projectDir), { recursive: true })
+  await fs.rename(from, to)
 }
 
-// ─── CRUD operations ─────────────────────────────────────────────────────────
+// ─── Author ─────────────────────────────────────────────────────────────────
 
-/**
- * Add a new entry and return the assigned ID.
- */
-export function addEntry(
-  store: MemoryStore,
-  title: string,
-  content: string,
-  tags?: string[],
-): { store: MemoryStore; id: string } {
-  const id = `MEM-${String(store.nextSeq).padStart(3, "0")}`
-  const entry: MemoryEntry = {
-    id,
-    title,
-    content,
-    added: today(),
-    archived: false,
-  }
-  if (tags !== undefined && tags.length > 0) entry.tags = tags
-  return {
-    store: {
-      entries: [...store.entries, entry],
-      nextSeq: store.nextSeq + 1,
-    },
-    id,
-  }
-}
+export type GitConfigReader = (key: string, cwd: string) => Promise<string | null>
+
+const defaultGitReader: GitConfigReader = (key, cwd) =>
+  new Promise((resolve) => {
+    execFile("git", ["config", key], { cwd }, (err, stdout) => {
+      if (err) return resolve(null)
+      const value = stdout.trim()
+      resolve(value.length > 0 ? value : null)
+    })
+  })
 
 /**
- * Update an existing entry by ID.  Returns null if not found.
+ * Resolve the author for a proposal: `git config user.name`, falling back to
+ * `user.email`, then `"unknown"` on any failure. `read` is injectable for tests.
  */
-export function updateEntry(
-  store: MemoryStore,
-  id: string,
-  patch: { title?: string; content?: string; tags?: string[] },
-): MemoryStore | null {
-  const idx = store.entries.findIndex((e) => e.id === id && !e.archived)
-  if (idx === -1) return null
-
-  const existing = store.entries[idx]
-  if (!existing) return null
-
-  const updated: MemoryEntry = {
-    id: existing.id,
-    title: patch.title !== undefined ? patch.title : existing.title,
-    content: patch.content !== undefined ? patch.content : existing.content,
-    added: existing.added,
-    updated: today(),
-    archived: existing.archived,
-  }
-  if (patch.tags !== undefined) {
-    updated.tags = patch.tags
-  } else if (existing.tags !== undefined) {
-    updated.tags = existing.tags
-  }
-
-  const entries = [...store.entries]
-  entries[idx] = updated
-  return { ...store, entries }
+export async function resolveAuthor(cwd: string, read: GitConfigReader = defaultGitReader): Promise<string> {
+  const name = await read("user.name", cwd)
+  if (name) return name
+  const email = await read("user.email", cwd)
+  if (email) return email
+  return "unknown"
 }
+
+// ─── Aging ──────────────────────────────────────────────────────────────────
+
+const DAY_MS = 24 * 60 * 60 * 1000
 
 /**
- * Soft-delete an entry by ID (moves it to the Archived section).
- * Returns null if not found among active entries.
- *
- * `reason` is stored on the entry (collapsed to one line); `supersededBy`
- * links the entry to the one that replaced it.
+ * Age of a memory in whole days, from the later of `approved_at`/`proposed_at`.
+ * Returns `NaN` when there is no usable timestamp.
  */
-export function archiveEntry(
-  store: MemoryStore,
-  id: string,
-  opts: { reason?: string; supersededBy?: string } = {},
-): MemoryStore | null {
-  const idx = store.entries.findIndex((e) => e.id === id && !e.archived)
-  if (idx === -1) return null
-
-  const existing = store.entries[idx]
-  if (!existing) return null
-
-  const now = today()
-  const archived: MemoryEntry = {
-    id: existing.id,
-    title: existing.title,
-    content: existing.content,
-    added: existing.added,
-    updated: now,
-    archived: true,
-    archivedAt: now,
-  }
-  if (existing.tags !== undefined) archived.tags = existing.tags
-  const reason = opts.reason !== undefined ? oneLine(opts.reason) : ""
-  if (reason) archived.archivedReason = reason
-  if (opts.supersededBy) archived.supersededBy = opts.supersededBy
-
-  const entries = [...store.entries]
-  entries[idx] = archived
-  return { ...store, entries }
+export function memoryAge(memory: Memory, now: Date): number {
+  const stamp = memory.approvedAt ?? memory.proposedAt
+  if (!stamp) return Number.NaN
+  const t = Date.parse(stamp)
+  return Number.isNaN(t) ? Number.NaN : Math.floor((now.getTime() - t) / DAY_MS)
 }
 
-export type SupersedeResult =
-  | { ok: true; store: MemoryStore; id: string; archivedIds: string[] }
-  | { ok: false; error: string; badIds: string[] }
-
-/**
- * Add a new entry and archive the entries it replaces, as one atomic change.
- *
- * Every ID in `supersedes` must be an active entry; otherwise nothing changes
- * and the offending IDs are reported. Duplicate IDs are collapsed.
- */
-export function addSupersedingEntry(
-  store: MemoryStore,
-  title: string,
-  content: string,
-  tags: string[] | undefined,
-  supersedes: string[],
-): SupersedeResult {
-  const ids = [...new Set(supersedes)]
-  const bad = ids.filter((id) => !store.entries.some((e) => e.id === id && !e.archived))
-  if (bad.length > 0) {
-    return {
-      ok: false,
-      badIds: bad,
-      error: `Cannot supersede ${bad.join(", ")}: not an active memory. Nothing was saved.`,
-    }
-  }
-
-  const added = addEntry(store, title, content, tags)
-  let next = added.store
-  for (const id of ids) {
-    const archivedStore = archiveEntry(next, id, { reason: "superseded", supersededBy: added.id })
-    if (!archivedStore) {
-      // Unreachable after validation; guard keeps the operation all-or-nothing.
-      return { ok: false, badIds: [id], error: `Cannot supersede ${id}. Nothing was saved.` }
-    }
-    next = archivedStore
-  }
-  return { ok: true, store: next, id: added.id, archivedIds: ids }
-}
-
-/**
- * Follow superseded_by links from an entry to the one that currently stands in
- * for it. Returns the last entry in the chain. Cycle-safe.
- */
-export function resolveSuccessor(store: MemoryStore, id: string): MemoryEntry | undefined {
-  const seen = new Set<string>()
-  let cur = store.entries.find((e) => e.id === id)
-  while (cur?.supersededBy && !seen.has(cur.id)) {
-    seen.add(cur.id)
-    const next = store.entries.find((e) => e.id === cur!.supersededBy)
-    if (!next) break
-    cur = next
-  }
-  return cur
-}
-
-/**
- * Search active entries by keyword (case-insensitive match on title + content + tags).
- */
-export function searchEntries(store: MemoryStore, query: string): MemoryEntry[] {
-  const q = query.toLowerCase()
-  return store.entries.filter(
-    (e) =>
-      !e.archived &&
-      (e.title.toLowerCase().includes(q) ||
-        e.content.toLowerCase().includes(q) ||
-        (e.tags ?? []).some((t) => t.toLowerCase().includes(q))),
-  )
-}
-
-// ─── Utilities ───────────────────────────────────────────────────────────────
-
-function oneLine(text: string): string {
-  return text.replace(/\s+/g, " ").trim()
-}
-
-function today(): string {
-  return new Date().toISOString().slice(0, 10)
-}
+// ─── Utilities ──────────────────────────────────────────────────────────────
 
 function isNodeError(err: unknown): err is NodeJS.ErrnoException {
   return err instanceof Error && "code" in err

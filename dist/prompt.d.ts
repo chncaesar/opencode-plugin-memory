@@ -28,11 +28,11 @@ export type MemoryPolicyExample = {
 export declare const MEMORY_POLICY_EXAMPLES: readonly MemoryPolicyExample[];
 /**
  * The complete policy injected on every request and repeated in the
- * memory_add tool description.
+ * memory_propose tool description.
  *
- * Two modes of triggering are intentional:
- * - Reactive  — user feedback/correction → save without waiting for "remember this"
- * - Proactive — LLM discovers a non-obvious fact → save immediately, no user cue needed
+ * The model is PR-gated: it only ever PROPOSES memories by writing a local
+ * file. A bot opens a PR and a human merges it; only merged (active) memories
+ * are valid and injected into context.
  */
 export declare const MEMORY_WRITE_POLICY: string;
 //# sourceMappingURL=prompt.d.ts.map

@@ -1,14 +1,12 @@
 import type { Config, Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
 import { DEFAULT_CONFIG, type PluginConfig } from "./types.js"
 import { createMemoryTools } from "./tools.js"
-import { buildSystemPrompt } from "./summary.js"
-import { migrateLegacyStore, readStore, validStoreDir } from "./storage.js"
+import { buildSystemPrompt, generateSummary, readSummaryContent } from "./summary.js"
 import { createLogger } from "./logging.js"
-import { collectAttention, nudgeLine, readReviewState } from "./review.js"
-import { createAuditScheduler, createSdkModelCall, type AuditClient } from "./audit.js"
+import { migrateLegacyStores } from "./migrate.js"
+import { createAuditScheduler, createSdkModelCall, type AuditClient, type ModelCall } from "./audit.js"
 import { registerAuditAgent } from "./auditAgent.js"
 import { tool } from "@opencode-ai/plugin/tool"
-import type { ModelCall } from "./audit.js"
 
 /**
  * Parse and validate plugin options from opencode.json.
@@ -42,34 +40,49 @@ export function resolveConfig(options?: PluginOptions): PluginConfig {
       typeof raw["auditIntervalMinutes"] === "number" && raw["auditIntervalMinutes"] > 0
         ? raw["auditIntervalMinutes"]
         : DEFAULT_CONFIG.auditIntervalMinutes,
-    storeDir: validStoreDir(raw["storeDir"]) ?? DEFAULT_CONFIG.storeDir,
   }
 }
 
 /**
- * opencode-plugin-memory — project-scoped persistent memory
+ * Build the block injected into every system prompt. Bootstraps a missing
+ * `memory/_summary.md` via generateSummary, then injects the committed index
+ * plus the writing policy (never full bodies).
+ */
+async function injectMemoryBlock(directory: string, config: PluginConfig): Promise<string> {
+  let summary = await readSummaryContent(directory)
+  if (!summary) {
+    await generateSummary(directory)
+    summary = await readSummaryContent(directory)
+  }
+  return buildSystemPrompt(summary, config.maxSummaryChars)
+}
+
+/**
+ * opencode-plugin-memory — PR-gated project memory.
  *
- * Provides five tools (memory_add, memory_update, memory_delete, memory_read,
- * memory_review) and injects a compact memory summary into every system prompt
- * so the LLM always knows what has been remembered without needing to read the
- * full file.
+ * The agent only PROPOSES memories by writing files into `.memory/staging/`. A
+ * bot (see bot.ts) turns those into pull requests; a human merges them; merged
+ * memories live under `memory/active/` and are indexed in `memory/_summary.md`,
+ * which is the only memory content injected into the system prompt.
  *
- * A background audit runs after sessions go idle and records possible memory
- * conflicts in review.json; it never edits MEMORY.md.
+ * A background semantic audit runs after sessions go idle and asks a model to
+ * flag duplicate / refining / contradicting memories; each finding becomes a
+ * retirement proposal, which the bot turns into a PR.
  *
- * Storage: <projectDir>/.agents/memory/MEMORY.md (committable; `storeDir` overrides)
- * Summary: <projectDir>/.opencode/memory/memory_summary.md (machine-local)
- * Review:  <projectDir>/.opencode/memory/review.json (machine-local)
+ * Layout:
+ *   .memory/staging/   machine-local proposals (git-ignored)
+ *   memory/active/     merged truth
+ *   memory/retired/    retired memories
+ *   memory/_summary.md committed one-line-per-active index
  */
 export const server: Plugin = async (input: PluginInput, options?: PluginOptions): Promise<Hooks> => {
   const config = resolveConfig(options)
   const directory = input.directory
   const logger = createLogger(directory, config.enableLog)
 
-  // One-time migration of a legacy `.opencode/memory/MEMORY.md` into the new
-  // shared store location. Failure is logged, never fatal.
+  // One-time migration of the legacy single-file store into the per-file model.
   try {
-    await migrateLegacyStore(directory, config.storeDir)
+    await migrateLegacyStores(directory, logger)
   } catch (err) {
     await logger.error("migration", err)
   }
@@ -86,7 +99,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
     },
     auditSessions,
   )
-  const memoryTools = createMemoryTools(config, logger, { runAuditNow: () => scheduler.runNow() })
+  const memoryTools = createMemoryTools(config, logger)
 
   const hooks: Hooks = {
     // ── Register the restricted audit agent ───────────────────────────────
@@ -97,7 +110,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 
     // ── Register the five memory tools ────────────────────────────────────
     tool: {
-      memory_add: memoryTools.memory_add,
+      memory_propose: memoryTools.memory_propose,
       memory_update: memoryTools.memory_update,
       memory_delete: memoryTools.memory_delete,
       memory_read: memoryTools.memory_read,
@@ -109,12 +122,10 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
       if (event.type === "session.idle") scheduler.onSessionIdle(event.properties.sessionID)
     },
 
-    // ── Inject memory block into every system prompt ──────────────────────
+    // ── Inject the committed memory index into every system prompt ─────────
     "experimental.chat.system.transform": async (hookInput, output) => {
       if (hookInput.sessionID && auditSessions.has(hookInput.sessionID)) return
-      const store = await readStore(directory, config.storeDir)
-      const nudge = nudgeLine(collectAttention(store, await readReviewState(directory)))
-      output.system.push(buildSystemPrompt(store, config.maxSummaryChars, nudge))
+      output.system.push(await injectMemoryBlock(directory, config))
     },
   }
 
@@ -165,10 +176,8 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
   const directory = ctx.location.directory
   const logger = createLogger(directory, config.enableLog)
 
-  // One-time migration of a legacy `.opencode/memory/MEMORY.md` into the new
-  // shared store location. Failure is logged, never fatal.
   try {
-    await migrateLegacyStore(directory, config.storeDir)
+    await migrateLegacyStores(directory, logger)
   } catch (err) {
     await logger.error("migration", err)
   }
@@ -187,7 +196,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
   }
 
   const scheduler = createAuditScheduler({ directory, config, logger, call }, new Set<string>())
-  const memoryTools = createMemoryTools(config, logger, { runAuditNow: () => scheduler.runNow() })
+  const memoryTools = createMemoryTools(config, logger)
 
   const registrations: Registration[] = []
   registrations.push(
@@ -211,9 +220,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
 
   registrations.push(
     await ctx.session.hook("context", async (event: { system: Array<{ type: "text"; text: string }> }) => {
-      const store = await readStore(directory, config.storeDir)
-      const nudge = nudgeLine(collectAttention(store, await readReviewState(directory)))
-      event.system.push({ type: "text", text: buildSystemPrompt(store, config.maxSummaryChars, nudge) })
+      event.system.push({ type: "text", text: await injectMemoryBlock(directory, config) })
     }),
   )
 

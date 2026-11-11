@@ -1,0 +1,46 @@
+name: Regenerate memory index
+
+# On merge to the default branch, regenerate the committed `memory/_summary.md`
+# from `memory/active/`. The bot never edits the index in its PRs, so this is
+# the single place the index is produced from merged truth.
+#
+# Guarded against infinite loops: it only commits when there is a diff, and the
+# commit is tagged [skip ci] so it does not re-trigger this workflow.
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "memory/**"
+
+jobs:
+  regenerate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm ci
+      - run: npm run build
+      - run: node dist/bot.js regenerate
+
+      - name: Commit and push the regenerated index if it changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet memory/_summary.md; then
+            echo "no change to _summary.md"
+            exit 0
+          fi
+          git add memory/_summary.md
+          git commit -m "chore: regenerate memory index [skip ci]"
+          git push

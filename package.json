@@ -2,10 +2,13 @@
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@chncaesar/opencode-plugin-memory",
   "version": "0.2.1",
-  "description": "Project-scoped persistent memory plugin for OpenCode — LLM-directed add/update/delete plus a model-judged background consistency audit",
+  "description": "PR-gated, project-scoped persistent memory plugin for OpenCode — the LLM proposes, a bot opens a PR, a human merges, CI regenerates the index",
   "type": "module",
   "license": "MIT",
   "main": "./dist/index.js",
+  "bin": {
+    "opencode-memory-bot": "./dist/bot.js"
+  },
   "exports": {
     ".": "./dist/index.js"
   },

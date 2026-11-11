@@ -1,202 +1,132 @@
 import { describe, it } from "node:test"
 import assert from "node:assert/strict"
-import { buildSystemPrompt, buildSummary } from "./summary.js"
+import fs from "fs/promises"
+import os from "os"
+import path from "path"
+import {
+  buildSummaryContent,
+  buildSystemPrompt,
+  extractIndexLines,
+  generateSummary,
+  readSummaryContent,
+} from "./summary.js"
 import { MEMORY_POLICY_EXAMPLES, MEMORY_WRITE_POLICY } from "./prompt.js"
-import { createMemoryTools } from "./tools.js"
-import { DEFAULT_CONFIG } from "./types.js"
-import type { MemoryStore } from "./types.js"
+import { activeDir, summaryFilePath, writeMemoryFile } from "./storage.js"
+import type { Memory } from "./types.js"
 
-function emptyStore(): MemoryStore {
-  return { entries: [], nextSeq: 1 }
+function mem(id: string, title: string): Memory {
+  return { id, title, body: "c", proposedAt: "2026-01-01" }
 }
 
-// ─── buildSystemPrompt ──────────────────────────────────────────────────────
+async function withDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mem-summary-"))
+  try {
+    return await fn(dir)
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+}
+
+describe("buildSummaryContent", () => {
+  it("emits one line per memory, sorted by id", () => {
+    const out = buildSummaryContent([mem("mem-bbbbbbbb", "B"), mem("mem-aaaaaaaa", "A")])
+    assert.ok(out.indexOf("[mem-aaaaaaaa] A") < out.indexOf("[mem-bbbbbbbb] B"))
+  })
+
+  it("marks an empty store", () => {
+    assert.match(buildSummaryContent([]), /no active memories/)
+  })
+})
+
+describe("generateSummary / readSummaryContent", () => {
+  it("writes memory/_summary.md and reads it back", async () => {
+    await withDir(async (dir) => {
+      await writeMemoryFile(activeDir(dir), mem("mem-aaaaaaaa", "First rule"))
+      await generateSummary(dir)
+      const text = await readSummaryContent(dir)
+      assert.match(text, /\[mem-aaaaaaaa\] First rule/)
+      await fs.access(summaryFilePath(dir))
+    })
+  })
+
+  it("returns an empty string when the summary is absent", async () => {
+    await withDir(async (dir) => {
+      assert.equal(await readSummaryContent(dir), "")
+    })
+  })
+})
+
+describe("extractIndexLines", () => {
+  it("keeps only [mem-XXXX] lines", () => {
+    const content = "<!-- header -->\n\n[mem-aaaaaaaa] A\n[mem-bbbbbbbb] B\nnoise\n"
+    assert.deepEqual(extractIndexLines(content), ["[mem-aaaaaaaa] A", "[mem-bbbbbbbb] B"])
+  })
+})
 
 describe("buildSystemPrompt", () => {
-  it("injects a memory-system instruction even when the store is empty", () => {
-    const out = buildSystemPrompt(emptyStore(), 2000)
-    assert.match(out, /persistent, project-scoped memory system/)
-    assert.match(out, /memory_add/)
-    assert.match(out, /No memories are stored/)
-    assert.match(out, /remember this/)
-  })
-
-  it("does not claim entries exist when the store is empty", () => {
-    const out = buildSystemPrompt(emptyStore(), 2000)
-    assert.doesNotMatch(out, /MEM-\d+/)
-  })
-
-  it("injects the complete write policy when memories exist", () => {
-    const store: MemoryStore = {
-      entries: [
-        {
-          id: "MEM-001",
-          title: "Always int for money",
-          content: "Use cents.",
-          added: "2026-08-26",
-          archived: false,
-        },
-      ],
-      nextSeq: 2,
-    }
-    const out = buildSystemPrompt(store, 2000)
-    assert.match(out, /MEM-001/)
+  it("injects the intro and policy, and no index lines when empty", () => {
+    const out = buildSystemPrompt("", 2000)
+    assert.match(out, /PR-gated project memory system/)
+    assert.match(out, /no active memories/)
     assert.ok(out.includes(MEMORY_WRITE_POLICY))
   })
 
-  it("ignores archived entries when deciding empty vs non-empty", () => {
-    const store: MemoryStore = {
-      entries: [
-        {
-          id: "MEM-001",
-          title: "Old entry",
-          content: "archived",
-          added: "2026-08-20",
-          archived: true,
-        },
-      ],
-      nextSeq: 2,
-    }
-    const out = buildSystemPrompt(store, 2000)
-    assert.match(out, /No memories are stored/)
-    assert.doesNotMatch(out, /Old entry/)
+  it("injects the index lines and never full bodies", () => {
+    const content = buildSummaryContent([mem("mem-aaaaaaaa", "First rule")])
+    const out = buildSystemPrompt(content, 2000)
+    assert.match(out, /\[mem-aaaaaaaa\] First rule/)
+    assert.ok(out.includes(MEMORY_WRITE_POLICY))
+  })
+
+  it("truncates a long index to maxChars with a notice", () => {
+    const many = Array.from({ length: 40 }, (_, i) => mem(`mem-${String(i).padStart(8, "0")}`, `Title ${i} with some words`))
+    const content = buildSummaryContent(many)
+    const out = buildSystemPrompt(content, 200)
+    const indexPart = out.split("Project memory index:")[1]!.split("## When to propose")[0]!
+    assert.ok(indexPart.includes("showing a subset"))
+    // The index section (titles only) is capped near maxChars; the policy is
+    // injected separately and is not part of the truncation budget.
+    assert.ok(indexPart.length <= 210)
   })
 })
 
-// ─── memory-writing behavioral policy ──────────────────────────────────────
-
-describe("memory-writing behavioral policy", () => {
-  const nonEmptyStore: MemoryStore = {
-    entries: [
-      {
-        id: "MEM-001",
-        title: "Existing preference",
-        content: "Existing content.",
-        added: "2026-08-26",
-        archived: false,
-      },
-    ],
-    nextSeq: 2,
-  }
-
+describe("memory-writing policy", () => {
   it("covers corrections, confirmations, temporary limits, and task-local requests", () => {
     for (const signal of ["correction", "confirmation", "temporary", "task-local"] as const) {
-      assert.ok(
-        MEMORY_POLICY_EXAMPLES.some((example) => example.signal === signal),
-        `missing ${signal} example`,
-      )
+      assert.ok(MEMORY_POLICY_EXAMPLES.some((e) => e.signal === signal), `missing ${signal} example`)
     }
   })
 
-  for (const [state, store] of [
-    ["empty", emptyStore()],
-    ["non-empty", nonEmptyStore],
-  ] as const) {
-    it(`preserves every behavioral decision in the ${state} store prompt`, () => {
-      const out = buildSystemPrompt(store, 2000)
-      assert.ok(out.includes(MEMORY_WRITE_POLICY))
-
-      for (const example of MEMORY_POLICY_EXAMPLES) {
-        const expectedDecision = example.decision === "save" ? "SAVE" : "DO NOT SAVE"
-        const speaker = example.signal === "llm-discovery" ? "LLM discovers" : "User"
-        const expectedLine =
-          `- ${speaker}: "${example.cue}" -> ${expectedDecision}: ${example.guidance}.`
-        assert.ok(
-          out.includes(expectedLine),
-          `missing ${state} policy decision: ${expectedLine}`,
-        )
-      }
-    })
-  }
-
-  it("uses the same complete policy in the memory_add tool description", () => {
-    const logger = {
-      async info() {},
-      async error() {},
-    }
-    const tools = createMemoryTools(DEFAULT_CONFIG, logger)
-
-    assert.ok(tools.memory_add.description.includes(MEMORY_WRITE_POLICY))
-  })
-})
-
-// ─── buildSummary ───────────────────────────────────────────────────────────
-
-describe("buildSummary", () => {
-  it("lists active entries newest-first", () => {
-    const store: MemoryStore = {
-      entries: [
-        { id: "MEM-001", title: "Old", content: "", added: "2026-08-01", archived: false },
-        { id: "MEM-002", title: "New", content: "", added: "2026-08-30", archived: false },
-      ],
-      nextSeq: 3,
-    }
-    const out = buildSummary(store, 2000)
-    const newIdx = out.indexOf("MEM-002")
-    const oldIdx = out.indexOf("MEM-001")
-    assert.ok(newIdx >= 0 && oldIdx >= 0)
-    assert.ok(newIdx < oldIdx, "newest entry should come first")
+  it("teaches the PR gate and the new tool names", () => {
+    assert.match(MEMORY_WRITE_POLICY, /PROPOSE/i)
+    assert.match(MEMORY_WRITE_POLICY, /memory_propose/)
+    assert.match(MEMORY_WRITE_POLICY, /memory_update/)
+    assert.match(MEMORY_WRITE_POLICY, /memory_delete/)
+    assert.match(MEMORY_WRITE_POLICY, /merge/i)
   })
 
-  it("excludes archived entries", () => {
-    const store: MemoryStore = {
-      entries: [
-        { id: "MEM-001", title: "Active", content: "", added: "2026-08-26", archived: false },
-        { id: "MEM-002", title: "Archived", content: "", added: "2026-08-20", archived: true },
-      ],
-      nextSeq: 3,
-    }
-    const out = buildSummary(store, 2000)
-    assert.match(out, /MEM-001/)
-    assert.doesNotMatch(out, /MEM-002/)
+  it("preserves the granularity and title-coherence rules", () => {
+    assert.match(MEMORY_WRITE_POLICY, /Granularity and title-content coherence/)
+    assert.match(MEMORY_WRITE_POLICY, /Title must summarize the full content/)
   })
 
-  it("truncates to maxChars", () => {
-    const entries = Array.from({ length: 50 }, (_, i) => ({
-      id: `MEM-${String(i + 1).padStart(3, "0")}`,
-      title: `A very long title number ${i + 1} with extra words`,
-      content: "",
-      added: "2026-08-26",
-      archived: false,
-    }))
-    const store: MemoryStore = { entries, nextSeq: 51 }
-    const out = buildSummary(store, 500)
-    assert.ok(out.length <= 500 + 100, `summary too long: ${out.length}`)
-    assert.match(out, /truncated/)
-  })
-})
-
-describe("memory evolution in the prompt", () => {
-  const mk = (id: string, title: string, added: string, updated?: string) => ({
-    id,
-    title,
-    content: "c",
-    added,
-    ...(updated ? { updated } : {}),
-    archived: false,
+  it("tells the model not to record facts a simple query can answer", () => {
+    assert.match(MEMORY_WRITE_POLICY, /Do not record what a simple query can answer/)
+    assert.match(MEMORY_WRITE_POLICY, /production migration version/)
+    assert.ok(
+      MEMORY_POLICY_EXAMPLES.some((e) => e.decision === "skip" && /migration/i.test(e.cue)),
+      "missing skip example for query-derivable state",
+    )
   })
 
-  it("orders by latest of added/updated so a corrected entry survives truncation", () => {
-    const store: MemoryStore = {
-      entries: [mk("MEM-001", "Old but corrected", "2026-01-01", "2026-10-01"), mk("MEM-002", "Newer untouched", "2026-06-01")],
-      nextSeq: 3,
-    }
-    const out = buildSummary(store, 2000)
-    assert.ok(out.indexOf("Old but corrected") < out.indexOf("Newer untouched"))
-  })
-
-  it("appends the nudge line only when given, before the policy", () => {
-    const store: MemoryStore = { entries: [mk("MEM-001", "A", "2026-01-01")], nextSeq: 2 }
-    assert.doesNotMatch(buildSystemPrompt(store, 2000), /Memory maintenance/)
-    const nudged = buildSystemPrompt(store, 2000, "Memory maintenance: 1 possible memory conflict. Run memory_review when convenient.")
-    assert.match(nudged, /Memory maintenance/)
-    assert.ok(nudged.indexOf("Memory maintenance") < nudged.indexOf("## When to write project memory"))
-  })
-
-  it("the policy tells the LLM how to resolve conflicts, and names memory_review", () => {
-    assert.match(MEMORY_WRITE_POLICY, /Keeping memory consistent/)
-    assert.match(MEMORY_WRITE_POLICY, /supersedes/)
-    assert.match(MEMORY_WRITE_POLICY, /memory_review/)
-    assert.match(buildSystemPrompt(emptyStore(), 2000), /memory_review/)
+  it("teaches the model to record the lesson behind a bug fix, not the incident", () => {
+    assert.match(MEMORY_WRITE_POLICY, /Bug fixes: record the lesson, not the incident/)
+    assert.match(MEMORY_WRITE_POLICY, /Root cause/)
+    assert.match(MEMORY_WRITE_POLICY, /Generalize/)
+    assert.match(MEMORY_WRITE_POLICY, /actionable rule/)
+    assert.ok(
+      MEMORY_POLICY_EXAMPLES.some((e) => e.signal === "llm-discovery" && /bug/i.test(e.cue) && /rule/i.test(e.guidance)),
+      "missing bug-lesson example",
+    )
   })
 })

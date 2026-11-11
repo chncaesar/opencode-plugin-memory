@@ -1,116 +1,94 @@
 import fs from "fs/promises"
-import path from "path"
-import type { MemoryStore } from "./types.js"
-import { summaryFilePath, memoryDir } from "./storage.js"
+import { listActiveMemories, memoryRootDir, summaryFilePath } from "./storage.js"
+import type { Memory } from "./types.js"
 import { MEMORY_WRITE_POLICY } from "./prompt.js"
 
-const SUMMARY_HEADER = `<!-- opencode-plugin-memory: project memory summary -->
-<!-- This file is auto-generated — edit MEMORY.md instead -->`
+const SUMMARY_HEADER = [
+  "<!-- opencode-plugin-memory: project memory index -->",
+  "<!-- auto-generated — edit memory files, not this index -->",
+].join("\n")
 
 const MEMORY_SYSTEM_INTRO = [
-  "<!-- opencode-plugin-memory: project memory system -->",
+  "<!-- opencode-plugin-memory: PR-gated project memory system -->",
   "",
-  "You have a persistent, project-scoped memory system (tools: memory_add, memory_update, memory_delete, memory_read, memory_review).",
+  "You have a PR-gated, project-scoped memory system (tools: memory_propose, memory_update, memory_delete, memory_read, memory_review).",
+  "You only PROPOSE memories; a human approves each one by merging a pull request before it becomes active.",
 ].join("\n")
 
 /**
- * Build the text content for memory_summary.md from active entries,
- * truncated to at most maxChars characters.
- *
- * The summary is intentionally compact so it can be injected into every
- * system prompt with minimal token cost.  Entries are ordered newest-first
- * (by "added" date) so the most recent knowledge survives truncation.
+ * Build the committed index: one line per active memory, `[mem-XXXX] Title`,
+ * ordered deterministically (by id) so regeneration is stable across runs.
  */
-export function buildSummary(store: MemoryStore, maxChars: number): string {
-  const active = store.entries
-    .filter((e) => !e.archived)
-    .sort((a, b) => {
-      // Most recently touched first, so a corrected entry is not the first to be truncated.
-      const ka = a.updated && a.updated > a.added ? a.updated : a.added
-      const kb = b.updated && b.updated > b.added ? b.updated : b.added
-      return kb > ka ? 1 : kb < ka ? -1 : 0
-    })
-
-  if (active.length === 0) {
-    return [SUMMARY_HEADER, "", "No memories stored yet.", ""].join("\n")
+export function buildSummaryContent(memories: Memory[]): string {
+  const sorted = [...memories].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+  if (sorted.length === 0) {
+    return `${SUMMARY_HEADER}\n\n<!-- no active memories -->\n`
   }
-
-  const lines: string[] = [
-    SUMMARY_HEADER,
-    "",
-    "Project memories (use memory_read for full content, memory_add/update/delete to manage):",
-    "",
-  ]
-
-  for (const e of active) {
-    const tags = e.tags && e.tags.length > 0 ? ` [${e.tags.join(", ")}]` : ""
-    const line = `- [${e.id}]${tags} ${e.title}`
-    lines.push(line)
-  }
-
-  lines.push("")
-  const full = lines.join("\n")
-
-  if (full.length <= maxChars) return full
-
-  // Truncate: keep header + as many entries as fit, with a truncation notice
-  const header = [
-    SUMMARY_HEADER,
-    "",
-    "Project memories (truncated — use memory_read for full list):",
-    "",
-  ].join("\n")
-
-  const notice = `\n... (${active.length} total; showing recent entries only)\n`
-  const budget = maxChars - header.length - notice.length - 2
-
-  const entryLines = lines.slice(4, -1) // just the "- [MEM-xxx] ..." lines
-  let kept = ""
-  for (const line of entryLines) {
-    if (kept.length + line.length + 1 > budget) break
-    kept += line + "\n"
-  }
-
-  return header + kept + notice
+  return `${SUMMARY_HEADER}\n\n${sorted.map((m) => `[${m.id}] ${m.title}`).join("\n")}\n`
 }
 
 /**
- * Build the full block injected into every system prompt.
- *
- * This is what the LLM actually sees — unlike `buildSummary`, it is not just
- * a list of entries. It always carries an instruction to use the memory
- * system, and it handles the empty store case so a fresh project still learns
- * that memory tools exist (the single biggest reason memory goes unused).
+ * Regenerate `memory/_summary.md` from the active memories. Called by migration
+ * and later by CI on merge. Never called when proposing (proposals must stay
+ * invisible until merged).
  */
-export function buildSystemPrompt(store: MemoryStore, maxChars: number, nudge: string = ""): string {
-  const hasActive = store.entries.some((e) => !e.archived)
-  const memoryState = hasActive
-    ? buildSummary(store, maxChars).trimEnd()
-    : "No memories are stored for this project yet."
-
-  return [MEMORY_SYSTEM_INTRO, memoryState, ...(nudge ? [nudge] : []), MEMORY_WRITE_POLICY, ""].join("\n\n")
+export async function generateSummary(projectDir: string): Promise<void> {
+  const memories = await listActiveMemories(projectDir)
+  await fs.mkdir(memoryRootDir(projectDir), { recursive: true })
+  await fs.writeFile(summaryFilePath(projectDir), buildSummaryContent(memories), "utf8")
 }
 
 /**
- * Write the summary file to disk, creating the directory if needed.
+ * Read the committed index; empty string when it does not exist.
  */
-export async function writeSummary(projectDir: string, store: MemoryStore, maxChars: number): Promise<void> {
-  const dir = memoryDir(projectDir)
-  await fs.mkdir(dir, { recursive: true })
-  const content = buildSummary(store, maxChars)
-  await fs.writeFile(summaryFilePath(projectDir), content, "utf8")
-}
-
-/**
- * Read the current summary file, returning an empty string if it does not exist.
- */
-export async function readSummary(projectDir: string): Promise<string> {
+export async function readSummaryContent(projectDir: string): Promise<string> {
   try {
     return await fs.readFile(summaryFilePath(projectDir), "utf8")
   } catch (err: unknown) {
     if (isNodeError(err) && err.code === "ENOENT") return ""
     throw err
   }
+}
+
+const INDEX_LINE_RE = /^\[mem-[A-Za-z0-9_-]{8}\]/
+
+/** Extract just the `[mem-XXXX] Title` lines from raw summary content. */
+export function extractIndexLines(content: string): string[] {
+  return content
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => INDEX_LINE_RE.test(l))
+}
+
+/**
+ * Build the block injected into every system prompt: the memory-system
+ * introduction, the committed index (titles and ids only, never full bodies),
+ * and the complete writing policy. `summaryContent` is the raw `_summary.md`.
+ */
+export function buildSystemPrompt(summaryContent: string, maxChars: number): string {
+  const lines = extractIndexLines(summaryContent)
+  let index: string
+
+  if (lines.length === 0) {
+    index = "(no active memories — propose your first with memory_propose)"
+  } else {
+    let body = lines.join("\n")
+    if (body.length > maxChars) {
+      const notice = `\n… (${lines.length} active memories; showing a subset — use memory_read for the full list)`
+      const kept: string[] = []
+      let budget = maxChars - notice.length
+      for (const line of lines) {
+        const cost = line.length + (kept.length > 0 ? 1 : 0)
+        if (cost > budget) break
+        kept.push(line)
+        budget -= cost
+      }
+      body = kept.join("\n") + notice
+    }
+    index = body
+  }
+
+  return [MEMORY_SYSTEM_INTRO, "", "Project memory index:", index, MEMORY_WRITE_POLICY, ""].join("\n\n")
 }
 
 function isNodeError(err: unknown): err is NodeJS.ErrnoException {

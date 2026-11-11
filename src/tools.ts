@@ -1,67 +1,90 @@
 import { tool } from "@opencode-ai/plugin/tool"
 import type { ToolDefinition } from "@opencode-ai/plugin/tool"
-import type { PluginConfig } from "./types.js"
+import type { PluginConfig, Memory, RetiredReason } from "./types.js"
 import type { Logger } from "./logging.js"
 import { MEMORY_WRITE_POLICY } from "./prompt.js"
+import {
+  generateMemoryId,
+  listActiveMemories,
+  listRetiredMemories,
+  listStagedProposals,
+  memoryAge,
+  readMemoryById,
+  resolveAuthor,
+  writeProposal,
+  StoreWriteError,
+} from "./storage.js"
+import { detectSecrets } from "./secret.js"
 
 // Use the zod instance bundled with @opencode-ai/plugin to avoid version conflicts
 const z = tool.schema
 
+const ID_SCHEMA = z.string().regex(/^mem-[A-Za-z0-9_-]{8}$/)
+
 type MemoryToolSet = {
-  memory_add: ToolDefinition
+  memory_propose: ToolDefinition
   memory_update: ToolDefinition
   memory_delete: ToolDefinition
   memory_read: ToolDefinition
   memory_review: ToolDefinition
 }
 
-import {
-  readStore,
-  writeStore,
-  addEntry,
-  addSupersedingEntry,
-  updateEntry,
-  archiveEntry,
-  searchEntries,
-  StoreWriteError,
-} from "./storage.js"
-import { detectSecrets } from "./secret.js"
-import { writeSummary } from "./summary.js"
-import type { AuditOutcome } from "./audit.js"
-import {
-  activeEntries,
-  collectAttention,
-  dismissItems,
-  findAging,
-  formatReview,
-  readReviewState,
-  writeReviewState,
-} from "./review.js"
-
-export type ToolDeps = {
-  /** Runs a forced audit (bypasses the interval) and returns its outcome. */
-  runAuditNow?: () => Promise<AuditOutcome>
+/** Map a free-text retirement reason onto the fixed vocabulary (default `stale`). */
+export function mapRetireReason(reason?: string): RetiredReason {
+  if (!reason) return "stale"
+  const r = reason.toLowerCase()
+  if (/wrong|incorrect|false|错误|不正确/.test(r)) return "wrong"
+  if (/duplicat|\bdup\b|重复/.test(r)) return "duplicate"
+  if (/useless|pointless|无用|没用/.test(r)) return "useless"
+  if (/supersed|replac|取代|替代|替换/.test(r)) return "superseded"
+  if (/stale|outdated|obsolete|过期|过时|陈旧/.test(r)) return "stale"
+  return "stale"
 }
 
-/**
- * Create all five memory tools bound to the given plugin config and logger.
- * Each tool reads and writes the shared store at `<projectDir>/<storeDir>/MEMORY.md`
- * (default `.agents/memory`); machine-local files stay under `.opencode/memory/`.
- */
-export function createMemoryTools(config: PluginConfig, logger: Logger, deps: ToolDeps = {}): MemoryToolSet {
-  // ── memory_add ────────────────────────────────────────────────────────────
+function normalize(text: string): string {
+  return text.replace(/\s+/g, " ").trim()
+}
 
-  const memory_add = tool({
-    description: `Persist durable knowledge for future OpenCode sessions in this project. User corrections and confirmed preferences are high-priority memories, even when the user does not explicitly ask you to remember them.
+/** Find an existing memory that duplicates the candidate by title or content. */
+function findDuplicate(title: string, content: string, existing: Memory[]): Memory | null {
+  const t = normalize(title).toLowerCase()
+  const c = normalize(content)
+  return (
+    existing.find(
+      (m) => normalize(m.title).toLowerCase() === t || (c.length > 0 && normalize(m.body) === c),
+    ) ?? null
+  )
+}
+
+function secretReject(logger: Logger, action: string, secrets: string[]): { title: string; output: string } {
+  void logger.info(action, "rejected: secret scan")
+  return {
+    title: "Memory not proposed",
+    output: `The content appears to contain a credential (${secrets.join(", ")}). It was not proposed. Rewrite without credentials — never store secrets or tokens in project memory.`,
+  }
+}
+
+const PROPOSE_DESCRIPTION = `Propose durable project knowledge for review. A proposal is a suggestion only: it becomes an active memory only after a human reviews and merges a pull request.
 
 ${MEMORY_WRITE_POLICY}
 
-After adding, the memory is immediately visible in future session system prompts. Similarity between memories is judged by a model in the background audit, not by this tool: if you suspect the new entry duplicates or contradicts an existing one, call memory_review with refresh=true.
+Proposed memories are NOT yet active. Do not propose a duplicate — first check the index and, when unsure, use memory_read.
 
-To REPLACE an existing memory, pass its ID in supersedes. The old entry is archived with a link to the new one in the same step; do not add and delete separately.`,
+To REPLACE an existing active memory, pass its ID in supersedes; the replacement retires the old one in the same PR (do not add and delete separately).`
+
+/**
+ * Create the five memory tools bound to the given plugin config and logger.
+ * Each tool only ever PROPOSES: it writes a file into `.memory/staging/`. The
+ * merged store under `memory/active/` is never edited by any tool.
+ */
+export function createMemoryTools(config: PluginConfig, logger: Logger): MemoryToolSet {
+  // ── memory_propose ────────────────────────────────────────────────────────
+
+  const memory_propose = tool({
+    description: PROPOSE_DESCRIPTION,
     args: {
       title: z.string().max(120).describe(
-        "Short one-line title shown in the summary. Must fully represent the content: a future LLM reading only the title must be able to decide whether to load this entry. " +
+        "Short one-line title shown in the index. Must fully represent the content: a future LLM reading only the title must be able to decide whether to load this entry. " +
         "One entry = one distinct rule or fact. If the content covers multiple independent behaviors, split into separate entries with separate titles. " +
         "Name the specific behavior, not just the domain. Bad: 'Metabase display rules'. Good: 'Metabase drill-through: use details-only to hide columns, not hidden'."
       ),
@@ -73,70 +96,69 @@ To REPLACE an existing memory, pass its ID in supersedes. The old entry is archi
         .optional()
         .describe("Optional tags for grouping, e.g. ['coding-style', 'workflow', 'architecture']"),
       supersedes: z
-        .array(z.string().regex(/^MEM-\d+$/))
+        .array(ID_SCHEMA)
         .optional()
-        .describe("IDs of active memories this entry replaces (e.g. ['MEM-004']). They are archived and linked to the new entry. All IDs must be active or nothing is saved."),
+        .describe("IDs of active memories this proposal replaces. All IDs must be active or nothing is proposed."),
     },
     async execute({ title, content, tags, supersedes }, context) {
       try {
         const secrets = detectSecrets(`${title}\n${content}`)
-        if (secrets.length > 0) {
-          await logger.info("memory_add", "rejected: secret scan")
-          return {
-            title: "Memory not saved",
-            output: `The content appears to contain a credential (${secrets.join(", ")}). It was not saved. Rewrite without credentials — never store secrets or tokens in project memory.`,
-          }
-        }
+        if (secrets.length > 0) return secretReject(logger, "memory_propose", secrets)
 
-        const store = await readStore(context.directory, config.storeDir)
-        let updated = store
-        let id: string
-        let archivedIds: string[] = []
+        const active = await listActiveMemories(context.directory)
 
         if (supersedes && supersedes.length > 0) {
-          const r = addSupersedingEntry(store, title, content, tags, supersedes)
-          if (!r.ok) {
-            await logger.info("memory_add", `rejected: ${r.error}`)
+          const activeIds = new Set(active.map((m) => m.id))
+          const bad = [...new Set(supersedes)].filter((id) => !activeIds.has(id))
+          if (bad.length > 0) {
+            await logger.info("memory_propose", `rejected: unknown supersedes ${bad.join(", ")}`)
             return {
-              title: "Memory not saved",
-              output: `${r.error}\nUse memory_read to list active memory IDs.`,
+              title: "Memory not proposed",
+              output: `Cannot supersede ${bad.join(", ")}: not an active memory. Use memory_read to list active memory IDs.`,
             }
           }
-          updated = r.store
-          id = r.id
-          archivedIds = r.archivedIds
-        } else {
-          const r = addEntry(store, title, content, tags)
-          updated = r.store
-          id = r.id
         }
 
-        await writeStore(context.directory, updated, config.storeDir)
-        await writeSummary(context.directory, updated, config.maxSummaryChars)
-        await logger.info(
-          "memory_add",
-          `${id}: ${title}${archivedIds.length ? ` (supersedes ${archivedIds.join(", ")})` : ""}`,
-        )
-
-        const out: string[] = [`Saved as [${id}]: ${title}`, "", "Content:", content]
-        if (archivedIds.length > 0) {
-          out.push("", `Archived (superseded by ${id}): ${archivedIds.join(", ")}`)
+        const staged = await listStagedProposals(context.directory)
+        const duplicate = findDuplicate(title, content, [...active, ...staged])
+        if (duplicate) {
+          await logger.info("memory_propose", `skipped: duplicate of ${duplicate.id}`)
+          return {
+            title: "Memory not proposed",
+            output: `A memory with the same title or content already exists (${duplicate.id}). Do not propose a duplicate — skip this one.`,
+          }
         }
 
-        if (activeEntries(updated).filter((e) => e.id !== id).length > 0) {
-          out.push(
-            "",
-            "If this entry may duplicate or contradict an existing memory, call memory_review with refresh=true to run the semantic check now, or wait for the background audit.",
-          )
+        const id = generateMemoryId()
+        const author = await resolveAuthor(context.directory)
+        const memory: Memory = {
+          id,
+          title,
+          body: content,
+          author,
+          source: "memory_propose",
+          proposedAt: new Date().toISOString(),
+          intent: "propose",
         }
+        if (tags !== undefined && tags.length > 0) memory.tags = tags
+        if (supersedes !== undefined && supersedes.length > 0) memory.supersedes = [...new Set(supersedes)]
 
-        return { title: `Memory saved: ${id}`, output: out.join("\n") }
+        await writeProposal(context.directory, memory)
+        await logger.info("memory_propose", `${id}: ${title}`)
+
+        const out = [
+          `Proposed [${id}]: ${title}`,
+          "",
+          "This is a proposal only. It becomes an active memory after a human reviews and merges the pull request.",
+        ]
+        if (memory.supersedes?.length) out.push("", `Supersedes: ${memory.supersedes.join(", ")}`)
+        return { title: `Memory proposed: ${id}`, output: out.join("\n") }
       } catch (err) {
         if (err instanceof StoreWriteError) {
-          await logger.info("memory_add", "rejected: store not writable")
-          return { title: "Memory not saved", output: err.message }
+          await logger.info("memory_propose", "rejected: staging not writable")
+          return { title: "Memory not proposed", output: err.message }
         }
-        await logger.error("memory_add", err)
+        await logger.error("memory_propose", err)
         throw err
       }
     },
@@ -145,69 +167,68 @@ To REPLACE an existing memory, pass its ID in supersedes. The old entry is archi
   // ── memory_update ─────────────────────────────────────────────────────────
 
   const memory_update = tool({
-    description: `Update an existing memory entry by its ID (e.g. MEM-001).
+    description: `Update an existing active memory by its ID (e.g. mem-abc12345).
+
+memory_update does NOT edit the active memory. It PROPOSES a replacement: a new memory that carries supersedes: [id]. The old memory is retired and the new one becomes active only after a human merges the pull request.
 
 Use this when:
 - An existing memory is outdated or incorrect (API changed, preference changed)
 - The user corrects or refines something already remembered
 - You want to add more detail to an existing entry
-- You checked an entry (for example one listed as aging in memory_review) and it still holds: call with only the id to re-confirm it. This refreshes its updated date and changes nothing else.
 
-You can update the title, content, or tags, or any combination.
-If the change reverses the entry's meaning or replaces it with a different rule, use memory_add with supersedes instead, so the history is kept.
+You can update the title, content, or tags, or any combination. Fields you omit are copied from the existing memory.
 If you are unsure of the exact ID, call memory_read first to find it.`,
     args: {
-      id: z.string().regex(/^MEM-\d+$/).describe("The memory ID to update, e.g. MEM-001"),
+      id: ID_SCHEMA.describe("The memory ID to update, e.g. mem-abc12345"),
       title: z.string().max(120).optional().describe(
-        "New title (leave empty to keep existing). Must fully represent the content — see memory_add for granularity rules."
+        "New title (leave empty to keep existing). Must fully represent the content — see memory_propose for granularity rules."
       ),
       content: z.string().optional().describe("New content (leave empty to keep existing)"),
       tags: z.array(z.string()).optional().describe("New tags (leave empty to keep existing)"),
     },
     async execute({ id, title, content, tags }, context) {
       try {
-        const scanText = [title, content].filter((x) => x !== undefined).join("\n")
-        const secrets = detectSecrets(scanText)
-        if (secrets.length > 0) {
-          await logger.info("memory_update", "rejected: secret scan")
-          return {
-            title: "Memory not saved",
-            output: `The content appears to contain a credential (${secrets.join(", ")}). It was not saved. Rewrite without credentials — never store secrets or tokens in project memory.`,
-          }
-        }
-
-        const store = await readStore(context.directory, config.storeDir)
-        const before = store.entries.find((e) => e.id === id && !e.archived)
-        const updated = updateEntry(store, id, {
-          ...(title !== undefined ? { title } : {}),
-          ...(content !== undefined ? { content } : {}),
-          ...(tags !== undefined ? { tags } : {}),
-        })
-        if (!updated) {
+        const active = await listActiveMemories(context.directory)
+        const target = active.find((m) => m.id === id)
+        if (!target) {
           await logger.info("memory_update", `${id} not found`)
           return {
             title: "Memory not found",
             output: `No active memory with ID ${id}. Use memory_read to list all active memories.`,
           }
         }
-        await writeStore(context.directory, updated, config.storeDir)
-        await writeSummary(context.directory, updated, config.maxSummaryChars)
-        const entry = updated.entries.find((e) => e.id === id)!
-        const changed = before && (before.title !== entry.title || before.content !== entry.content)
-        await logger.info(
-          "memory_update",
-          changed
-            ? `${id}: ${entry.title} | previous=${JSON.stringify({ title: before.title, content: before.content, tags: before.tags ?? [] })}`
-            : `${id}: ${entry.title} (reconfirmed or tags only)`,
-        )
+
+        const newTitle = title !== undefined ? title : target.title
+        const newContent = content !== undefined ? content : target.body
+        const newTags = tags !== undefined ? tags : target.tags
+
+        const secrets = detectSecrets(`${newTitle}\n${newContent}`)
+        if (secrets.length > 0) return secretReject(logger, "memory_update", secrets)
+
+        const newId = generateMemoryId()
+        const author = await resolveAuthor(context.directory)
+        const memory: Memory = {
+          id: newId,
+          title: newTitle,
+          body: newContent,
+          author,
+          source: "memory_update",
+          proposedAt: new Date().toISOString(),
+          supersedes: [id],
+          intent: "propose",
+        }
+        if (newTags !== undefined && newTags.length > 0) memory.tags = newTags
+
+        await writeProposal(context.directory, memory)
+        await logger.info("memory_update", `${newId} supersedes ${id}`)
         return {
-          title: `Memory updated: ${id}`,
-          output: `Updated [${id}]: ${entry.title}\n\nContent:\n${entry.content}`,
+          title: `Memory update proposed: ${newId}`,
+          output: `Proposed [${newId}] as a replacement for [${id}]: ${newTitle}\n\nThis is a proposal only; it takes effect after a human merges the pull request.`,
         }
       } catch (err) {
         if (err instanceof StoreWriteError) {
-          await logger.info("memory_update", "rejected: store not writable")
-          return { title: "Memory not saved", output: err.message }
+          await logger.info("memory_update", "rejected: staging not writable")
+          return { title: "Memory not proposed", output: err.message }
         }
         await logger.error("memory_update", err)
         throw err
@@ -218,66 +239,54 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
   // ── memory_delete ─────────────────────────────────────────────────────────
 
   const memory_delete = tool({
-    description: `Soft-delete a memory entry by its ID (moves it to the Archived section).
+    description: `Propose retiring an active memory by its ID.
+
+memory_delete does NOT edit the active memory. It writes a retirement proposal: a staging file naming the target id and a reason. The memory moves to retired/ only after a human merges the pull request.
 
 Use this when:
 - The user says "forget this", "remove this memory", "this is no longer relevant"
 - A memory is clearly obsolete (old API, old architecture, old workflow)
 - A memory is a leftover test or placeholder
 
-Always give a short reason; it is stored on the archived entry. If another existing memory replaces this one, pass its ID as superseded_by. To replace a memory with NEW content, prefer memory_add with supersedes, which does both steps at once.
-
-The entry is not permanently erased — it moves to the Archived section in MEMORY.md and can be listed with memory_read include_archived. Restoring means editing the file or adding a new memory.
-
+Give a short reason; it is mapped to a fixed vocabulary (wrong, stale, useless, superseded, duplicate; default stale).
 If you are unsure of the exact ID, call memory_read first to find it.`,
     args: {
-      id: z.string().regex(/^MEM-\d+$/).describe("The memory ID to delete, e.g. MEM-001"),
-      reason: z.string().optional().describe("Short reason for archiving (stored on the entry; strongly recommended)"),
-      superseded_by: z
-        .string()
-        .regex(/^MEM-\d+$/)
-        .optional()
-        .describe("ID of the active memory that replaces this one, if any"),
+      id: ID_SCHEMA.describe("The memory ID to retire, e.g. mem-abc12345"),
+      reason: z.string().optional().describe("Short reason for retiring (mapped to a fixed vocabulary)"),
     },
-    async execute({ id, reason, superseded_by }, context) {
+    async execute({ id, reason }, context) {
       try {
-        const store = await readStore(context.directory, config.storeDir)
-        if (superseded_by) {
-          if (superseded_by === id || !store.entries.some((e) => e.id === superseded_by && !e.archived)) {
-            return {
-              title: "Memory not archived",
-              output: `superseded_by ${superseded_by} must be a different, active memory. Nothing was changed.`,
-            }
-          }
-        }
-        const updated = archiveEntry(store, id, {
-          ...(reason !== undefined ? { reason } : {}),
-          ...(superseded_by !== undefined ? { supersededBy: superseded_by } : {}),
-        })
-        if (!updated) {
+        const active = await listActiveMemories(context.directory)
+        const target = active.find((m) => m.id === id)
+        if (!target) {
           await logger.info("memory_delete", `${id} not found`)
           return {
             title: "Memory not found",
             output: `No active memory with ID ${id}. Use memory_read to list all active memories.`,
           }
         }
-        await writeStore(context.directory, updated, config.storeDir)
-        await writeSummary(context.directory, updated, config.maxSummaryChars)
-        const reasonNote = reason ? ` (reason: ${reason})` : ""
-        const linkNote = superseded_by ? ` (superseded by ${superseded_by})` : ""
-        await logger.info("memory_delete", `${id}${reasonNote}${linkNote}`)
-        const notes = [
-          reason ? `Reason: ${reason}` : "",
-          superseded_by ? `Superseded by: ${superseded_by}` : "",
-        ].filter(Boolean)
+
+        const mapped = mapRetireReason(reason)
+        const author = await resolveAuthor(context.directory)
+        await writeProposal(context.directory, {
+          id,
+          title: target.title,
+          body: "",
+          author,
+          source: "memory_delete",
+          proposedAt: new Date().toISOString(),
+          intent: "retire",
+          retiredReason: mapped,
+        })
+        await logger.info("memory_delete", `${id} (reason: ${mapped})`)
         return {
-          title: `Memory archived: ${id}`,
-          output: [`[${id}] has been moved to the Archived section.`, ...notes].join("\n"),
+          title: `Memory retirement proposed: ${id}`,
+          output: `Proposed retiring [${id}]: ${target.title}\nReason: ${mapped}.\n\nThis is a proposal only; the memory is removed after a human merges the pull request.`,
         }
       } catch (err) {
         if (err instanceof StoreWriteError) {
-          await logger.info("memory_delete", "rejected: store not writable")
-          return { title: "Memory not saved", output: err.message }
+          await logger.info("memory_delete", "rejected: staging not writable")
+          return { title: "Memory not proposed", output: err.message }
         }
         await logger.error("memory_delete", err)
         throw err
@@ -288,149 +297,135 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
   // ── memory_read ───────────────────────────────────────────────────────────
 
   const memory_read = tool({
-    description: `Read active memory entries, optionally filtered by a keyword.
+    description: `Read memory entries, optionally filtered by a keyword.
 
 Use this when:
-- You need the full content of a specific memory (the summary only shows titles)
-- You want to find the ID of a memory before updating or deleting it
+- You need the full content of a specific memory (the index only shows titles)
+- You want to find the ID of a memory before updating or retiring it
 - You want to verify what is currently stored
-- You want to see why something was archived or what replaced it (set include_archived)
 
-Returns all active entries, or only those matching the search query. Archived entries are listed only when include_archived is true.`,
+Returns full bodies of active memories, plus your own staged proposals (marked "pending — not yet merged"), so you do not propose a duplicate. Retired memories are listed only when include_retired is true.`,
     args: {
       query: z
         .string()
         .optional()
-        .describe("Optional keyword to filter entries (matches title, content, and tags)"),
-      include_archived: z
+        .describe("Optional keyword to filter entries (matches id, title, content, and tags)"),
+      include_retired: z
         .boolean()
         .optional()
-        .describe("Also list archived entries with their archive date, reason and replacement. Default false."),
+        .describe("Also list retired memories with their retirement reason. Default false."),
     },
-    async execute({ query, include_archived }, context) {
-      const store = await readStore(context.directory, config.storeDir)
-      const entries = query ? searchEntries(store, query) : store.entries.filter((e) => !e.archived)
-      const q = query?.toLowerCase()
-      const archived = include_archived
-        ? store.entries.filter(
-            (e) =>
-              e.archived &&
-              (!q ||
-                e.title.toLowerCase().includes(q) ||
-                e.content.toLowerCase().includes(q) ||
-                (e.tags ?? []).some((t) => t.toLowerCase().includes(q))),
-          )
-        : []
+    async execute({ query, include_retired }, context) {
+      const active = await listActiveMemories(context.directory)
+      const retired = include_retired ? await listRetiredMemories(context.directory) : []
+      const staged = await listStagedProposals(context.directory)
 
-      if (entries.length === 0 && archived.length === 0) {
+      const q = query?.toLowerCase()
+      const matches = (m: Memory) =>
+        !q ||
+        m.id.toLowerCase().includes(q) ||
+        m.title.toLowerCase().includes(q) ||
+        m.body.toLowerCase().includes(q) ||
+        (m.tags ?? []).some((t) => t.toLowerCase().includes(q))
+
+      const activeOut = active.filter(matches)
+      const retiredOut = retired.filter(matches)
+      const stagedOut = staged.filter(matches)
+
+      if (activeOut.length === 0 && retiredOut.length === 0 && stagedOut.length === 0) {
         const msg = query
-          ? `No ${include_archived ? "" : "active "}memories matching "${query}".`
-          : "No active memories stored yet. Use memory_add to save knowledge."
+          ? `No memories matching "${query}".`
+          : "No active memories yet. Use memory_propose to propose knowledge."
         return { title: "Memory read", output: msg }
       }
 
       const lines: string[] = []
-      if (entries.length > 0 || !include_archived) {
-        lines.push(`Found ${entries.length} active ${entries.length === 1 ? "memory" : "memories"}:\n`)
-      }
-      for (const e of entries) {
-        const tags = e.tags && e.tags.length > 0 ? ` [${e.tags.join(", ")}]` : ""
-        const updated = e.updated ? ` (updated ${e.updated})` : ""
-        lines.push(`### [${e.id}]${tags} ${e.title}`)
-        lines.push(`Added: ${e.added}${updated}`)
-        lines.push(e.content)
+      lines.push(`Active memories (${activeOut.length}):\n`)
+      for (const m of activeOut) lines.push(...formatMemory(m))
+      lines.push(`Pending proposals — not yet merged (${stagedOut.length}):\n`)
+      for (const m of stagedOut) {
+        const kind = m.intent === "retire" ? "retire" : "propose"
+        lines.push(`### [${m.id}] ${m.title} (${kind})`)
+        if (m.intent === "retire") lines.push(`Retirement proposal (reason: ${m.retiredReason ?? "stale"}) — no body.`)
+        else if (m.body) lines.push(m.body)
         lines.push("")
       }
-
-      if (include_archived) {
-        lines.push(`Archived (${archived.length}):\n`)
-        for (const e of archived) {
-          const tags = e.tags && e.tags.length > 0 ? ` [${e.tags.join(", ")}]` : ""
-          lines.push(`### [${e.id}]${tags} ${e.title}`)
-          const meta = [`Added: ${e.added}`]
-          if (e.archivedAt) meta.push(`archived ${e.archivedAt}`)
-          if (e.archivedReason) meta.push(`reason: ${e.archivedReason}`)
-          if (e.supersededBy) meta.push(`superseded by ${e.supersededBy}`)
-          lines.push(meta.join(" | "))
-          lines.push(e.content)
-          lines.push("")
+      if (include_retired) {
+        lines.push(`Retired memories (${retiredOut.length}):\n`)
+        for (const m of retiredOut) {
+          const meta = [m.retiredAt ? `retired ${m.retiredAt}` : "", m.retiredReason ? `reason: ${m.retiredReason}` : "", m.supersededBy ? `superseded by ${m.supersededBy}` : ""].filter(Boolean)
+          lines.push(`### [${m.id}] ${m.title}`)
+          if (meta.length) lines.push(meta.join(" | "))
+          lines.push(m.body, "")
         }
       }
 
-      return {
-        title: `Memory read (${entries.length}${include_archived ? ` + ${archived.length} archived` : ""})`,
-        output: lines.join("\n"),
-      }
+      const total = activeOut.length + (include_retired ? retiredOut.length : 0)
+      return { title: `Memory read (${total}${stagedOut.length ? ` + ${stagedOut.length} pending` : ""})`, output: lines.join("\n") }
     },
   })
 
   // ── memory_review ─────────────────────────────────────────────────────────
 
   const memory_review = tool({
-    description: `List memories that may need maintenance, and record decisions to keep them as they are.
+    description: `A read-only overview of the memory store. Shows active memories (id + title), pending proposals, aging memories, and — on request — retired memories.
 
-Use this when the system prompt says memories need review, or when asked to clean up memory. It shows:
-- Possible conflicts found by the background audit (duplicate, refinement, contradiction), with the full text of the entries involved
-- Placeholder-like entries (test or temporary leftovers)
-- Aging entries that have not been touched for a long time (informational)
-
-Similarity is judged by a model, never by keyword matching. Set refresh to run that semantic audit immediately (bypassing the usual interval) and return its findings; otherwise cached findings are shown.
-
-For each item decide, then act with the other memory tools: merge or replace with memory_add supersedes, correct with memory_update, remove with memory_delete (give a reason). If two entries legitimately coexist, or a placeholder is intentional, pass its key in dismiss; it will not be raised again until one of the entries changes.`,
+Use this when the system prompt says memories need review, or when cleaning up memory. It never edits anything; use memory_propose / memory_update / memory_delete to propose changes.`,
     args: {
-      dismiss: z
-        .array(z.string())
-        .optional()
-        .describe("Item keys (as shown in the review output) to record as 'keep as is'"),
-      refresh: z
+      include_retired: z
         .boolean()
         .optional()
-        .describe("Run the semantic audit now instead of showing cached findings. Use after a write that may duplicate or contradict an existing memory."),
+        .describe("Also list retired memories. Default false."),
     },
-    async execute({ dismiss, refresh }, context) {
-      try {
-        const notes: string[] = []
+    async execute({ include_retired }, context) {
+      const active = await listActiveMemories(context.directory)
+      const staged = await listStagedProposals(context.directory)
+      const retired = include_retired ? await listRetiredMemories(context.directory) : []
 
-        if (refresh) {
-          if (!config.backgroundAudit) {
-            notes.push("Background audit is disabled; showing cached findings.")
-          } else if (deps.runAuditNow) {
-            notes.push(`Audit run: ${await deps.runAuditNow()}.`)
-          }
-        }
+      const now = new Date()
+      const aging = active
+        .map((m) => ({ memory: m, age: memoryAge(m, now) }))
+        .filter((a) => !Number.isNaN(a.age) && a.age >= config.staleDays)
+        .sort((a, b) => b.age - a.age)
 
-        const store = await readStore(context.directory, config.storeDir)
-        let state = await readReviewState(context.directory)
+      const lines: string[] = []
+      lines.push(`## Active memories (${active.length})`)
+      if (active.length === 0) lines.push("None.")
+      for (const m of active) lines.push(`- [${m.id}] ${m.title}`)
 
-        if (dismiss && dismiss.length > 0) {
-          const out = dismissItems(store, state, dismiss)
-          state = out.state
-          if (out.dismissed.length > 0) {
-            await writeReviewState(context.directory, state)
-            notes.push(`Dismissed: ${out.dismissed.join(", ")}`)
-            await logger.info("memory_review", `dismissed ${out.dismissed.join(", ")}`)
-          }
-          if (out.unknown.length > 0) {
-            notes.push(`Not a current review item (ignored): ${out.unknown.join(", ")}`)
-          }
-        }
-
-        const items = collectAttention(store, state)
-        const aging = findAging(store, config.staleDays)
-        const body = formatReview(store, items, aging, config.staleDays, {
-          lastAuditAt: state.lastAuditAt,
-          enabled: config.backgroundAudit,
-        })
-        return {
-          title: `Memory review (${items.length} item${items.length === 1 ? "" : "s"})`,
-          output: [...notes, ...(notes.length ? [""] : []), body].join("\n"),
-        }
-      } catch (err) {
-        await logger.error("memory_review", err)
-        throw err
+      lines.push("", `## Pending proposals — not yet merged (${staged.length})`)
+      if (staged.length === 0) lines.push("None.")
+      for (const m of staged) {
+        const kind = m.intent === "retire" ? "retire" : "propose"
+        const note = m.intent === "retire" ? ` (retire, reason: ${m.retiredReason ?? "stale"})` : ""
+        lines.push(`- [${m.id}] ${m.title} (${kind})${note}`)
       }
+
+      lines.push("", `## Aging memories (not touched for ${config.staleDays}+ days)`)
+      if (aging.length === 0) lines.push("None.")
+      for (const a of aging) lines.push(`- [${a.memory.id}] ${a.memory.title} (${a.age} days)`)
+      if (aging.length > 0) {
+        lines.push("", "For aging memories: check whether they still hold. If yes, propose a refresh with memory_update; if not, memory_delete with a reason.")
+      }
+
+      if (include_retired) {
+        lines.push("", `## Retired memories (${retired.length})`)
+        if (retired.length === 0) lines.push("None.")
+        for (const m of retired) lines.push(`- [${m.id}] ${m.title}${m.retiredReason ? ` (${m.retiredReason})` : ""}`)
+      }
+
+      return { title: `Memory review (${active.length} active)`, output: lines.join("\n") }
     },
   })
 
-  return { memory_add, memory_update, memory_delete, memory_read, memory_review }
+  return { memory_propose, memory_update, memory_delete, memory_read, memory_review }
+}
+
+function formatMemory(m: Memory): string[] {
+  const tags = m.tags && m.tags.length > 0 ? ` [${m.tags.join(", ")}]` : ""
+  const lines = [`### [${m.id}]${tags} ${m.title}`]
+  const meta = [m.approvedAt ? `approved ${m.approvedAt}` : ""].filter(Boolean)
+  if (meta.length) lines.push(meta.join(" | "))
+  lines.push(m.body, "")
+  return lines
 }

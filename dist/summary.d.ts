@@ -1,28 +1,25 @@
-import type { MemoryStore } from "./types.js";
+import type { Memory } from "./types.js";
 /**
- * Build the text content for memory_summary.md from active entries,
- * truncated to at most maxChars characters.
- *
- * The summary is intentionally compact so it can be injected into every
- * system prompt with minimal token cost.  Entries are ordered newest-first
- * (by "added" date) so the most recent knowledge survives truncation.
+ * Build the committed index: one line per active memory, `[mem-XXXX] Title`,
+ * ordered deterministically (by id) so regeneration is stable across runs.
  */
-export declare function buildSummary(store: MemoryStore, maxChars: number): string;
+export declare function buildSummaryContent(memories: Memory[]): string;
 /**
- * Build the full block injected into every system prompt.
- *
- * This is what the LLM actually sees — unlike `buildSummary`, it is not just
- * a list of entries. It always carries an instruction to use the memory
- * system, and it handles the empty store case so a fresh project still learns
- * that memory tools exist (the single biggest reason memory goes unused).
+ * Regenerate `memory/_summary.md` from the active memories. Called by migration
+ * and later by CI on merge. Never called when proposing (proposals must stay
+ * invisible until merged).
  */
-export declare function buildSystemPrompt(store: MemoryStore, maxChars: number, nudge?: string): string;
+export declare function generateSummary(projectDir: string): Promise<void>;
 /**
- * Write the summary file to disk, creating the directory if needed.
+ * Read the committed index; empty string when it does not exist.
  */
-export declare function writeSummary(projectDir: string, store: MemoryStore, maxChars: number): Promise<void>;
+export declare function readSummaryContent(projectDir: string): Promise<string>;
+/** Extract just the `[mem-XXXX] Title` lines from raw summary content. */
+export declare function extractIndexLines(content: string): string[];
 /**
- * Read the current summary file, returning an empty string if it does not exist.
+ * Build the block injected into every system prompt: the memory-system
+ * introduction, the committed index (titles and ids only, never full bodies),
+ * and the complete writing policy. `summaryContent` is the raw `_summary.md`.
  */
-export declare function readSummary(projectDir: string): Promise<string>;
+export declare function buildSystemPrompt(summaryContent: string, maxChars: number): string;
 //# sourceMappingURL=summary.d.ts.map

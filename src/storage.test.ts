@@ -4,517 +4,25 @@ import fs from "fs/promises"
 import os from "os"
 import path from "path"
 import {
-  parseMemory,
-  serializeMemory,
-  addEntry,
-  updateEntry,
-  archiveEntry,
-  addSupersedingEntry,
-  resolveSuccessor,
-  searchEntries,
-  storeDir,
-  memoryFilePath,
-  validStoreDir,
-  writeStore,
-  readStore,
-  migrateLegacyStore,
+  activeDir,
+  generateMemoryId,
+  isMemoryId,
+  listActiveMemories,
+  listRetiredMemories,
+  listStagedProposals,
+  memoryAge,
+  moveToActive,
+  moveToRetired,
+  readMemoryById,
+  readMemoryFile,
+  resolveAuthor,
+  retiredDir,
+  stagingDir,
+  writeMemoryFile,
+  writeProposal,
   StoreWriteError,
 } from "./storage.js"
-import type { MemoryStore } from "./types.js"
-
-// ─── parseMemory ─────────────────────────────────────────────────────────────
-
-describe("parseMemory", () => {
-  it("returns empty store for blank input", () => {
-    const store = parseMemory("")
-    assert.equal(store.entries.length, 0)
-    assert.equal(store.nextSeq, 1)
-  })
-
-  it("parses nextSeq from comment", () => {
-    const store = parseMemory("# OpenCode Memory\n<!-- nextSeq: 7 -->\n\n## Active\n")
-    assert.equal(store.nextSeq, 7)
-  })
-
-  it("parses a single active entry", () => {
-    const text = [
-      "# OpenCode Memory",
-      "<!-- nextSeq: 2 -->",
-      "",
-      "## Active",
-      "",
-      "### [MEM-001] Use int for money",
-      "- added: 2026-08-26",
-      "- tags: coding-style, finance",
-      "Always store amounts as int cents.",
-      "",
-      "## Archived",
-      "",
-    ].join("\n")
-
-    const store = parseMemory(text)
-    assert.equal(store.entries.length, 1)
-    const e = store.entries[0]!
-    assert.equal(e.id, "MEM-001")
-    assert.equal(e.title, "Use int for money")
-    assert.equal(e.added, "2026-08-26")
-    assert.deepEqual(e.tags, ["coding-style", "finance"])
-    assert.equal(e.content, "Always store amounts as int cents.")
-    assert.equal(e.archived, false)
-  })
-
-  it("parses updated field", () => {
-    const text = [
-      "# OpenCode Memory",
-      "<!-- nextSeq: 2 -->",
-      "",
-      "## Active",
-      "",
-      "### [MEM-001] Title",
-      "- added: 2026-08-20",
-      "- updated: 2026-08-26",
-      "Body.",
-      "",
-      "## Archived",
-      "",
-    ].join("\n")
-
-    const store = parseMemory(text)
-    assert.equal(store.entries[0]!.updated, "2026-08-26")
-  })
-
-  it("parses archived entries correctly", () => {
-    const text = [
-      "# OpenCode Memory",
-      "<!-- nextSeq: 3 -->",
-      "",
-      "## Active",
-      "",
-      "## Archived",
-      "",
-      "### [MEM-001] Old thing",
-      "- added: 2026-08-01",
-      "Content.",
-      "",
-    ].join("\n")
-
-    const store = parseMemory(text)
-    assert.equal(store.entries.length, 1)
-    assert.equal(store.entries[0]!.archived, true)
-  })
-
-  it("parses multiple entries", () => {
-    const text = [
-      "# OpenCode Memory",
-      "<!-- nextSeq: 3 -->",
-      "",
-      "## Active",
-      "",
-      "### [MEM-001] First",
-      "- added: 2026-08-01",
-      "Content one.",
-      "",
-      "### [MEM-002] Second",
-      "- added: 2026-08-02",
-      "Content two.",
-      "",
-      "## Archived",
-      "",
-    ].join("\n")
-
-    const store = parseMemory(text)
-    assert.equal(store.entries.length, 2)
-    assert.equal(store.entries[0]!.id, "MEM-001")
-    assert.equal(store.entries[1]!.id, "MEM-002")
-  })
-})
-
-// ─── serializeMemory ─────────────────────────────────────────────────────────
-
-describe("serializeMemory", () => {
-  it("round-trips through parse → serialize → parse", () => {
-    const original: MemoryStore = {
-      nextSeq: 3,
-      entries: [
-        {
-          id: "MEM-001",
-          title: "Use int for money",
-          content: "Always int cents.",
-          added: "2026-08-20",
-          updated: "2026-08-26",
-          tags: ["coding-style"],
-          archived: false,
-        },
-        {
-          id: "MEM-002",
-          title: "Old rule",
-          content: "Archived body.",
-          added: "2026-08-01",
-          archived: true,
-        },
-      ],
-    }
-
-    const serialized = serializeMemory(original)
-    const reparsed = parseMemory(serialized)
-
-    assert.equal(reparsed.nextSeq, original.nextSeq)
-    assert.equal(reparsed.entries.length, 2)
-
-    const active = reparsed.entries[0]!
-    assert.equal(active.id, "MEM-001")
-    assert.equal(active.title, "Use int for money")
-    assert.equal(active.updated, "2026-08-26")
-    assert.deepEqual(active.tags, ["coding-style"])
-    assert.equal(active.archived, false)
-
-    const archived = reparsed.entries[1]!
-    assert.equal(archived.id, "MEM-002")
-    assert.equal(archived.archived, true)
-  })
-
-  it("includes nextSeq comment", () => {
-    const store: MemoryStore = { nextSeq: 5, entries: [] }
-    const text = serializeMemory(store)
-    assert.ok(text.includes("<!-- nextSeq: 5 -->"))
-  })
-})
-
-// ─── addEntry ────────────────────────────────────────────────────────────────
-
-describe("addEntry", () => {
-  it("assigns sequential IDs and increments nextSeq", () => {
-    let store: MemoryStore = { nextSeq: 1, entries: [] }
-    let id: string
-
-    ;({ store, id } = addEntry(store, "First", "body"))
-    assert.equal(id, "MEM-001")
-    assert.equal(store.nextSeq, 2)
-
-    ;({ store, id } = addEntry(store, "Second", "body"))
-    assert.equal(id, "MEM-002")
-    assert.equal(store.nextSeq, 3)
-  })
-
-  it("pads ID to three digits", () => {
-    const store: MemoryStore = { nextSeq: 9, entries: [] }
-    const { id } = addEntry(store, "T", "b")
-    assert.equal(id, "MEM-009")
-  })
-
-  it("stores tags when provided", () => {
-    const store: MemoryStore = { nextSeq: 1, entries: [] }
-    const { store: next } = addEntry(store, "T", "b", ["tag-a", "tag-b"])
-    assert.deepEqual(next.entries[0]!.tags, ["tag-a", "tag-b"])
-  })
-
-  it("does not set tags field when tags is empty", () => {
-    const store: MemoryStore = { nextSeq: 1, entries: [] }
-    const { store: next } = addEntry(store, "T", "b", [])
-    assert.equal("tags" in next.entries[0]!, false)
-  })
-
-  it("sets archived to false", () => {
-    const store: MemoryStore = { nextSeq: 1, entries: [] }
-    const { store: next } = addEntry(store, "T", "b")
-    assert.equal(next.entries[0]!.archived, false)
-  })
-})
-
-// ─── updateEntry ─────────────────────────────────────────────────────────────
-
-describe("updateEntry", () => {
-  function storeWithOne(): MemoryStore {
-    const base: MemoryStore = { nextSeq: 1, entries: [] }
-    return addEntry(base, "Original title", "Original content", ["old-tag"]).store
-  }
-
-  it("returns null for unknown ID", () => {
-    const store = storeWithOne()
-    assert.equal(updateEntry(store, "MEM-999", { content: "x" }), null)
-  })
-
-  it("updates title only", () => {
-    const store = updateEntry(storeWithOne(), "MEM-001", { title: "New title" })!
-    assert.equal(store.entries[0]!.title, "New title")
-    assert.equal(store.entries[0]!.content, "Original content")
-  })
-
-  it("updates content only", () => {
-    const store = updateEntry(storeWithOne(), "MEM-001", { content: "New content" })!
-    assert.equal(store.entries[0]!.content, "New content")
-    assert.equal(store.entries[0]!.title, "Original title")
-  })
-
-  it("updates tags", () => {
-    const store = updateEntry(storeWithOne(), "MEM-001", { tags: ["new-tag"] })!
-    assert.deepEqual(store.entries[0]!.tags, ["new-tag"])
-  })
-
-  it("sets updated date", () => {
-    const store = updateEntry(storeWithOne(), "MEM-001", { title: "x" })!
-    const today = new Date().toISOString().slice(0, 10)
-    assert.equal(store.entries[0]!.updated, today)
-  })
-
-  it("does not touch archived entries", () => {
-    const base = storeWithOne()
-    const archived = archiveEntry(base, "MEM-001")!
-    const result = updateEntry(archived, "MEM-001", { title: "x" })
-    assert.equal(result, null)
-  })
-})
-
-// ─── archiveEntry ────────────────────────────────────────────────────────────
-
-describe("archiveEntry", () => {
-  it("returns null for unknown ID", () => {
-    const store: MemoryStore = { nextSeq: 1, entries: [] }
-    assert.equal(archiveEntry(store, "MEM-001"), null)
-  })
-
-  it("moves entry to archived", () => {
-    const base: MemoryStore = { nextSeq: 1, entries: [] }
-    const { store } = addEntry(base, "T", "b")
-    const next = archiveEntry(store, "MEM-001")!
-    assert.equal(next.entries[0]!.archived, true)
-  })
-
-  it("does not re-archive an already archived entry", () => {
-    const base: MemoryStore = { nextSeq: 1, entries: [] }
-    const { store } = addEntry(base, "T", "b")
-    const once = archiveEntry(store, "MEM-001")!
-    const twice = archiveEntry(once, "MEM-001")
-    assert.equal(twice, null)
-  })
-
-  it("preserves other entries", () => {
-    let store: MemoryStore = { nextSeq: 1, entries: [] }
-    ;({ store } = addEntry(store, "A", "a"))
-    ;({ store } = addEntry(store, "B", "b"))
-    store = archiveEntry(store, "MEM-001")!
-    assert.equal(store.entries.length, 2)
-    assert.equal(store.entries[1]!.archived, false)
-  })
-})
-
-// ─── searchEntries ───────────────────────────────────────────────────────────
-
-describe("searchEntries", () => {
-  function populated(): MemoryStore {
-    let store: MemoryStore = { nextSeq: 1, entries: [] }
-    ;({ store } = addEntry(store, "Use int for money", "Store as cents", ["finance"]))
-    ;({ store } = addEntry(store, "Git push confirmation", "Always confirm before push", ["workflow"]))
-    store = archiveEntry(store, "MEM-002")!
-    return store
-  }
-
-  it("returns all active when no query", () => {
-    const results = searchEntries(populated(), "")
-    // MEM-002 is archived, only MEM-001 active
-    assert.equal(results.length, 1)
-  })
-
-  it("matches title case-insensitively", () => {
-    const results = searchEntries(populated(), "INT")
-    assert.equal(results.length, 1)
-    assert.equal(results[0]!.id, "MEM-001")
-  })
-
-  it("matches content", () => {
-    const results = searchEntries(populated(), "cents")
-    assert.equal(results.length, 1)
-  })
-
-  it("matches tags", () => {
-    const results = searchEntries(populated(), "finance")
-    assert.equal(results.length, 1)
-  })
-
-  it("excludes archived entries", () => {
-    // MEM-002 is archived and matches "workflow" tag
-    const results = searchEntries(populated(), "workflow")
-    assert.equal(results.length, 0)
-  })
-
-  it("returns empty when no match", () => {
-    const results = searchEntries(populated(), "nonexistent-xyz")
-    assert.equal(results.length, 0)
-  })
-})
-
-// ─── memory evolution: archive metadata ──────────────────────────────────────
-
-function storeWith(...entries: Array<[string, string]>): MemoryStore {
-  let s: MemoryStore = { entries: [], nextSeq: 1 }
-  for (const [title, content] of entries) s = addEntry(s, title, content).store
-  return s
-}
-
-describe("archive metadata", () => {
-  it("archiveEntry records archivedAt and a one-line reason", () => {
-    const s = storeWith(["A", "a"])
-    const out = archiveEntry(s, "MEM-001", { reason: "no longer\ntrue   here" })!
-    const e = out.entries[0]!
-    assert.equal(e.archived, true)
-    assert.match(e.archivedAt!, /^\d{4}-\d{2}-\d{2}$/)
-    assert.equal(e.archivedReason, "no longer true here")
-    assert.equal(e.supersededBy, undefined)
-  })
-
-  it("archiveEntry without opts sets no reason", () => {
-    const out = archiveEntry(storeWith(["A", "a"]), "MEM-001")!
-    assert.equal(out.entries[0]!.archivedReason, undefined)
-  })
-
-  it("round-trips archive fields through serialize → parse", () => {
-    let s = storeWith(["Old", "old body"], ["New", "new body"])
-    s = archiveEntry(s, "MEM-001", { reason: "superseded", supersededBy: "MEM-002" })!
-    const again = parseMemory(serializeMemory(s))
-    const old = again.entries.find((e) => e.id === "MEM-001")!
-    assert.equal(old.archived, true)
-    assert.equal(old.archivedReason, "superseded")
-    assert.equal(old.supersededBy, "MEM-002")
-    assert.equal(old.archivedAt, s.entries[0]!.archivedAt)
-    assert.equal(old.content, "old body")
-    assert.equal(serializeMemory(again), serializeMemory(s))
-  })
-
-  it("does not treat metadata-looking body lines as metadata", () => {
-    const body = "first line\n- tags: not-a-tag\n- superseded_by: MEM-999\n- added: 1999-01-01"
-    const s = storeWith(["T", body])
-    const again = parseMemory(serializeMemory(s))
-    const e = again.entries[0]!
-    assert.equal(e.tags, undefined)
-    assert.equal(e.supersededBy, undefined)
-    assert.notEqual(e.added, "1999-01-01")
-    assert.equal(e.content, body)
-  })
-
-  it("ignores archive metadata on active entries", () => {
-    const text = [
-      "# OpenCode Memory", "<!-- nextSeq: 2 -->", "", "## Active", "",
-      "### [MEM-001] T", "- added: 2026-01-01", "- superseded_by: MEM-002", "body", "",
-      "## Archived", "",
-    ].join("\n")
-    assert.equal(parseMemory(text).entries[0]!.supersededBy, undefined)
-  })
-})
-
-describe("legacy MEMORY.md compatibility", () => {
-  const legacy = [
-    "# OpenCode Memory",
-    "<!-- nextSeq: 5 -->",
-    "<!-- auto-managed by opencode-plugin-memory — do not edit section headings -->",
-    "",
-    "## Active",
-    "",
-    "### [MEM-001] 插件加载验证",
-    "- added: 2026-08-27",
-    "- tags: test",
-    "测试 memory_add 工具是否可用。",
-    "",
-    "### [MEM-004] WebFetch 必须走 subagent",
-    "- added: 2026-09-07",
-    "- tags: workflow, context",
-    "当 webfetch 的目的是提取信息。",
-    "",
-    "原因：raw HTML 太大。",
-    "",
-    "## Archived",
-    "",
-    "### [MEM-002] 万颗",
-    "- added: 2026-09-04",
-    "- updated: 2026-09-04",
-    "- tags: metabase, 单位",
-    "换算规则：",
-    "- 在 SQL 里用 `qty / 10000.0`",
-    "",
-  ].join("\n")
-
-  it("parses entries unchanged", () => {
-    const s = parseMemory(legacy)
-    assert.equal(s.nextSeq, 5)
-    assert.equal(s.entries.length, 3)
-    const m4 = s.entries.find((e) => e.id === "MEM-004")!
-    assert.deepEqual(m4.tags, ["workflow", "context"])
-    assert.equal(m4.content, "当 webfetch 的目的是提取信息。\n\n原因：raw HTML 太大。")
-    const m2 = s.entries.find((e) => e.id === "MEM-002")!
-    assert.equal(m2.archived, true)
-    assert.equal(m2.content, "换算规则：\n- 在 SQL 里用 `qty / 10000.0`")
-    assert.equal(m2.archivedReason, undefined)
-  })
-
-  it("is stable after one rewrite", () => {
-    const once = serializeMemory(parseMemory(legacy))
-    assert.equal(serializeMemory(parseMemory(once)), once)
-  })
-})
-
-describe("addSupersedingEntry", () => {
-  it("adds the new entry and archives the old one with a link", () => {
-    const s = storeWith(["Old rule", "x"], ["Other", "y"])
-    const r = addSupersedingEntry(s, "New rule", "z", ["t"], ["MEM-001"])
-    assert.equal(r.ok, true)
-    if (!r.ok) return
-    assert.equal(r.id, "MEM-003")
-    assert.deepEqual(r.archivedIds, ["MEM-001"])
-    const old = r.store.entries.find((e) => e.id === "MEM-001")!
-    assert.equal(old.archived, true)
-    assert.equal(old.supersededBy, "MEM-003")
-    assert.equal(old.archivedReason, "superseded")
-    assert.equal(r.store.entries.find((e) => e.id === "MEM-002")!.archived, false)
-    assert.equal(r.store.entries.find((e) => e.id === "MEM-003")!.archived, false)
-    assert.equal(r.store.nextSeq, 4)
-  })
-
-  it("supersedes several entries and collapses duplicate IDs", () => {
-    const s = storeWith(["A", "a"], ["B", "b"])
-    const r = addSupersedingEntry(s, "C", "c", undefined, ["MEM-001", "MEM-002", "MEM-001"])
-    assert.ok(r.ok)
-    if (!r.ok) return
-    assert.deepEqual(r.archivedIds, ["MEM-001", "MEM-002"])
-    assert.equal(r.store.entries.filter((e) => e.archived).length, 2)
-  })
-
-  it("fails without changing anything when an ID is unknown", () => {
-    const s = storeWith(["A", "a"])
-    const r = addSupersedingEntry(s, "B", "b", undefined, ["MEM-001", "MEM-099"])
-    assert.equal(r.ok, false)
-    if (r.ok) return
-    assert.deepEqual(r.badIds, ["MEM-099"])
-    assert.equal(s.entries.length, 1)
-    assert.equal(s.entries[0]!.archived, false)
-    assert.equal(s.nextSeq, 2)
-  })
-
-  it("fails when the target is already archived", () => {
-    const s = archiveEntry(storeWith(["A", "a"]), "MEM-001")!
-    assert.equal(addSupersedingEntry(s, "B", "b", undefined, ["MEM-001"]).ok, false)
-  })
-
-  it("resolveSuccessor walks a chain A → B → C", () => {
-    const r1 = addSupersedingEntry(storeWith(["A", "a"]), "B", "b", undefined, ["MEM-001"])
-    assert.ok(r1.ok); if (!r1.ok) return
-    const r2 = addSupersedingEntry(r1.store, "C", "c", undefined, ["MEM-002"])
-    assert.ok(r2.ok); if (!r2.ok) return
-    assert.equal(resolveSuccessor(r2.store, "MEM-001")!.id, "MEM-003")
-    assert.equal(resolveSuccessor(r2.store, "MEM-003")!.id, "MEM-003")
-  })
-
-  it("resolveSuccessor survives a cycle", () => {
-    const store: MemoryStore = {
-      nextSeq: 3,
-      entries: [
-        { id: "MEM-001", title: "a", content: "", added: "2026-01-01", archived: true, supersededBy: "MEM-002" },
-        { id: "MEM-002", title: "b", content: "", added: "2026-01-01", archived: true, supersededBy: "MEM-001" },
-      ],
-    }
-    assert.ok(resolveSuccessor(store, "MEM-001"))
-  })
-})
-
-// ─── store paths ─────────────────────────────────────────────────────────────
+import type { Memory } from "./types.js"
 
 async function withDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mem-store-"))
@@ -525,99 +33,195 @@ async function withDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   }
 }
 
-describe("storeDir", () => {
-  it("defaults to .agents/memory", () => {
-    assert.equal(storeDir("/proj"), path.join("/proj", ".agents/memory"))
-    assert.equal(memoryFilePath("/proj"), path.join("/proj", ".agents/memory/MEMORY.md"))
-  })
+function activeMemory(id: string, title: string, body = "content"): Memory {
+  return { id, title, body, approvedAt: "2026-01-01", proposedAt: "2026-01-01" }
+}
 
-  it("honours a relative override", () => {
-    assert.equal(storeDir("/proj", "memory"), path.join("/proj", "memory"))
-    assert.equal(memoryFilePath("/proj", "memory"), path.join("/proj", "memory/MEMORY.md"))
-  })
-})
+// ─── identity ───────────────────────────────────────────────────────────────
 
-describe("validStoreDir", () => {
-  it("accepts relative paths", () => {
-    assert.equal(validStoreDir("memory"), "memory")
-    assert.equal(validStoreDir(".agents/memory"), ".agents/memory")
-  })
-
-  it("rejects .., absolute and empty values", () => {
-    assert.equal(validStoreDir("../escape"), undefined)
-    assert.equal(validStoreDir("a/../../b"), undefined)
-    assert.equal(validStoreDir("/abs/path"), undefined)
-    assert.equal(validStoreDir(""), undefined)
-    assert.equal(validStoreDir("   "), undefined)
-    assert.equal(validStoreDir(42), undefined)
-    assert.equal(validStoreDir(undefined), undefined)
+describe("generateMemoryId", () => {
+  it("produces mem- + 8 base64url chars and is collision-free in practice", () => {
+    const seen = new Set<string>()
+    for (let i = 0; i < 1000; i++) {
+      const id = generateMemoryId()
+      assert.match(id, /^mem-[A-Za-z0-9_-]{8}$/)
+      assert.ok(isMemoryId(id))
+      assert.ok(!seen.has(id))
+      seen.add(id)
+    }
   })
 })
 
-describe("writeStore paths", () => {
-  it("writes the store to .agents/memory/MEMORY.md by default", async () => {
-    await withDir(async (dir) => {
-      await writeStore(dir, { entries: [], nextSeq: 1 })
-      const text = await fs.readFile(path.join(dir, ".agents/memory/MEMORY.md"), "utf8")
-      assert.match(text, /# OpenCode Memory/)
-      assert.equal((await readStore(dir)).entries.length, 0)
-    })
-  })
-
-  it("writes to a custom relative dir when overridden", async () => {
-    await withDir(async (dir) => {
-      await writeStore(dir, { entries: [], nextSeq: 1 }, "memory")
-      await fs.access(path.join(dir, "memory/MEMORY.md"))
-      assert.equal((await readStore(dir, "memory")).entries.length, 0)
-    })
+describe("isMemoryId", () => {
+  it("accepts well-formed ids and rejects others", () => {
+    assert.equal(isMemoryId("mem-aaaaaaaa"), true)
+    assert.equal(isMemoryId("mem-A_b-c123"), true)
+    assert.equal(isMemoryId("mem-aaa"), false)
+    assert.equal(isMemoryId("MEM-001"), false)
+    assert.equal(isMemoryId("mem-aaaaaaa!"), false)
+    assert.equal(isMemoryId(""), false)
   })
 })
 
-describe("migrateLegacyStore", () => {
-  it("renames a legacy store into the shared location when the new file is absent", async () => {
-    await withDir(async (dir) => {
-      await fs.mkdir(path.join(dir, ".opencode/memory"), { recursive: true })
-      await fs.writeFile(path.join(dir, ".opencode/memory/MEMORY.md"), "# OpenCode Memory\n<!-- nextSeq: 3 -->\n", "utf8")
-      await migrateLegacyStore(dir)
-      const moved = await fs.readFile(path.join(dir, ".agents/memory/MEMORY.md"), "utf8")
-      assert.match(moved, /nextSeq: 3/)
-      await assert.rejects(fs.access(path.join(dir, ".opencode/memory/MEMORY.md")))
-    })
+// ─── author ─────────────────────────────────────────────────────────────────
+
+describe("resolveAuthor", () => {
+  it("uses user.name first", async () => {
+    const author = await resolveAuthor("/proj", async (key) => (key === "user.name" ? "Alice" : null))
+    assert.equal(author, "Alice")
   })
 
-  it("leaves both files untouched when the new store already exists", async () => {
-    await withDir(async (dir) => {
-      await fs.mkdir(path.join(dir, ".opencode/memory"), { recursive: true })
-      await fs.writeFile(path.join(dir, ".opencode/memory/MEMORY.md"), "legacy", "utf8")
-      await fs.mkdir(path.join(dir, ".agents/memory"), { recursive: true })
-      await fs.writeFile(path.join(dir, ".agents/memory/MEMORY.md"), "new", "utf8")
-      await migrateLegacyStore(dir)
-      assert.equal(await fs.readFile(path.join(dir, ".agents/memory/MEMORY.md"), "utf8"), "new")
-      assert.equal(await fs.readFile(path.join(dir, ".opencode/memory/MEMORY.md"), "utf8"), "legacy")
-    })
+  it("falls back to user.email when there is no name", async () => {
+    const author = await resolveAuthor("/proj", async (key) => (key === "user.email" ? "alice@example.com" : null))
+    assert.equal(author, "alice@example.com")
   })
 
-  it("is a no-op when there is no legacy store", async () => {
-    await withDir(async (dir) => {
-      await migrateLegacyStore(dir)
-      await assert.rejects(fs.access(path.join(dir, ".agents/memory/MEMORY.md")))
-    })
+  it("falls back to unknown on any failure", async () => {
+    assert.equal(await resolveAuthor("/proj", async () => null), "unknown")
+    assert.equal(await resolveAuthor("/proj", async () => ""), "unknown")
   })
 })
 
-describe("writeStore error handling", () => {
-  it("throws a clean StoreWriteError when the store path is not writable", async () => {
-    // A projectDir that is a file (not a directory) makes the mkdir fail with
-    // ENOTDIR, which writeStore maps to a user-facing StoreWriteError.
+// ─── propose / stage ────────────────────────────────────────────────────────
+
+describe("writeProposal and staging", () => {
+  it("writes a proposal file to .memory/staging and lists it back", async () => {
+    await withDir(async (dir) => {
+      const memory: Memory = {
+        id: "mem-aaaaaaaa",
+        title: "Rule",
+        body: "The rule body.",
+        author: "alice",
+        proposedAt: "2026-01-01T00:00:00.000Z",
+        intent: "propose",
+      }
+      await writeProposal(dir, memory)
+      const staged = await listStagedProposals(dir)
+      assert.equal(staged.length, 1)
+      assert.equal(staged[0]!.id, "mem-aaaaaaaa")
+      assert.equal(staged[0]!.body, "The rule body.")
+      assert.equal(staged[0]!.intent, "propose")
+
+      const byId = await readMemoryById(dir, "mem-aaaaaaaa")
+      assert.equal(byId!.status, "staging")
+      assert.equal(byId!.memory.title, "Rule")
+    })
+  })
+
+  it("does not appear in active or retired lists", async () => {
+    await withDir(async (dir) => {
+      await writeProposal(dir, { id: "mem-aaaaaaaa", title: "Rule", body: "b", intent: "propose" })
+      assert.equal((await listActiveMemories(dir)).length, 0)
+      assert.equal((await listRetiredMemories(dir)).length, 0)
+    })
+  })
+
+  it("throws a clean StoreWriteError when staging is not writable", async () => {
     const file = path.join(os.tmpdir(), `mem-notdir-${process.pid}`)
     await fs.writeFile(file, "x", "utf8")
     try {
       await assert.rejects(
-        writeStore(file, { entries: [], nextSeq: 1 }),
+        writeProposal(file, { id: "mem-aaaaaaaa", title: "T", body: "b", intent: "propose" }),
         (err: unknown) => err instanceof StoreWriteError && /not writable/.test((err as Error).message),
       )
     } finally {
       await fs.rm(file, { force: true })
     }
+  })
+})
+
+// ─── read active / retired ──────────────────────────────────────────────────
+
+describe("active and retired reads", () => {
+  it("lists active memories and reads one by id", async () => {
+    await withDir(async (dir) => {
+      await writeMemoryFile(activeDir(dir), activeMemory("mem-aaaaaaaa", "First"))
+      await writeMemoryFile(activeDir(dir), activeMemory("mem-bbbbbbbb", "Second"))
+      const active = await listActiveMemories(dir)
+      assert.equal(active.length, 2)
+      const byId = await readMemoryById(dir, "mem-aaaaaaaa")
+      assert.equal(byId!.status, "active")
+      assert.equal(byId!.memory.title, "First")
+    })
+  })
+
+  it("lists retired memories and reads one by id", async () => {
+    await withDir(async (dir) => {
+      const retired: Memory = {
+        id: "mem-cccccccc",
+        title: "Old",
+        body: "old body",
+        retiredAt: "2026-02-01",
+        retiredReason: "stale",
+      }
+      await writeMemoryFile(retiredDir(dir), retired)
+      const list = await listRetiredMemories(dir)
+      assert.equal(list.length, 1)
+      assert.equal(list[0]!.retiredReason, "stale")
+      assert.equal((await readMemoryById(dir, "mem-cccccccc"))!.status, "retired")
+    })
+  })
+
+  it("skips files with malformed frontmatter", async () => {
+    await withDir(async (dir) => {
+      await writeMemoryFile(activeDir(dir), activeMemory("mem-aaaaaaaa", "Good"))
+      await fs.writeFile(path.join(activeDir(dir), "mem-bbbbbbbb.md"), "no frontmatter here", "utf8")
+      await fs.writeFile(path.join(activeDir(dir), "mem-cccccccc.md"), "---\ntitle: missing id\n---\nbody", "utf8")
+      const active = await listActiveMemories(dir)
+      assert.equal(active.length, 1)
+      assert.equal(active[0]!.id, "mem-aaaaaaaa")
+    })
+  })
+
+  it("readMemoryFile returns null for a missing file", async () => {
+    await withDir(async (dir) => {
+      assert.equal(await readMemoryFile(path.join(activeDir(dir), "mem-aaaaaaaa.md")), null)
+    })
+  })
+})
+
+// ─── moves ──────────────────────────────────────────────────────────────────
+
+describe("move helpers", () => {
+  it("moveToRetired moves an active memory to retired/", async () => {
+    await withDir(async (dir) => {
+      await writeMemoryFile(activeDir(dir), activeMemory("mem-aaaaaaaa", "X"))
+      await moveToRetired(dir, "mem-aaaaaaaa")
+      assert.equal((await listActiveMemories(dir)).length, 0)
+      assert.equal((await listRetiredMemories(dir)).length, 1)
+    })
+  })
+
+  it("moveToActive moves a retired memory back to active/", async () => {
+    await withDir(async (dir) => {
+      await writeMemoryFile(retiredDir(dir), { id: "mem-aaaaaaaa", title: "X", body: "b", retiredReason: "stale" })
+      await moveToActive(dir, "mem-aaaaaaaa")
+      assert.equal((await listRetiredMemories(dir)).length, 0)
+      assert.equal((await listActiveMemories(dir)).length, 1)
+    })
+  })
+})
+
+// ─── aging ──────────────────────────────────────────────────────────────────
+
+describe("memoryAge", () => {
+  const now = new Date("2026-01-01T00:00:00Z")
+  it("measures whole days from approved_at, falling back to proposed_at", () => {
+    assert.equal(memoryAge({ id: "mem-aaaaaaaa", title: "T", body: "", approvedAt: "2025-12-01", proposedAt: "2025-11-01" }, now), 31)
+    assert.equal(memoryAge({ id: "mem-aaaaaaaa", title: "T", body: "", proposedAt: "2025-12-01" }, now), 31)
+  })
+  it("returns NaN when there is no usable timestamp", () => {
+    assert.ok(Number.isNaN(memoryAge({ id: "mem-aaaaaaaa", title: "T", body: "" }, now)))
+    assert.ok(Number.isNaN(memoryAge({ id: "mem-aaaaaaaa", title: "T", body: "", proposedAt: "not-a-date" }, now)))
+  })
+})
+
+// ─── paths ──────────────────────────────────────────────────────────────────
+
+describe("path helpers", () => {
+  it("resolve under the project root", () => {
+    assert.equal(stagingDir("/p"), path.join("/p", ".memory/staging"))
+    assert.equal(activeDir("/p"), path.join("/p", "memory/active"))
+    assert.equal(retiredDir("/p"), path.join("/p", "memory/retired"))
   })
 })
