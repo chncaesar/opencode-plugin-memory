@@ -1,5 +1,6 @@
 import type { Plugin, PluginOptions } from "@opencode-ai/plugin";
 import { type PluginConfig } from "./types.js";
+import { type ModelCall } from "./audit.js";
 /**
  * Parse and validate plugin options from opencode.json.
  * All options are optional; missing values fall back to DEFAULT_CONFIG.
@@ -8,6 +9,13 @@ import { type PluginConfig } from "./types.js";
  *   "plugin": [["opencode-plugin-memory", { "maxSummaryChars": 10000 }]]
  */
 export declare function resolveConfig(options?: PluginOptions): PluginConfig;
+/**
+ * Tell the model when staged proposals have no pull request yet. The background
+ * audit stages retire proposals while no model is in the loop, so without this
+ * nothing would ever prompt a `memory_publish` call. Same rule as for
+ * memory_propose/update/delete: the model publishes, the human merges.
+ */
+export declare function pendingPublishNotice(directory: string): Promise<string | null>;
 /**
  * opencode-plugin-memory — PR-gated project memory.
  *
@@ -46,18 +54,22 @@ export type V2Context = {
     };
     experimental: {
         generate: {
-            text: (input: {
-                prompt: string;
-                model?: {
-                    providerID: string;
-                    id: string;
-                };
-            }) => Promise<{
-                text: string;
-            }>;
+            text: V2GenerateText;
         };
     };
 };
+/** `ctx.experimental.generate.text`: plugin-context methods take `requestOptions` (an AbortSignal) as the last argument. */
+export type V2GenerateText = (input: {
+    prompt: string;
+    model?: {
+        providerID: string;
+        id: string;
+    };
+}, requestOptions?: {
+    signal?: AbortSignal;
+}) => Promise<{
+    text: string;
+}>;
 /**
  * Parse the optional `auditModel` plugin option ("providerID/modelID") into a
  * V2 model ref. Without it the host picks a default model, which may be one
@@ -67,6 +79,22 @@ export declare function parseAuditModel(raw: unknown): {
     providerID: string;
     id: string;
 } | undefined;
+/**
+ * Model call for the V2 audit, with a timeout.
+ *
+ * A timeout rejects the call and signals abort through the AbortSignal passed as
+ * `requestOptions`. OpenCode 2.2.7 does NOT honour that signal for
+ * `experimental.generate.text` (packages/plugin/src/promise/adapter.ts drops the
+ * second argument), so the host request keeps running after a timeout. What
+ * actually prevents a pile-up is the guard below: while the previous request is
+ * still unsettled, the next call fails fast instead of starting a second
+ * concurrent request. The signal is still passed so a host that does honour it
+ * cancels the request.
+ */
+export declare function createV2ModelCall(generate: V2GenerateText, model?: {
+    providerID: string;
+    id: string;
+}, timeoutMs?: number): ModelCall;
 /**
  * V2 entry point. The audit uses stateless `generate.text`, so there is no
  * throwaway session and no audit agent to register or to ignore in hooks.

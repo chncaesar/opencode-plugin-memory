@@ -3,9 +3,9 @@ import assert from "node:assert/strict"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
-import { resolveConfig, server, setup } from "./plugin.js"
+import { createV2ModelCall, pendingPublishNotice, resolveConfig, server, setup } from "./plugin.js"
 import defaultExport from "./index.js"
-import { activeDir, writeMemoryFile } from "./storage.js"
+import { activeDir, stagingDir, writeMemoryFile, writeProposal } from "./storage.js"
 import { generateSummary } from "./summary.js"
 
 async function withDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -38,15 +38,6 @@ describe("resolveConfig", () => {
     assert.equal(resolveConfig({ auditBatchChars: -1 }).auditBatchChars, 400_000)
   })
 
-  it("applies defaults and validates positive numbers", () => {
-    assert.equal(resolveConfig().maxSummaryChars, 10000)
-    assert.equal(resolveConfig().enableLog, true)
-    assert.equal(resolveConfig().staleDays, 90)
-    assert.equal(resolveConfig().backgroundAudit, true)
-    assert.equal(resolveConfig().auditIntervalMinutes, 1)
-    assert.equal(resolveConfig({}).maxSummaryChars, 10000)
-  })
-
   it("accepts overrides and ignores junk", () => {
     const c = resolveConfig({ maxSummaryChars: 3000, staleDays: 7, backgroundAudit: false, enableLog: false })
     assert.equal(c.maxSummaryChars, 3000)
@@ -54,6 +45,83 @@ describe("resolveConfig", () => {
     assert.equal(c.backgroundAudit, false)
     assert.equal(c.enableLog, false)
     assert.equal(resolveConfig({ staleDays: -5 }).staleDays, 90)
+  })
+})
+
+describe("V2 model call (timeout, abort signal and the no-overlap guard)", () => {
+  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+  it("passes the prompt, the model and an AbortSignal, and returns the text", async () => {
+    let seen: { prompt?: string | undefined; model?: unknown; signal?: AbortSignal | undefined } = {}
+    const call = createV2ModelCall(async (input, opts) => {
+      seen = { prompt: input.prompt, model: input.model, signal: opts?.signal }
+      return { text: "ok" }
+    }, { providerID: "deepseek", id: "deepseek-flash" }, 1000)
+    assert.equal(await call("SYS", "USER"), "ok")
+    assert.equal(seen.prompt, "SYS\n\nUSER")
+    assert.deepEqual(seen.model, { providerID: "deepseek", id: "deepseek-flash" })
+    assert.ok(seen.signal && !seen.signal.aborted)
+  })
+
+  it("on timeout it rejects and signals abort; a host that honours the signal settles and the next call proceeds", async () => {
+    let signal: AbortSignal | undefined
+    let first = true
+    const call = createV2ModelCall((_input, opts) => {
+      signal = opts?.signal
+      if (!first) return Promise.resolve({ text: "second" })
+      first = false
+      return new Promise((_res, rej) => opts?.signal?.addEventListener("abort", () => rej(new Error("aborted"))))
+    }, undefined, 20)
+    await assert.rejects(call("s", "p"), /timed out after/)
+    assert.equal(signal?.aborted, true)
+    await wait(5) // let the aborted request settle
+    assert.equal(await call("s", "p"), "second")
+  })
+
+  it("if the host ignores the signal (as OpenCode 2.2.7 does), the next call fails fast instead of starting a concurrent request", async () => {
+    let started = 0
+    const call = createV2ModelCall(() => {
+      started++
+      return new Promise(() => {}) // never settles, ignores the signal
+    }, undefined, 20)
+    await assert.rejects(call("s", "p"), /timed out/)
+    await assert.rejects(call("s", "p"), /still running/)
+    assert.equal(started, 1)
+  })
+
+  it("a request that fails after the timeout does not raise an unhandled rejection", async () => {
+    const call = createV2ModelCall((_i, opts) => new Promise((_r, rej) => opts?.signal?.addEventListener("abort", () => setTimeout(() => rej(new Error("late")), 5))), undefined, 10)
+    await assert.rejects(call("s", "p"), /timed out/)
+    await wait(30) // would crash the test process on an unhandled rejection
+  })
+})
+
+describe("pending publish notice", () => {
+  it("is null with nothing staged, and lists staged proposals with the memory_publish instruction", async () => {
+    await withDir(async (dir) => {
+      assert.equal(await pendingPublishNotice(dir), null)
+      await writeProposal(dir, { id: "mem-aaaa0001", title: "Retire me", body: "", proposedAt: "2026-11-12", intent: "retire", retiredReason: "duplicate" })
+      await writeProposal(dir, { id: "mem-bbbb0002", title: "New rule", body: "b", proposedAt: "2026-11-12", intent: "propose" })
+      const n = (await pendingPublishNotice(dir)) ?? ""
+      assert.match(n, /2 staged memory proposals have no pull request yet/)
+      assert.match(n, /\[mem-aaaa0001\] Retire me \(retire\)/)
+      assert.match(n, /memory_publish/)
+    })
+  })
+
+  it("reaches the system prompt, and is gone once nothing is staged", async () => {
+    await withDir(async (dir) => {
+      await writeProposal(dir, { id: "mem-aaaa0001", title: "Retire me", body: "", proposedAt: "2026-11-12", intent: "retire", retiredReason: "stale" })
+      const hooks = await server(fakeInput(dir))
+      const out = { system: [] as string[] }
+      await (hooks["experimental.chat.system.transform"] as any)({ sessionID: "ses_x" }, out)
+      assert.match(out.system.join("\n"), /Call memory_publish/)
+
+      await fs.rm(stagingDir(dir), { recursive: true, force: true })
+      const out2 = { system: [] as string[] }
+      await (hooks["experimental.chat.system.transform"] as any)({ sessionID: "ses_x" }, out2)
+      assert.ok(!/Call memory_publish/.test(out2.system.join("\n")))
+    })
   })
 })
 

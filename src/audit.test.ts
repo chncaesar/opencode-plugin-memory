@@ -7,6 +7,7 @@ import {
   activeHash,
   buildAuditPrompt,
   auditFailureHint,
+  auditWarning,
   createAuditScheduler,
   describeAuditStatus,
   looksLikeContextOverflow,
@@ -447,6 +448,32 @@ describe("audit failure visibility", () => {
       const text = (await describeAuditStatus(dir, cfg())).join("\n")
       assert.match(text, /ok/)
       assert.ok(!/FAILED/.test(text))
+    })
+  })
+})
+
+describe("auditWarning (system prompt)", () => {
+  it("is null before any run, after success and when the audit is disabled", async () => {
+    await withDir(async (dir) => {
+      assert.equal(await auditWarning(dir, cfg()), null)
+      await seed(dir, mem("mem-aaaa0001", "A"), mem("mem-bbbb0002", "B"))
+      await runAudit({ directory: dir, config: cfg(), logger: quietLogger, call: findingReply([]), now: () => NOW })
+      assert.equal(await auditWarning(dir, cfg()), null)
+      assert.equal(await auditWarning(dir, cfg({ backgroundAudit: false })), null)
+    })
+  })
+
+  it("after a context-window failure it tells the model to warn the user and names the fix", async () => {
+    await withDir(async (dir) => {
+      await seed(dir, mem("mem-aaaa0001", "A"), mem("mem-bbbb0002", "B"))
+      await runAudit({ directory: dir, config: cfg(), logger: quietLogger, call: async () => { throw new Error("maximum context length is 65536 tokens") }, now: () => NOW })
+      const w = await auditWarning(dir, cfg())
+      assert.match(w ?? "", /FAILED/)
+      assert.match(w ?? "", /auditBatchChars/)
+      assert.match(w ?? "", /Tell the user/)
+      // cleared by the next success
+      await runAudit({ directory: dir, config: cfg(), logger: quietLogger, call: findingReply([]), now: () => later(5) })
+      assert.equal(await auditWarning(dir, cfg()), null)
     })
   })
 })

@@ -2,10 +2,10 @@ import type { Config, Hooks, Plugin, PluginInput, PluginOptions } from "@opencod
 import { DEFAULT_CONFIG, type PluginConfig } from "./types.js"
 import { createMemoryTools } from "./tools.js"
 import { buildSummaryContent, buildSystemPrompt, readSummaryContent } from "./summary.js"
-import { listActiveMemories } from "./storage.js"
+import { listActiveMemories, listStagedProposals } from "./storage.js"
 import { createLogger } from "./logging.js"
 import { migrateLegacyStores } from "./migrate.js"
-import { createAuditScheduler, createSdkModelCall, type AuditClient, type ModelCall } from "./audit.js"
+import { auditWarning, createAuditScheduler, createSdkModelCall, type AuditClient, type ModelCall } from "./audit.js"
 import { registerAuditAgent } from "./auditAgent.js"
 import { tool } from "@opencode-ai/plugin/tool"
 
@@ -58,7 +58,31 @@ export function resolveConfig(options?: PluginOptions): PluginConfig {
 async function injectMemoryBlock(directory: string, config: PluginConfig): Promise<string> {
   let summary = await readSummaryContent(directory)
   if (!summary) summary = buildSummaryContent(await listActiveMemories(directory))
-  return buildSystemPrompt(summary, config.maxSummaryChars)
+  const block = buildSystemPrompt(summary, config.maxSummaryChars)
+  const notices: string[] = [block]
+  const warning = await auditWarning(directory, config).catch(() => null)
+  if (warning) notices.push(warning)
+  const pending = await pendingPublishNotice(directory).catch(() => null)
+  if (pending) notices.push(pending)
+  return notices.join("\n\n")
+}
+
+/**
+ * Tell the model when staged proposals have no pull request yet. The background
+ * audit stages retire proposals while no model is in the loop, so without this
+ * nothing would ever prompt a `memory_publish` call. Same rule as for
+ * memory_propose/update/delete: the model publishes, the human merges.
+ */
+export async function pendingPublishNotice(directory: string): Promise<string | null> {
+  const staged = await listStagedProposals(directory)
+  if (staged.length === 0) return null
+  const lines = staged.slice(0, 10).map((m) => `- [${m.id}] ${m.title} (${m.intent === "retire" ? "retire" : "propose"})`)
+  const more = staged.length > lines.length ? `\n… and ${staged.length - lines.length} more` : ""
+  return [
+    `[memory plugin] ${staged.length} staged memory proposal${staged.length === 1 ? " has" : "s have"} no pull request yet:`,
+    lines.join("\n") + more,
+    "Call memory_publish to open the pull requests (the human merge is the approval gate; no confirmation is needed).",
+  ].join("\n")
 }
 
 /**
@@ -156,8 +180,14 @@ export type V2Context = {
       cb: (input: any) => Promise<void> | void,
     ) => Promise<Registration>
   }
-  experimental: { generate: { text: (input: { prompt: string; model?: { providerID: string; id: string } }) => Promise<{ text: string }> } }
+  experimental: { generate: { text: V2GenerateText } }
 }
+
+/** `ctx.experimental.generate.text`: plugin-context methods take `requestOptions` (an AbortSignal) as the last argument. */
+export type V2GenerateText = (
+  input: { prompt: string; model?: { providerID: string; id: string } },
+  requestOptions?: { signal?: AbortSignal },
+) => Promise<{ text: string }>
 
 const V2_AUDIT_TIMEOUT_MS = 300_000
 
@@ -171,6 +201,54 @@ export function parseAuditModel(raw: unknown): { providerID: string; id: string 
   const slash = raw.indexOf("/")
   if (slash <= 0 || slash === raw.length - 1) return undefined
   return { providerID: raw.slice(0, slash), id: raw.slice(slash + 1) }
+}
+
+/**
+ * Model call for the V2 audit, with a timeout.
+ *
+ * A timeout rejects the call and signals abort through the AbortSignal passed as
+ * `requestOptions`. OpenCode 2.2.7 does NOT honour that signal for
+ * `experimental.generate.text` (packages/plugin/src/promise/adapter.ts drops the
+ * second argument), so the host request keeps running after a timeout. What
+ * actually prevents a pile-up is the guard below: while the previous request is
+ * still unsettled, the next call fails fast instead of starting a second
+ * concurrent request. The signal is still passed so a host that does honour it
+ * cancels the request.
+ */
+export function createV2ModelCall(
+  generate: V2GenerateText,
+  model?: { providerID: string; id: string },
+  timeoutMs: number = V2_AUDIT_TIMEOUT_MS,
+): ModelCall {
+  let inFlight: Promise<void> | null = null
+  return async (system, prompt) => {
+    if (inFlight) throw new Error("audit: the previous model call is still running; not starting another")
+
+    const controller = new AbortController()
+    const started = generate({ prompt: `${system}\n\n${prompt}`, ...(model ? { model } : {}) }, { signal: controller.signal })
+    const settled: Promise<void> = started.then(
+      () => undefined,
+      () => undefined,
+    )
+    inFlight = settled
+    void settled.then(() => {
+      if (inFlight === settled) inFlight = null
+    })
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        // Reject first, then abort: a host that honours the signal fails the request at once, and the caller must see the timeout, not "aborted".
+        reject(new Error(`audit: model call timed out after ${Math.round(timeoutMs / 1000)}s`))
+        controller.abort()
+      }, timeoutMs)
+    })
+    try {
+      return (await Promise.race([started, timeout])).text
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
 }
 
 /**
@@ -192,18 +270,8 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
     await logger.error("migration", err)
   }
 
-  const call: ModelCall = async (system, prompt) => {
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("audit: model call timed out")), V2_AUDIT_TIMEOUT_MS)
-    })
-    try {
-      const res = await Promise.race([ctx.experimental.generate.text({ prompt: `${system}\n\n${prompt}`, ...(auditModel ? { model: auditModel } : {}) }), timeout])
-      return res.text
-    } finally {
-      if (timer) clearTimeout(timer)
-    }
-  }
+  // Read ctx.experimental lazily: a host without it must not stop the plugin from loading.
+  const call = createV2ModelCall((input, opts) => ctx.experimental.generate.text(input, opts), auditModel)
 
   const scheduler = createAuditScheduler({ directory, config, logger, call }, new Set<string>())
   const memoryTools = createMemoryTools(config, logger)

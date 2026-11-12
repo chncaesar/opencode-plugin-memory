@@ -62,6 +62,12 @@ export declare function runAudit(deps: AuditDeps): Promise<AuditOutcome>;
 export declare function looksLikeContextOverflow(message: string): boolean;
 /** What the user can do about a failure, or null when there is no specific advice. */
 export declare function auditFailureHint(message: string, config: PluginConfig): string | null;
+/**
+ * A short warning for the system prompt when the last audit failed, or null.
+ * This reaches the user on every host (OpenCode 2.x has no plugin toast), through
+ * the model, until a later audit succeeds.
+ */
+export declare function auditWarning(directory: string, config: PluginConfig): Promise<string | null>;
 /** Lines for `memory_review`: how the background audit last went. */
 export declare function describeAuditStatus(directory: string, config: PluginConfig): Promise<string[]>;
 /** The slice of the OpenCode SDK client the audit uses. */

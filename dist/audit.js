@@ -396,6 +396,24 @@ async function recordFailure(deps, message, at) {
         // a notification problem must never break the audit
     }
 }
+/**
+ * A short warning for the system prompt when the last audit failed, or null.
+ * This reaches the user on every host (OpenCode 2.x has no plugin toast), through
+ * the model, until a later audit succeeds.
+ */
+export async function auditWarning(directory, config) {
+    if (!config.backgroundAudit)
+        return null;
+    const state = await readAuditState(directory);
+    if (state.lastOutcome !== "failed")
+        return null;
+    const hint = auditFailureHint(state.lastError ?? "", config);
+    return [
+        "[memory plugin warning] The last background memory audit FAILED" + (state.lastOutcomeAt ? ` (${state.lastOutcomeAt})` : "") + `: ${state.lastError ?? "(no message)"}`,
+        hint ?? "Run memory_review for details.",
+        "Tell the user about this once, in plain words, and suggest the fix.",
+    ].join("\n");
+}
 /** Lines for `memory_review`: how the background audit last went. */
 export async function describeAuditStatus(directory, config) {
     if (!config.backgroundAudit)
