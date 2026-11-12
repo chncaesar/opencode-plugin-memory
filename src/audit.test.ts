@@ -9,7 +9,9 @@ import {
   createAuditScheduler,
   parseAuditResponse,
   relationToReason,
+  orderBySimilarity,
   runAudit,
+  splitIntoBatches,
   type ModelCall,
 } from "./audit.js"
 import { activeDir, listStagedProposals, writeMemoryFile } from "./storage.js"
@@ -238,6 +240,120 @@ describe("createAuditScheduler", () => {
       sch.onSessionIdle("audit-1")
       await sch.settled()
       assert.equal(calls, 0)
+    })
+  })
+})
+
+describe("batching", () => {
+  const many = (n: number, body = "x".repeat(200)): Memory[] =>
+    Array.from({ length: n }, (_, i) => mem(`mem-${String(i).padStart(8, "0")}`, `Title ${i}`, body))
+
+  it("returns one batch, in the given order, when everything fits", () => {
+    const ms = many(5)
+    const out = splitIntoBatches(ms, 1_000_000)
+    assert.equal(out.length, 1)
+    assert.deepEqual(out[0]!.map((m) => m.id), ms.map((m) => m.id))
+  })
+
+  it("splits by size, keeps every entry, and overlaps consecutive batches", () => {
+    const ms = many(30)
+    const out = splitIntoBatches(ms, 2_000, 2)
+    assert.ok(out.length > 1)
+    const seen = new Set(out.flat().map((m) => m.id))
+    assert.equal(seen.size, 30)
+    for (let i = 1; i < out.length; i++) {
+      const prevTail = out[i - 1]!.slice(-2).map((m) => m.id)
+      assert.deepEqual(out[i]!.slice(0, 2).map((m) => m.id), prevTail)
+    }
+    for (const b of out) assert.ok(b.reduce((n, m) => n + m.id.length + m.title.length + m.body.length + 24, 0) <= 2_000)
+  })
+
+  it("gives an oversized entry its own batch instead of dropping it", () => {
+    const ms = [mem("mem-aaaa0001", "small"), mem("mem-bbbb0002", "huge", "y".repeat(5_000)), mem("mem-cccc0003", "small too")]
+    const out = splitIntoBatches(ms, 1_000, 0)
+    assert.equal(new Set(out.flat().map((m) => m.id)).size, 3)
+  })
+
+  it("orders related entries next to each other and is deterministic", () => {
+    const ms = [
+      mem("mem-00000001", "Kingdee API field rules", "kingdee api field name"),
+      mem("mem-00000002", "Metabase tooltip wording", "metabase tooltip description"),
+      mem("mem-00000003", "Kingdee API sub entity keys", "kingdee api key"),
+      mem("mem-00000004", "Metabase dashboard tooltip override", "metabase dashboard tooltip"),
+    ]
+    const a = orderBySimilarity(ms).map((m) => m.id)
+    const b = orderBySimilarity([...ms].reverse()).map((m) => m.id)
+    assert.deepEqual(a, b)
+    const pos = (id: string) => a.indexOf(id)
+    assert.equal(Math.abs(pos("mem-00000001") - pos("mem-00000003")), 1)
+    assert.equal(Math.abs(pos("mem-00000002") - pos("mem-00000004")), 1)
+  })
+
+  it("groups Chinese titles by shared characters", () => {
+    const ms = [
+      mem("mem-00000001", "晶圆库存折算口径", "晶圆 库存"),
+      mem("mem-00000002", "委外订单结案日期", "委外 结案"),
+      mem("mem-00000003", "晶圆库存分类优先级", "晶圆 库存"),
+    ]
+    const a = orderBySimilarity(ms).map((m) => m.id)
+    assert.equal(Math.abs(a.indexOf("mem-00000001") - a.indexOf("mem-00000003")), 1)
+  })
+
+  it("audits a large store in several calls and merges findings across batches", async () => {
+    await withDir(async (dir) => {
+      const ms = many(12)
+      await seed(dir, ...ms)
+      const prompts: string[] = []
+      const call: ModelCall = async (_sys, prompt) => {
+        prompts.push(prompt)
+        const ids = [...prompt.matchAll(/\[(mem-\d{8})\]/g)].map((m) => m[1]!)
+        // every batch reports the same pair it can see; the merged result must hold it once
+        if (ids.includes("mem-00000000") && ids.includes("mem-00000001")) {
+          return JSON.stringify({ findings: [{ relation: "duplicate", retire: "mem-00000000", superseded_by: "mem-00000001", reason: "same" }] })
+        }
+        return JSON.stringify({ findings: [{ relation: "duplicate", retire: ids[0], superseded_by: ids[1], reason: "r" }] })
+      }
+      const out = await runAudit({ directory: dir, config: cfg({ auditBatchChars: 1_500 }), logger: quietLogger, call, now: () => NOW })
+      assert.equal(out, "done")
+      assert.ok(prompts.length > 1)
+      assert.match(prompts[0]!, /^Batch 1 of /)
+      const staged = await listStagedProposals(dir)
+      const ids = staged.map((p) => p.id)
+      assert.equal(new Set(ids).size, ids.length)
+      assert.ok(ids.length >= 1)
+    })
+  })
+
+  it("does not cap the number of entries (formerly skipped above 200)", async () => {
+    await withDir(async (dir) => {
+      await seed(dir, ...many(205, "z"))
+      let calls = 0
+      const call: ModelCall = async () => {
+        calls++
+        return JSON.stringify({ findings: [] })
+      }
+      const out = await runAudit({ directory: dir, config: cfg({ auditBatchChars: 100_000 }), logger: quietLogger, call, now: () => NOW })
+      assert.equal(out, "done")
+      assert.ok(calls >= 1)
+    })
+  })
+
+  it("fails the whole run without writing proposals or state when one batch fails", async () => {
+    await withDir(async (dir) => {
+      await seed(dir, ...many(12))
+      let n = 0
+      const call: ModelCall = async (_s, prompt) => {
+        n++
+        if (n === 2) throw new Error("model down")
+        const ids = [...prompt.matchAll(/\[(mem-\d{8})\]/g)].map((m) => m[1]!)
+        return JSON.stringify({ findings: [{ relation: "duplicate", retire: ids[0], superseded_by: ids[1], reason: "r" }] })
+      }
+      const out = await runAudit({ directory: dir, config: cfg({ auditBatchChars: 1_500 }), logger: quietLogger, call, now: () => NOW })
+      assert.equal(out, "failed")
+      assert.equal((await listStagedProposals(dir)).length, 0)
+      // not marked as audited: a later run (after the interval) tries again
+      const retry = await runAudit({ directory: dir, config: cfg({ auditBatchChars: 1_500 }), logger: quietLogger, call: findingReply([]), now: () => later(5) })
+      assert.equal(retry, "done")
     })
   })
 })

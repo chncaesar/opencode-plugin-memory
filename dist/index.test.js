@@ -29,6 +29,11 @@ async function seedStale(dir) {
     });
 }
 describe("resolveConfig", () => {
+    it("auditBatchChars defaults to 400000 and can be overridden", () => {
+        assert.equal(resolveConfig().auditBatchChars, 400_000);
+        assert.equal(resolveConfig({ auditBatchChars: 50_000 }).auditBatchChars, 50_000);
+        assert.equal(resolveConfig({ auditBatchChars: -1 }).auditBatchChars, 400_000);
+    });
     it("applies defaults and validates positive numbers", () => {
         assert.equal(resolveConfig().maxSummaryChars, 10000);
         assert.equal(resolveConfig().enableLog, true);

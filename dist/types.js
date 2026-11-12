@@ -15,5 +15,6 @@ export const DEFAULT_CONFIG = {
     staleDays: 90,
     backgroundAudit: true,
     auditIntervalMinutes: 1,
+    auditBatchChars: 400_000,
 };
 //# sourceMappingURL=types.js.map

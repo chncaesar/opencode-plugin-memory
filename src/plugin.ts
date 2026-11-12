@@ -40,6 +40,10 @@ export function resolveConfig(options?: PluginOptions): PluginConfig {
       typeof raw["auditIntervalMinutes"] === "number" && raw["auditIntervalMinutes"] > 0
         ? raw["auditIntervalMinutes"]
         : DEFAULT_CONFIG.auditIntervalMinutes,
+    auditBatchChars:
+      typeof raw["auditBatchChars"] === "number" && raw["auditBatchChars"] > 0
+        ? raw["auditBatchChars"]
+        : DEFAULT_CONFIG.auditBatchChars,
   }
 }
 

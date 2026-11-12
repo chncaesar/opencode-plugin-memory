@@ -87,6 +87,15 @@ export type PluginConfig = {
      * @default 1
      */
     auditIntervalMinutes: number;
+    /**
+     * Maximum characters of memory text sent to the audit model in one call. A
+     * larger store is audited in several batches (related entries grouped, with a
+     * small overlap between batches). Characters, not tokens: budget for roughly
+     * one token per character (Chinese text), so 400000 stays within a 1M-token
+     * window with room for the reply. Lower it for models with a smaller context.
+     * @default 400000
+     */
+    auditBatchChars: number;
 };
 export declare const DEFAULT_CONFIG: PluginConfig;
 //# sourceMappingURL=types.d.ts.map

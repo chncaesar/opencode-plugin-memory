@@ -2,6 +2,21 @@ import type { Memory, PluginConfig, RetiredReason } from "./types.js";
 import type { Logger } from "./logging.js";
 export declare const AUDIT_SYSTEM_PROMPT: string;
 export declare function buildAuditPrompt(memories: Memory[]): string;
+/**
+ * Order entries so related ones sit next to each other (greedy nearest
+ * neighbour on title/tag/body similarity, starting from the lowest id). Pure and
+ * deterministic, so repeated audits of the same store batch it the same way.
+ */
+export declare function orderBySimilarity(memories: Memory[]): Memory[];
+/**
+ * Split entries into batches of at most `maxChars` prompt characters. A store
+ * that fits is returned as one batch unchanged. Otherwise entries are ordered by
+ * similarity, filled greedily, and each batch repeats the last `overlap` entries
+ * of the previous one. An entry larger than the budget gets a batch of its own.
+ * Pairs that land in different batches can still be missed; ordering and overlap
+ * make that unlikely, not impossible.
+ */
+export declare function splitIntoBatches(memories: Memory[], maxChars: number, overlap?: number): Memory[][];
 export type AuditFinding = {
     relation: "duplicate" | "refinement" | "contradiction";
     /** ID of the active memory the audit proposes retiring. */
@@ -22,7 +37,7 @@ export declare function relationToReason(relation: AuditFinding["relation"]): Re
 export declare function activeHash(memories: Memory[]): string;
 /** Sends system + user text to a model and returns the reply text. Throws on failure. */
 export type ModelCall = (system: string, prompt: string) => Promise<string>;
-export type AuditOutcome = "disabled" | "skipped-unchanged" | "skipped-interval" | "skipped-too-few" | "skipped-too-many" | "discarded-changed" | "failed" | "done";
+export type AuditOutcome = "disabled" | "skipped-unchanged" | "skipped-interval" | "skipped-too-few" | "discarded-changed" | "failed" | "done";
 export type AuditDeps = {
     directory: string;
     config: PluginConfig;
@@ -34,7 +49,7 @@ export type AuditDeps = {
 };
 /**
  * Run one audit if the guards allow it. Never throws. Guards, in order:
- * enabled, at least two active entries, not too many entries, entries changed
+ * enabled, at least two active entries, entries changed
  * since the last completed audit, minimum interval since the last attempt.
  *
  * On success, each finding becomes an `intent: retire` staging proposal (with

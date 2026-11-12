@@ -11,7 +11,8 @@ import { AUDIT_AGENT_NAME } from "./auditAgent.js"
  *
  * After a session goes idle, and only if the set of active memories changed
  * since the last audit and enough time has passed, a model is asked whether any
- * memories duplicate, refine or contradict each other. Each finding becomes an
+ * memories duplicate, refine or contradict each other. A store too large for one
+ * prompt is audited in batches (see splitIntoBatches). Each finding becomes an
  * `intent: retire` proposal in staging, which the bot turns into a PR — the
  * human reviews and merges. There is no review.json: the PR is the durable
  * record of the suggestion and its outcome.
@@ -19,7 +20,8 @@ import { AUDIT_AGENT_NAME } from "./auditAgent.js"
  * The audit never edits `memory/active/` or `_summary.md`.
  */
 
-const MAX_ACTIVE_ENTRIES = 200
+/** Entries repeated at the start of the next batch so neighbouring pairs are not split. */
+const BATCH_OVERLAP = 3
 const AUDIT_STATE_FILE = "audit-state.json"
 
 // ─── Prompt and response handling ────────────────────────────────────────────
@@ -44,6 +46,94 @@ export function buildAuditPrompt(memories: Memory[]): string {
     return `[${m.id}] ${m.title}${tags}\n${m.body}`
   })
   return `Memory entries:\n\n${blocks.join("\n\n---\n\n")}`
+}
+
+// ─── Batching ────────────────────────────────────────────────────────────────
+
+/** Characters one entry contributes to the audit prompt (see buildAuditPrompt). */
+function entrySize(m: Memory): number {
+  return m.id.length + m.title.length + m.body.length + (m.tags ?? []).join(", ").length + 24
+}
+
+/** Word and CJK-bigram tokens of an entry's title, tags and body start, for similarity ordering. */
+function tokensOf(m: Memory): Set<string> {
+  const text = `${m.title} ${(m.tags ?? []).join(" ")} ${m.body.slice(0, 400)}`.toLowerCase()
+  const out = new Set<string>()
+  for (const w of text.match(/[a-z0-9_]{3,}/g) ?? []) out.add(w)
+  for (const run of text.match(/[\u4e00-\u9fff]+/g) ?? []) {
+    for (let i = 0; i + 1 < run.length; i++) out.add(run.slice(i, i + 2))
+  }
+  return out
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0
+  let inter = 0
+  for (const t of a) if (b.has(t)) inter++
+  return inter / (a.size + b.size - inter)
+}
+
+/**
+ * Order entries so related ones sit next to each other (greedy nearest
+ * neighbour on title/tag/body similarity, starting from the lowest id). Pure and
+ * deterministic, so repeated audits of the same store batch it the same way.
+ */
+export function orderBySimilarity(memories: Memory[]): Memory[] {
+  if (memories.length <= 2) return [...memories]
+  const rest = [...memories].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+  const tokens = new Map(rest.map((m) => [m.id, tokensOf(m)]))
+  const ordered: Memory[] = [rest.shift()!]
+  while (rest.length > 0) {
+    const last = tokens.get(ordered[ordered.length - 1]!.id)!
+    let best = 0
+    let bestScore = -1
+    for (let i = 0; i < rest.length; i++) {
+      const score = jaccard(last, tokens.get(rest[i]!.id)!)
+      if (score > bestScore) {
+        bestScore = score
+        best = i
+      }
+    }
+    ordered.push(rest.splice(best, 1)[0]!)
+  }
+  return ordered
+}
+
+/**
+ * Split entries into batches of at most `maxChars` prompt characters. A store
+ * that fits is returned as one batch unchanged. Otherwise entries are ordered by
+ * similarity, filled greedily, and each batch repeats the last `overlap` entries
+ * of the previous one. An entry larger than the budget gets a batch of its own.
+ * Pairs that land in different batches can still be missed; ordering and overlap
+ * make that unlikely, not impossible.
+ */
+export function splitIntoBatches(memories: Memory[], maxChars: number, overlap = BATCH_OVERLAP): Memory[][] {
+  const total = memories.reduce((n, m) => n + entrySize(m), 0)
+  if (total <= maxChars) return [memories]
+
+  const ordered = orderBySimilarity(memories)
+  const batches: Memory[][] = []
+  let cur: Memory[] = []
+  let curSize = 0
+  for (const m of ordered) {
+    const size = entrySize(m)
+    if (cur.length > 0 && curSize + size > maxChars) {
+      batches.push(cur)
+      const carry = cur.slice(-overlap)
+      const carrySize = carry.reduce((n, c) => n + entrySize(c), 0)
+      if (carry.length > 0 && carrySize + size <= maxChars) {
+        cur = [...carry]
+        curSize = carrySize
+      } else {
+        cur = []
+        curSize = 0
+      }
+    }
+    cur.push(m)
+    curSize += size
+  }
+  if (cur.length > 0) batches.push(cur)
+  return batches
 }
 
 export type AuditFinding = {
@@ -174,7 +264,6 @@ export type AuditOutcome =
   | "skipped-unchanged"
   | "skipped-interval"
   | "skipped-too-few"
-  | "skipped-too-many"
   | "discarded-changed"
   | "failed"
   | "done"
@@ -191,7 +280,7 @@ export type AuditDeps = {
 
 /**
  * Run one audit if the guards allow it. Never throws. Guards, in order:
- * enabled, at least two active entries, not too many entries, entries changed
+ * enabled, at least two active entries, entries changed
  * since the last completed audit, minimum interval since the last attempt.
  *
  * On success, each finding becomes an `intent: retire` staging proposal (with
@@ -211,10 +300,6 @@ export async function runAudit(deps: AuditDeps): Promise<AuditOutcome> {
       if (state.lastHash !== hash) await writeAuditState(directory, { lastHash: hash, lastAuditAt: state.lastAuditAt })
       return "skipped-too-few"
     }
-    if (active.length > MAX_ACTIVE_ENTRIES) {
-      await logger.info("audit", `skipped: ${active.length} active entries exceeds ${MAX_ACTIVE_ENTRIES}`)
-      return "skipped-too-many"
-    }
     if (hash === state.lastHash) return "skipped-unchanged"
 
     if (!deps.force) {
@@ -224,21 +309,35 @@ export async function runAudit(deps: AuditDeps): Promise<AuditOutcome> {
       }
     }
 
-    let reply: string
-    try {
-      reply = await call(AUDIT_SYSTEM_PROMPT, buildAuditPrompt(active))
-    } catch (err) {
-      await markAttempt(directory, now())
-      await logger.error("audit", err)
-      return "failed"
-    }
+    // One model call per batch. A failed or unparsable batch fails the whole run
+    // before anything is written, so a retry never sees a half-applied audit.
+    const batches = splitIntoBatches(active, config.auditBatchChars)
+    const merged = new Map<string, AuditFinding>()
+    for (let i = 0; i < batches.length; i++) {
+      const batch = batches[i]!
+      const prompt =
+        batches.length > 1
+          ? `Batch ${i + 1} of ${batches.length}: these are some of the project's memory entries; report only relations among the entries shown below.\n\n${buildAuditPrompt(batch)}`
+          : buildAuditPrompt(batch)
 
-    const findings = parseAuditResponse(reply, active)
-    if (findings === null) {
-      await markAttempt(directory, now())
-      await logger.error("audit", "unparsable audit reply: " + clip(reply, 200))
-      return "failed"
+      let reply: string
+      try {
+        reply = await call(AUDIT_SYSTEM_PROMPT, prompt)
+      } catch (err) {
+        await markAttempt(directory, now())
+        await logger.error("audit", err)
+        return "failed"
+      }
+
+      const parsed = parseAuditResponse(reply, batch)
+      if (parsed === null) {
+        await markAttempt(directory, now())
+        await logger.error("audit", `unparsable audit reply (batch ${i + 1}/${batches.length}): ` + clip(reply, 200))
+        return "failed"
+      }
+      for (const f of parsed) if (!merged.has(f.retire)) merged.set(f.retire, f)
     }
+    const findings = [...merged.values()]
 
     // If memories changed while the model was working, the verdict may describe
     // text that no longer exists. Leave lastHash as is so the next idle re-audits.
@@ -272,7 +371,10 @@ export async function runAudit(deps: AuditDeps): Promise<AuditOutcome> {
     }
 
     await writeAuditState(directory, { lastHash: hash, lastAuditAt: now().toISOString() })
-    await logger.info("audit", `${findings.length} finding(s) → ${emitted} proposal(s) over ${active.length} entries`)
+    await logger.info(
+      "audit",
+      `${findings.length} finding(s) → ${emitted} proposal(s) over ${active.length} entries in ${batches.length} batch(es)`,
+    )
     return "done"
   } catch (err) {
     await logger.error("audit", err)

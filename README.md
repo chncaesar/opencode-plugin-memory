@@ -77,6 +77,7 @@ The bot is idempotent: a proposal whose branch already exists is skipped, and a 
 - `enableLog` (boolean, default `true`) — write an operation log to `.memory/plugin.log`.
 - `staleDays` (number, default `90`) — active memories older than this are listed as "aging" in `memory_review`. Informational only; nothing is retired on an age threshold.
 - `auditIntervalMinutes` (number, default `1`) — minimum minutes between two background audits.
+- `auditBatchChars` (number, default `400000`) — max characters of memory text per audit model call. The default assumes a ~1M-token model and about one token per character (Chinese); lower it if your audit model has a smaller context window, since an over-long prompt makes the audit fail. A larger store is split into batches of related entries, with a 3-entry overlap between batches; a memory is never cut in two, and a pair that lands in different batches can still be missed. Example: `["@chncaesar/opencode-plugin-memory", { "auditBatchChars": 100000 }]`.
 - `backgroundAudit` (boolean, default `true`) — run the model-judged semantic audit after sessions go idle: a restricted `memory-audit` agent reads every active memory and reports duplicate / refinement / contradiction findings, each of which becomes a retirement proposal (turned into a PR by the bot).
 - `auditModel` (string, V2 host only) — model for the audit, as `"providerID/modelID"`. Without it the host default is used (the V1 audit agent prefers `small_model`).
 
