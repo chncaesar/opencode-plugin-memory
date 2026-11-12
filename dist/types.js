@@ -10,7 +10,7 @@ export const RETIRED_REASONS = ["wrong", "stale", "useless", "superseded", "dupl
  */
 export const INTENTS = ["propose", "retire"];
 export const DEFAULT_CONFIG = {
-    maxSummaryChars: 2000,
+    maxSummaryChars: 10000,
     enableLog: true,
     staleDays: 90,
     backgroundAudit: true,

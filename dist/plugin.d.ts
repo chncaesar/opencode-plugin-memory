@@ -5,7 +5,7 @@ import { type PluginConfig } from "./types.js";
  * All options are optional; missing values fall back to DEFAULT_CONFIG.
  *
  * Example opencode.json entry:
- *   "plugin": [["opencode-plugin-memory", { "maxSummaryChars": 3000 }]]
+ *   "plugin": [["opencode-plugin-memory", { "maxSummaryChars": 10000 }]]
  */
 export declare function resolveConfig(options?: PluginOptions): PluginConfig;
 /**

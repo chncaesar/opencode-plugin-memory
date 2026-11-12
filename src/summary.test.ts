@@ -130,3 +130,12 @@ describe("memory-writing policy", () => {
     )
   })
 })
+
+describe("buildSystemPrompt default cap", () => {
+  it("fits all 56 realistic titles under the 10000-char default cap", () => {
+    const lines = Array.from({ length: 56 }, (_, i) => `[mem-${String(i).padStart(8, "0")}] ${"标题".repeat(40)} ${i}`)
+    const out = buildSystemPrompt(lines.join("\n"), 10000)
+    for (const l of lines) assert.ok(out.includes(l))
+    assert.ok(!out.includes("showing a subset"))
+  })
+})

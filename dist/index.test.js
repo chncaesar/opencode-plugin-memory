@@ -30,12 +30,12 @@ async function seedStale(dir) {
 }
 describe("resolveConfig", () => {
     it("applies defaults and validates positive numbers", () => {
-        assert.equal(resolveConfig().maxSummaryChars, 2000);
+        assert.equal(resolveConfig().maxSummaryChars, 10000);
         assert.equal(resolveConfig().enableLog, true);
         assert.equal(resolveConfig().staleDays, 90);
         assert.equal(resolveConfig().backgroundAudit, true);
         assert.equal(resolveConfig().auditIntervalMinutes, 1);
-        assert.equal(resolveConfig({}).maxSummaryChars, 2000);
+        assert.equal(resolveConfig({}).maxSummaryChars, 10000);
     });
     it("accepts overrides and ignores junk", () => {
         const c = resolveConfig({ maxSummaryChars: 3000, staleDays: 7, backgroundAudit: false, enableLog: false });

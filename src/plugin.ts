@@ -13,7 +13,7 @@ import { tool } from "@opencode-ai/plugin/tool"
  * All options are optional; missing values fall back to DEFAULT_CONFIG.
  *
  * Example opencode.json entry:
- *   "plugin": [["opencode-plugin-memory", { "maxSummaryChars": 3000 }]]
+ *   "plugin": [["opencode-plugin-memory", { "maxSummaryChars": 10000 }]]
  */
 export function resolveConfig(options?: PluginOptions): PluginConfig {
   if (!options || typeof options !== "object") return DEFAULT_CONFIG

@@ -45,7 +45,7 @@ Restart OpenCode afterwards: plugins are loaded per server process. Then add it 
 "plugin": ["/path/to/opencode-plugin-memory"]
 
 // with options
-"plugin": [["@chncaesar/opencode-plugin-memory", { "maxSummaryChars": 3000 }]]
+"plugin": [["@chncaesar/opencode-plugin-memory", { "maxSummaryChars": 10000 }]]
 ```
 
 ## The bot
@@ -73,7 +73,7 @@ The bot is idempotent: a proposal whose branch already exists is skipped, and a 
 
 ## Configuration
 
-- `maxSummaryChars` (number, default `2000`) — max characters used by the injected index of titles. The fixed writing policy is added separately.
+- `maxSummaryChars` (number, default `10000`) — max characters used by the injected index of titles. The fixed writing policy is added separately.
 - `enableLog` (boolean, default `true`) — write an operation log to `.memory/plugin.log`.
 - `staleDays` (number, default `90`) — active memories older than this are listed as "aging" in `memory_review`. Informational only; nothing is retired on an age threshold.
 - `auditIntervalMinutes` (number, default `1`) — minimum minutes between two background audits.

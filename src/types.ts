@@ -61,9 +61,10 @@ export type MemoryStatus = "active" | "retired" | "staging"
  */
 export type PluginConfig = {
   /**
-   * Maximum number of characters used by the injected memory index.
-   * The fixed writing policy is injected separately.
-   * @default 2000
+   * Maximum number of characters used by the injected memory index. Titles
+   * beyond the cap are dropped with a notice. The fixed writing policy is
+   * injected separately.
+   * @default 10000
    */
   maxSummaryChars: number
   /**
@@ -93,7 +94,7 @@ export type PluginConfig = {
 }
 
 export const DEFAULT_CONFIG: PluginConfig = {
-  maxSummaryChars: 2000,
+  maxSummaryChars: 10000,
   enableLog: true,
   staleDays: 90,
   backgroundAudit: true,
