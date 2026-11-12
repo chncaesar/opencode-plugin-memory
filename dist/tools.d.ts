@@ -7,6 +7,7 @@ type MemoryToolSet = {
     memory_delete: ToolDefinition;
     memory_read: ToolDefinition;
     memory_review: ToolDefinition;
+    memory_publish: ToolDefinition;
 };
 /** Map a free-text retirement reason onto the fixed vocabulary (default `stale`). */
 export declare function mapRetireReason(reason?: string): RetiredReason;

@@ -6,7 +6,7 @@ PR-gated, project-scoped persistent memory for [OpenCode](https://opencode.ai). 
 
 ## How it works
 
-- Five tools (`memory_propose`, `memory_update`, `memory_delete`, `memory_read`, `memory_review`) are registered with OpenCode and available to the LLM during every session.
+- Six tools (`memory_propose`, `memory_update`, `memory_delete`, `memory_read`, `memory_review`, `memory_publish`) are registered with OpenCode and available to the LLM during every session.
 - The LLM **never writes shared truth directly**. It only writes a proposal file into a machine-local, git-ignored `.memory/staging/` folder.
 - A local **bot** (a small CLI you run on your machine) watches staging, branches, commits each proposal into `memory/active/`, and opens a pull request.
 - A **human** reviews the PR against a checklist and merges it. Merge is the only approval.
@@ -49,6 +49,8 @@ Restart OpenCode afterwards: plugins are loaded per server process. Then add it 
 ```
 
 ## The bot
+
+The LLM can run the bot itself through the argument-less `memory_publish` tool. It needs no user approval because it only opens PRs (the merge is the gate), and all git work happens in a throwaway `git worktree`, so your checkout, branch and uncommitted files are never touched. A lock file (`.memory/bot.lock`) keeps a `watch` daemon and `memory_publish` from running at once.
 
 The bot is the only component that holds repository credentials and runs git. It is a local daemon/CLI, not a GitHub Action — an Action runs remotely and can never see a local, git-ignored staging folder. It uses the `gh` CLI (already authenticated) to open PRs.
 

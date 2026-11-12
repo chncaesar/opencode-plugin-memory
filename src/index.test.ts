@@ -52,12 +52,13 @@ describe("resolveConfig", () => {
 })
 
 describe("plugin entry", () => {
-  it("registers five tools, the event hook and the system transform hook", async () => {
+  it("registers six tools, the event hook and the system transform hook", async () => {
     await withDir(async (dir) => {
       const hooks = await server(fakeInput(dir))
       assert.deepEqual(Object.keys(hooks.tool ?? {}).sort(), [
         "memory_delete",
         "memory_propose",
+        "memory_publish",
         "memory_read",
         "memory_review",
         "memory_update",
@@ -135,14 +136,14 @@ describe("V2 entry", () => {
     assert.equal(typeof defaultExport.server, "function")
   })
 
-  it("setup registers five tools that execute, injects context, and disposes", async () => {
+  it("setup registers six tools that execute, injects context, and disposes", async () => {
     await withDir(async (dir) => {
       await seedStale(dir)
       await generateSummary(dir)
       const m = mockCtx(dir)
       const cleanup = await setup(m.ctx as never)
       assert.deepEqual(Object.keys(m.tools).sort(), [
-        "memory_delete", "memory_propose", "memory_read", "memory_review", "memory_update",
+        "memory_delete", "memory_propose", "memory_publish", "memory_read", "memory_review", "memory_update",
       ])
 
       const added = await m.tools["memory_propose"].execute({ title: "Rule three", content: "three" })

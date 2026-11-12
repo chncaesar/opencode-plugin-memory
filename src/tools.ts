@@ -15,6 +15,7 @@ import {
   StoreWriteError,
 } from "./storage.js"
 import { detectSecrets } from "./secret.js"
+import { processStagingOnce } from "./bot.js"
 
 // Use the zod instance bundled with @opencode-ai/plugin to avoid version conflicts
 const z = tool.schema
@@ -27,6 +28,7 @@ type MemoryToolSet = {
   memory_delete: ToolDefinition
   memory_read: ToolDefinition
   memory_review: ToolDefinition
+  memory_publish: ToolDefinition
 }
 
 /** Map a free-text retirement reason onto the fixed vocabulary (default `stale`). */
@@ -150,6 +152,7 @@ export function createMemoryTools(config: PluginConfig, logger: Logger): MemoryT
           `Proposed [${id}]: ${title}`,
           "",
           "This is a proposal only. It becomes an active memory after a human reviews and merges the pull request.",
+          "Staged only: no pull request exists until memory_publish runs.",
         ]
         if (memory.supersedes?.length) out.push("", `Supersedes: ${memory.supersedes.join(", ")}`)
         return { title: `Memory proposed: ${id}`, output: out.join("\n") }
@@ -223,7 +226,7 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
         await logger.info("memory_update", `${newId} supersedes ${id}`)
         return {
           title: `Memory update proposed: ${newId}`,
-          output: `Proposed [${newId}] as a replacement for [${id}]: ${newTitle}\n\nThis is a proposal only; it takes effect after a human merges the pull request.`,
+          output: `Proposed [${newId}] as a replacement for [${id}]: ${newTitle}\n\nThis is a proposal only; it takes effect after a human merges the pull request.\nStaged only: no pull request exists until memory_publish runs.`,
         }
       } catch (err) {
         if (err instanceof StoreWriteError) {
@@ -281,7 +284,7 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
         await logger.info("memory_delete", `${id} (reason: ${mapped})`)
         return {
           title: `Memory retirement proposed: ${id}`,
-          output: `Proposed retiring [${id}]: ${target.title}\nReason: ${mapped}.\n\nThis is a proposal only; the memory is removed after a human merges the pull request.`,
+          output: `Proposed retiring [${id}]: ${target.title}\nReason: ${mapped}.\n\nThis is a proposal only; the memory is removed after a human merges the pull request.\nStaged only: no pull request exists until memory_publish runs.`,
         }
       } catch (err) {
         if (err instanceof StoreWriteError) {
@@ -418,7 +421,36 @@ Use this when the system prompt says memories need review, or when cleaning up m
     },
   })
 
-  return { memory_propose, memory_update, memory_delete, memory_read, memory_review }
+  // ── memory_publish ────────────────────────────────────────────────────────
+
+  const memory_publish = tool({
+    description: `Publish staged memory proposals as pull requests. Call it once after you finish proposing (memory_propose / memory_update / memory_delete), or when memory_review shows pending proposals.
+
+Safe to call without asking the user: it runs the memory bot in a throwaway git worktree, so the user's checkout, branch and uncommitted files are never touched, and it only opens PRs. The human merge is the approval gate; nothing becomes an active memory until a person merges. It takes no arguments and cannot run arbitrary git commands.
+
+Returns the opened PR URLs. Proposals whose push or PR step failed stay staged and are retried on the next call.`,
+    args: {},
+    async execute(_args, context) {
+      try {
+        const lines: string[] = []
+        const res = await processStagingOnce(context.directory, { log: (l) => lines.push(l) })
+        await logger.info("memory_publish", `promoted=${res.promoted} skipped=${res.skipped} failed=${res.failed}`)
+        if (res.busy) return { title: "Memory publish busy", output: "Another memory bot run is in progress. Try again shortly." }
+        if (res.promoted + res.skipped + res.failed === 0) {
+          return { title: "Memory publish", output: "No staged proposals." }
+        }
+        const out = [`Opened ${res.promoted} PR${res.promoted === 1 ? "" : "s"}; skipped ${res.skipped}; failed ${res.failed}.`]
+        if (res.prs.length) out.push("", ...res.prs.map((u) => `- ${u}`))
+        if (lines.length) out.push("", "Log:", ...lines.map((l) => `  ${l}`))
+        return { title: `Memory published (${res.promoted})`, output: out.join("\n") }
+      } catch (err) {
+        await logger.error("memory_publish", err)
+        return { title: "Memory publish failed", output: `Could not publish: ${err instanceof Error ? err.message : String(err)}` }
+      }
+    },
+  })
+
+  return { memory_propose, memory_update, memory_delete, memory_read, memory_review, memory_publish }
 }
 
 function formatMemory(m: Memory): string[] {

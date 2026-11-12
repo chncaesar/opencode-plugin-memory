@@ -108,13 +108,14 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
       registerAuditAgent(cfg as unknown as { agent?: Record<string, unknown>; small_model?: string })
     },
 
-    // ── Register the five memory tools ────────────────────────────────────
+    // ── Register the six memory tools ────────────────────────────────────
     tool: {
       memory_propose: memoryTools.memory_propose,
       memory_update: memoryTools.memory_update,
       memory_delete: memoryTools.memory_delete,
       memory_read: memoryTools.memory_read,
       memory_review: memoryTools.memory_review,
+      memory_publish: memoryTools.memory_publish,
     },
 
     // ── Background audit: run after a session goes idle ───────────────────

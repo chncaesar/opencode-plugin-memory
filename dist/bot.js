@@ -18,6 +18,7 @@
  *   node dist/bot.js regenerate regenerate memory/_summary.md (used by CI)
  */
 import fs from "fs/promises";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import { execFile } from "child_process";
@@ -148,58 +149,124 @@ export function buildPrBody(memory) {
         lines.push("", `Source: ${memory.source}`);
     return lines.join("\n");
 }
+async function defaultOpenPr(req) {
+    return gh(["pr", "create", "--base", req.base, "--head", req.branch, "--title", req.title, "--body", req.body], req.cwd);
+}
+function pidAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    }
+    catch (err) {
+        return err.code === "EPERM";
+    }
+}
+/** Take the single-run lock; returns a release function, or null if another live run holds it. */
+async function acquireLock(projectDir) {
+    const lock = path.join(path.dirname(stagingDir(projectDir)), "bot.lock");
+    await fs.mkdir(path.dirname(lock), { recursive: true });
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            const fh = await fs.open(lock, "wx");
+            await fh.writeFile(String(process.pid));
+            await fh.close();
+            return () => fs.rm(lock, { force: true });
+        }
+        catch (err) {
+            if (err.code !== "EEXIST")
+                throw err;
+            const pid = Number((await fs.readFile(lock, "utf8").catch(() => "")).trim());
+            if (pid && pidAlive(pid))
+                return null;
+            await fs.rm(lock, { force: true }); // stale lock from a crashed run
+        }
+    }
+    return null;
+}
 /**
- * Process every staged proposal once. For each:
+ * Process every staged proposal once. All git work happens in a throwaway git
+ * worktree, so the developer's checkout (branch, index, uncommitted files) is
+ * never touched. For each proposal:
  *   1. skip if a branch `memory/<id>` already exists (PR already opened);
- *   2. branch off the default branch, apply the transform, commit, push, open PR;
- *   3. on success remove the staged file; on failure leave it for the next poll.
+ *   2. branch off the fetched default branch in the worktree, apply the
+ *      transform, commit, push, open PR;
+ *   3. on success remove the staged file; on failure leave it for the next run.
  */
 export async function processStagingOnce(projectDir, opts = {}) {
     const cwd = opts.cwd ?? projectDir;
     const log = opts.log ?? ((line) => console.error(line));
+    const openPr = opts.openPr ?? defaultOpenPr;
+    const result = { promoted: 0, skipped: 0, failed: 0, prs: [] };
     const staged = await listStagedProposals(projectDir);
     if (staged.length === 0)
-        return { promoted: 0, skipped: 0 };
+        return result;
+    const release = await acquireLock(projectDir);
+    if (!release) {
+        log("another bot run is in progress; skipping");
+        return { ...result, busy: true };
+    }
     const base = await defaultBranch(cwd);
-    await git(["checkout", base], cwd);
     try {
-        await git(["pull", "--ff-only"], cwd);
+        await git(["fetch", "origin"], cwd);
     }
     catch {
-        // best-effort; a stale base is acceptable
+        // best-effort; fall back to the local ref below
     }
-    let promoted = 0;
-    let skipped = 0;
-    // Process deterministically (by id) so behaviour is stable across runs.
-    for (const memory of [...staged].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
-        const branch = `memory/${memory.id}`;
-        if (await branchExists(cwd, branch)) {
-            log(`skip ${memory.id}: branch ${branch} already exists`);
-            skipped++;
-            continue;
-        }
-        await git(["checkout", "-b", branch], cwd);
-        try {
-            const changed = memory.intent === "retire" ? await applyRetire(projectDir, memory) : await applyPropose(projectDir, memory);
-            if (changed.length === 0) {
-                log(`skip ${memory.id}: nothing to change`);
-                await git(["checkout", base], cwd);
-                skipped++;
+    let startRef = `origin/${base}`;
+    try {
+        await git(["rev-parse", "--verify", "--quiet", startRef], cwd);
+    }
+    catch {
+        startRef = base;
+    }
+    const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "memory-bot-"));
+    try {
+        await git(["worktree", "add", "--detach", worktree, startRef], cwd);
+        // Process deterministically (by id) so behaviour is stable across runs.
+        for (const memory of [...staged].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
+            const branch = `memory/${memory.id}`;
+            if (await branchExists(cwd, branch)) {
+                log(`skip ${memory.id}: branch ${branch} already exists`);
+                result.skipped++;
                 continue;
             }
-            await git(["add", "memory/active", "memory/retired"], cwd);
-            await git(["commit", "-m", commitMessage(memory)], cwd);
-            await git(["push", "-u", "origin", branch], cwd);
-            await gh(["pr", "create", "--base", base, "--head", branch, "--title", buildPrTitle(memory), "--body", buildPrBody(memory)], cwd);
-            await fs.rm(path.join(stagingDir(projectDir), `${memory.id}.md`), { force: true });
-            log(`promoted ${memory.id} (${memory.intent === "retire" ? "retire" : "propose"})`);
-            promoted++;
-        }
-        finally {
-            await git(["checkout", base], cwd).catch(() => undefined);
+            try {
+                await git(["checkout", "-b", branch, startRef], worktree);
+                const changed = memory.intent === "retire" ? await applyRetire(worktree, memory) : await applyPropose(worktree, memory);
+                if (changed.length === 0) {
+                    log(`skip ${memory.id}: nothing to change`);
+                    result.skipped++;
+                    continue;
+                }
+                await git(["add", "--all", "memory"], worktree);
+                await git(["commit", "-m", commitMessage(memory)], worktree);
+                await git(["push", "-u", "origin", branch], worktree);
+                const url = await openPr({ cwd: worktree, base, branch, title: buildPrTitle(memory), body: buildPrBody(memory) });
+                await fs.rm(path.join(stagingDir(projectDir), `${memory.id}.md`), { force: true });
+                log(`promoted ${memory.id} (${memory.intent === "retire" ? "retire" : "propose"})${url ? ` ${url}` : ""}`);
+                result.promoted++;
+                if (url)
+                    result.prs.push(url);
+            }
+            catch (err) {
+                log(`failed ${memory.id}: ${err instanceof Error ? err.message : String(err)}`);
+                result.failed++;
+            }
+            finally {
+                await git(["checkout", "--detach", startRef], worktree).catch(() => undefined);
+                // The local branch is not needed once pushed, and an unpushed one must not block a retry.
+                // A pushed branch is still caught by the origin/<branch> check on the next run.
+                await git(["branch", "-D", branch], cwd).catch(() => undefined);
+            }
         }
     }
-    return { promoted, skipped };
+    finally {
+        await git(["worktree", "remove", "--force", worktree], cwd).catch(() => undefined);
+        await fs.rm(worktree, { recursive: true, force: true }).catch(() => undefined);
+        await git(["worktree", "prune"], cwd).catch(() => undefined);
+        await release();
+    }
+    return result;
 }
 function commitMessage(memory) {
     if (memory.intent === "retire")
@@ -262,6 +329,10 @@ async function main() {
                 console.log(`skipped ${result.skipped} proposal${result.skipped === 1 ? "" : "s"}`);
             else
                 console.log("no staged proposals");
+            if (result.failed > 0) {
+                console.error(`${result.failed} proposal${result.failed === 1 ? "" : "s"} failed; left in staging`);
+                process.exitCode = 1;
+            }
             return;
         }
         case "watch": {

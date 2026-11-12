@@ -3,7 +3,8 @@ import assert from "node:assert/strict"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
-import { applyPropose, applyRetire, buildPrBody, buildPrTitle, defaultBranch } from "./bot.js"
+import { execFileSync } from "child_process"
+import { applyPropose, applyRetire, buildPrBody, buildPrTitle, defaultBranch, processStagingOnce } from "./bot.js"
 import { activeDir, listActiveMemories, listRetiredMemories, retiredDir, stagingDir, writeMemoryFile, writeProposal } from "./storage.js"
 import type { Memory } from "./types.js"
 
@@ -128,6 +129,79 @@ describe("defaultBranch", () => {
   it("returns main when not in a repo", async () => {
     await withDir(async (dir) => {
       assert.equal(await defaultBranch(dir), "main")
+    })
+  })
+})
+
+describe("processStagingOnce (worktree isolation)", () => {
+  const sh = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim()
+
+  it("opens a branch per proposal without touching the developer checkout", async () => {
+    await withDir(async (root) => {
+      const remote = path.join(root, "remote.git")
+      const repo = path.join(root, "repo")
+      await fs.mkdir(repo)
+      sh(root, "init", "--bare", "-b", "main", remote)
+      sh(repo, "init", "-b", "main")
+      sh(repo, "config", "user.email", "t@example.com")
+      sh(repo, "config", "user.name", "t")
+      await fs.writeFile(path.join(repo, "README.md"), "x")
+      sh(repo, "add", ".")
+      sh(repo, "commit", "-m", "init")
+      sh(repo, "remote", "add", "origin", remote)
+      sh(repo, "push", "-u", "origin", "main")
+
+      // The developer is on another branch with uncommitted work.
+      sh(repo, "checkout", "-b", "feature")
+      await fs.writeFile(path.join(repo, "wip.txt"), "uncommitted")
+      await writeProposal(repo, { id: "mem-aaaaaaaa", title: "A", body: "body a", proposedAt: "2026-01-01", intent: "propose" })
+
+      const prs: string[] = []
+      const res = await processStagingOnce(repo, {
+        log: () => undefined,
+        openPr: async (r) => {
+          prs.push(r.branch)
+          return `https://example.test/pr/${prs.length}`
+        },
+      })
+
+      assert.equal(res.promoted, 1)
+      assert.equal(res.failed, 0)
+      assert.deepEqual(res.prs, ["https://example.test/pr/1"])
+      assert.deepEqual(prs, ["memory/mem-aaaaaaaa"])
+      assert.equal(sh(repo, "rev-parse", "--abbrev-ref", "HEAD"), "feature")
+      assert.equal(await fs.readFile(path.join(repo, "wip.txt"), "utf8"), "uncommitted")
+      assert.match(sh(repo, "ls-remote", "origin", "memory/mem-aaaaaaaa"), /refs\/heads\/memory\/mem-aaaaaaaa/)
+      assert.equal(sh(repo, "worktree", "list").split("\n").length, 1)
+      await assert.rejects(fs.access(path.join(stagingDir(repo), "mem-aaaaaaaa.md")))
+      await assert.rejects(fs.access(path.join(activeDir(repo), "mem-aaaaaaaa.md"))) // active/ only exists on the PR branch
+    })
+  })
+
+  it("keeps a proposal staged when the PR step fails, and retries it cleanly", async () => {
+    await withDir(async (root) => {
+      const remote = path.join(root, "remote.git")
+      const repo = path.join(root, "repo")
+      await fs.mkdir(repo)
+      sh(root, "init", "--bare", "-b", "main", remote)
+      sh(repo, "init", "-b", "main")
+      sh(repo, "config", "user.email", "t@example.com")
+      sh(repo, "config", "user.name", "t")
+      await fs.writeFile(path.join(repo, "README.md"), "x")
+      sh(repo, "add", ".")
+      sh(repo, "commit", "-m", "init")
+      sh(repo, "remote", "add", "origin", remote)
+      sh(repo, "push", "-u", "origin", "main")
+      await writeProposal(repo, { id: "mem-bbbbbbbb", title: "B", body: "body b", proposedAt: "2026-01-01", intent: "propose" })
+
+      const failed = await processStagingOnce(repo, {
+        log: () => undefined,
+        openPr: async () => {
+          throw new Error("gh down")
+        },
+      })
+      assert.equal(failed.failed, 1)
+      await fs.access(path.join(stagingDir(repo), "mem-bbbbbbbb.md"))
     })
   })
 })
