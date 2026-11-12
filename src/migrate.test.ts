@@ -126,11 +126,12 @@ describe("migrateLegacyStores", () => {
     })
   })
 
-  it("is a no-op when there is no legacy store, but still writes an empty summary", async () => {
+  it("is a no-op when there is no legacy store and creates nothing on disk", async () => {
     await withDir(async (dir) => {
       assert.equal(await migrateLegacyStores(dir), 0)
       assert.equal((await listActiveMemories(dir)).length, 0)
-      assert.match(await fs.readFile(summaryFilePath(dir), "utf8"), /no active memories/)
+      await assert.rejects(fs.access(path.join(dir, "memory")))
+      await assert.rejects(fs.access(summaryFilePath(dir)))
     })
   })
 

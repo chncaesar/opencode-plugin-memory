@@ -19,6 +19,7 @@
  */
 import fs from "fs/promises"
 import os from "os"
+import crypto from "crypto"
 import path from "path"
 import { fileURLToPath } from "url"
 import { execFile } from "child_process"
@@ -55,10 +56,36 @@ function gh(args: string[], cwd: string): Promise<string> {
   return run("gh", args, cwd)
 }
 
-/** The repository's default branch (main/master), used as the PR base. */
-export async function defaultBranch(cwd: string): Promise<string> {
+/**
+ * `owner/repo` (or `host/owner/repo` for non-github.com hosts) of a git remote
+ * URL, in the form `gh --repo` accepts. Undefined for local paths and anything
+ * that is not a hosted `owner/repo` URL.
+ */
+export function parseRemoteUrl(url: string): string | undefined {
+  const u = url.trim()
+  const m =
+    /^(?:https?|ssh|git):\/\/(?:[^@/]+@)?([^/:]+)(?::\d+)?\/(.+?)(?:\.git)?\/?$/.exec(u) ??
+    /^(?:[^@/]+@)?([^:/]+):(?!\/)(.+?)(?:\.git)?\/?$/.exec(u)
+  if (!m) return undefined
+  const host = m[1]!
+  const repoPath = m[2]!
+  if (repoPath.split("/").filter(Boolean).length !== 2) return undefined
+  return host.toLowerCase() === "github.com" ? repoPath : `${host}/${repoPath}`
+}
+
+/** The repo that `origin` points at, so PRs always target the repo we push to (not a fork's upstream). */
+async function repoSlug(cwd: string): Promise<string | undefined> {
   try {
-    const name = await gh(["repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"], cwd)
+    return parseRemoteUrl(await git(["remote", "get-url", "origin"], cwd))
+  } catch {
+    return undefined
+  }
+}
+
+/** The repository's default branch (main/master), used as the PR base. */
+export async function defaultBranch(cwd: string, repo?: string): Promise<string> {
+  try {
+    const name = await gh(["repo", "view", ...(repo ? [repo] : []), "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"], cwd)
     if (name) return name
   } catch {
     // fall through to git fallback
@@ -161,7 +188,8 @@ export function buildPrBody(memory: Memory): string {
 
 // ─── Orchestration ──────────────────────────────────────────────────────────
 
-export type PrRequest = { cwd: string; base: string; branch: string; title: string; body: string }
+export type PrRequest = { cwd: string; repo?: string; base: string; branch: string; title: string; body: string }
+export type PrLookup = { cwd: string; repo?: string; branch: string }
 
 export type BotOptions = {
   /** Repository root used for git commands (defaults to the project dir). */
@@ -170,24 +198,64 @@ export type BotOptions = {
   log?: (line: string) => void
   /** Open a PR and return its URL. Defaults to `gh pr create`. Injectable for tests. */
   openPr?: (req: PrRequest) => Promise<string>
+  /** Find an existing PR (any state) for a branch; its URL, or null. Defaults to `gh pr list`. */
+  findPr?: (req: PrLookup) => Promise<string | null>
 }
 
 export type BotResult = {
   /** Number of staged proposals successfully turned into PRs. */
   promoted: number
-  /** Number of staged proposals left in place (branch already existed, nothing to change). */
+  /** Number of staged proposals left in place (nothing to change). */
   skipped: number
   /** Number of staged proposals whose git/PR step failed; left in place for the next run. */
   failed: number
-  /** URLs of the PRs opened by this run. */
+  /** Proposals whose branch was already pushed by an earlier run; their PR was found or opened now. */
+  recovered: number
+  /** URLs of the PRs opened or found by this run. */
   prs: string[]
   /** True when another bot run held the lock, so nothing was processed. */
   busy?: boolean
 }
 
-async function defaultOpenPr(req: PrRequest): Promise<string> {
-  return gh(["pr", "create", "--base", req.base, "--head", req.branch, "--title", req.title, "--body", req.body], req.cwd)
+/** `gh pr create` arguments; `--repo` pins the PR to the repo we push to. */
+export function buildPrCreateArgs(req: PrRequest): string[] {
+  return [
+    "pr", "create",
+    ...(req.repo ? ["--repo", req.repo] : []),
+    "--base", req.base, "--head", req.branch, "--title", req.title, "--body", req.body,
+  ]
 }
+
+/** `gh pr list` arguments that find a PR in any state for a head branch. */
+export function buildPrListArgs(req: PrLookup): string[] {
+  return ["pr", "list", ...(req.repo ? ["--repo", req.repo] : []), "--head", req.branch, "--state", "all", "--limit", "1", "--json", "url", "--jq", ".[0].url // empty"]
+}
+
+async function defaultOpenPr(req: PrRequest): Promise<string> {
+  return gh(buildPrCreateArgs(req), req.cwd)
+}
+
+async function defaultFindPr(req: PrLookup): Promise<string | null> {
+  const url = await gh(buildPrListArgs(req), req.cwd)
+  return url || null
+}
+
+/**
+ * Branch for a proposal. A retire proposal carries the id of the memory it
+ * retires, which already has an add branch (`memory/<id>`) that is usually kept
+ * after merge, so retires get their own namespace, made unique per proposal by
+ * its proposal time (stable across retries of the same proposal).
+ */
+export function branchFor(memory: Memory): string {
+  if (memory.intent !== "retire") return `memory/${memory.id}`
+  const stamp = (memory.proposedAt ?? "").replace(/\D/g, "").slice(0, 14) || "0"
+  return `memory/retire/${memory.id}-${stamp}`
+}
+
+// ─── Single-run lock ─────────────────────────────────────────────────────────
+
+/** A lock older than this is stale even if its pid is alive (pids are reused; OpenCode is long-lived). */
+const LOCK_STALE_MS = 30 * 60_000
 
 function pidAlive(pid: number): boolean {
   try {
@@ -198,40 +266,113 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-/** Take the single-run lock; returns a release function, or null if another live run holds it. */
-async function acquireLock(projectDir: string): Promise<(() => Promise<void>) | null> {
-  const lock = path.join(path.dirname(stagingDir(projectDir)), "bot.lock")
+function lockPath(projectDir: string): string {
+  return path.join(path.dirname(stagingDir(projectDir)), "bot.lock")
+}
+
+/**
+ * Take the single-run lock; returns a release function, or null when another
+ * live, recent run holds it. The lock file appears atomically with its full
+ * content (written to a temp file, then hard-linked into place), so a reader
+ * never sees an empty or partial lock. A stale lock is removed only if it is
+ * unchanged since it was judged stale; two processes racing to take over the
+ * same stale lock can still both win in a very narrow window.
+ */
+export async function acquireLock(projectDir: string): Promise<(() => Promise<void>) | null> {
+  const lock = lockPath(projectDir)
   await fs.mkdir(path.dirname(lock), { recursive: true })
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fh = await fs.open(lock, "wx")
-      await fh.writeFile(String(process.pid))
-      await fh.close()
-      return () => fs.rm(lock, { force: true })
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err
-      const pid = Number((await fs.readFile(lock, "utf8").catch(() => "")).trim())
-      if (pid && pidAlive(pid)) return null
-      await fs.rm(lock, { force: true }) // stale lock from a crashed run
-    }
+  const token = `${process.pid}:${Date.now()}:${crypto.randomBytes(4).toString("hex")}`
+  const tmp = `${lock}.${token.replace(/:/g, "-")}.tmp`
+  await fs.writeFile(tmp, token, "utf8")
+
+  const release = async () => {
+    const current = await fs.readFile(lock, "utf8").catch(() => "")
+    if (current === token) await fs.rm(lock, { force: true })
   }
-  return null
+
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await fs.link(tmp, lock)
+        return release
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code
+        if (code === "EEXIST") {
+          // fall through to the staleness check below
+        } else if (code === "EPERM" || code === "ENOSYS" || code === "ENOTSUP" || code === "EXDEV") {
+          // filesystem without hard links: exclusive create is the best available
+          try {
+            await fs.writeFile(lock, token, { encoding: "utf8", flag: "wx" })
+            return release
+          } catch (err2) {
+            if ((err2 as NodeJS.ErrnoException).code !== "EEXIST") throw err2
+          }
+        } else {
+          throw err
+        }
+      }
+
+      const seen = await fs.readFile(lock, "utf8").catch(() => null)
+      if (seen === null) continue // released between our attempt and the read
+      const [pidText, tsText] = seen.split(":")
+      const pid = Number(pidText)
+      const ts = Number(tsText)
+      const fresh = Number.isFinite(ts) && Date.now() - ts < LOCK_STALE_MS
+      if (pid > 0 && pidAlive(pid) && fresh) return null
+      if ((await fs.readFile(lock, "utf8").catch(() => null)) === seen) await fs.rm(lock, { force: true })
+    }
+    return null
+  } finally {
+    await fs.rm(tmp, { force: true }).catch(() => undefined)
+  }
+}
+
+// ─── Worktree housekeeping ───────────────────────────────────────────────────
+
+/**
+ * Remove worktrees left behind by an earlier crashed run (named memory-bot-*),
+ * then prune records of worktrees whose directory is gone. Safe because the
+ * caller holds the single-run lock, so no live run owns one.
+ */
+async function cleanStaleWorktrees(cwd: string, log: (line: string) => void): Promise<void> {
+  let listing = ""
+  try {
+    listing = await git(["worktree", "list", "--porcelain"], cwd)
+  } catch {
+    return
+  }
+  for (const line of listing.split("\n")) {
+    if (!line.startsWith("worktree ")) continue
+    const dir = line.slice("worktree ".length).trim()
+    if (!path.basename(dir).startsWith("memory-bot-")) continue
+    await git(["worktree", "remove", "--force", dir], cwd).catch(() => undefined)
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined)
+    log(`removed stale worktree ${dir}`)
+  }
+  await git(["worktree", "prune"], cwd).catch(() => undefined)
+}
+
+async function remoteBranchExists(cwd: string, branch: string): Promise<boolean> {
+  const out = await git(["ls-remote", "--heads", "origin", branch], cwd)
+  return out.length > 0
 }
 
 /**
  * Process every staged proposal once. All git work happens in a throwaway git
  * worktree, so the developer's checkout (branch, index, uncommitted files) is
  * never touched. For each proposal:
- *   1. skip if a branch `memory/<id>` already exists (PR already opened);
- *   2. branch off the fetched default branch in the worktree, apply the
- *      transform, commit, push, open PR;
- *   3. on success remove the staged file; on failure leave it for the next run.
+ *   1. if its branch is already on the remote (an earlier run pushed it but did
+ *      not finish), find its PR, or open one, and drop the staged file;
+ *   2. otherwise branch off the fetched default branch in the worktree, apply
+ *      the transform, commit, push, open PR, drop the staged file;
+ *   3. on failure leave the staged file for the next run.
  */
 export async function processStagingOnce(projectDir: string, opts: BotOptions = {}): Promise<BotResult> {
   const cwd = opts.cwd ?? projectDir
   const log = opts.log ?? ((line: string) => console.error(line))
   const openPr = opts.openPr ?? defaultOpenPr
-  const result: BotResult = { promoted: 0, skipped: 0, failed: 0, prs: [] }
+  const findPr = opts.findPr ?? defaultFindPr
+  const result: BotResult = { promoted: 0, skipped: 0, failed: 0, recovered: 0, prs: [] }
 
   const staged = await listStagedProposals(projectDir)
   if (staged.length === 0) return result
@@ -242,33 +383,44 @@ export async function processStagingOnce(projectDir: string, opts: BotOptions = 
     return { ...result, busy: true }
   }
 
-  const base = await defaultBranch(cwd)
+  let worktree: string | undefined
   try {
-    await git(["fetch", "origin"], cwd)
-  } catch {
-    // best-effort; fall back to the local ref below
-  }
-  let startRef = `origin/${base}`
-  try {
-    await git(["rev-parse", "--verify", "--quiet", startRef], cwd)
-  } catch {
-    startRef = base
-  }
+    await cleanStaleWorktrees(cwd, log)
 
-  const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "memory-bot-"))
-  try {
+    const repo = await repoSlug(cwd)
+    const base = await defaultBranch(cwd, repo)
+    try {
+      await git(["fetch", "origin"], cwd)
+    } catch {
+      // best-effort; fall back to the local ref below
+    }
+    let startRef = `origin/${base}`
+    try {
+      await git(["rev-parse", "--verify", "--quiet", startRef], cwd)
+    } catch {
+      startRef = base
+    }
+
+    worktree = await fs.mkdtemp(path.join(os.tmpdir(), "memory-bot-"))
     await git(["worktree", "add", "--detach", worktree, startRef], cwd)
 
     // Process deterministically (by id) so behaviour is stable across runs.
     for (const memory of [...staged].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
-      const branch = `memory/${memory.id}`
-      if (await branchExists(cwd, branch)) {
-        log(`skip ${memory.id}: branch ${branch} already exists`)
-        result.skipped++
-        continue
-      }
-
+      const branch = branchFor(memory)
+      const title = buildPrTitle(memory)
+      const body = buildPrBody(memory)
       try {
+        if (await remoteBranchExists(cwd, branch)) {
+          const url = (await findPr({ cwd: worktree, ...(repo ? { repo } : {}), branch })) ?? (await openPr({ cwd: worktree, ...(repo ? { repo } : {}), base, branch, title, body }))
+          await fs.rm(path.join(stagingDir(projectDir), `${memory.id}.md`), { force: true })
+          log(`recovered ${memory.id}: branch ${branch} was already pushed${url ? ` ${url}` : ""}`)
+          result.recovered++
+          if (url) result.prs.push(url)
+          continue
+        }
+
+        // A local branch that never reached the remote must not block a fresh attempt.
+        await git(["branch", "-D", branch], cwd).catch(() => undefined)
         await git(["checkout", "-b", branch, startRef], worktree)
         const changed =
           memory.intent === "retire" ? await applyRetire(worktree, memory) : await applyPropose(worktree, memory)
@@ -281,7 +433,7 @@ export async function processStagingOnce(projectDir: string, opts: BotOptions = 
         await git(["add", "--all", "memory"], worktree)
         await git(["commit", "-m", commitMessage(memory)], worktree)
         await git(["push", "-u", "origin", branch], worktree)
-        const url = await openPr({ cwd: worktree, base, branch, title: buildPrTitle(memory), body: buildPrBody(memory) })
+        const url = await openPr({ cwd: worktree, ...(repo ? { repo } : {}), base, branch, title, body })
 
         await fs.rm(path.join(stagingDir(projectDir), `${memory.id}.md`), { force: true })
         log(`promoted ${memory.id} (${memory.intent === "retire" ? "retire" : "propose"})${url ? ` ${url}` : ""}`)
@@ -292,14 +444,15 @@ export async function processStagingOnce(projectDir: string, opts: BotOptions = 
         result.failed++
       } finally {
         await git(["checkout", "--detach", startRef], worktree).catch(() => undefined)
-        // The local branch is not needed once pushed, and an unpushed one must not block a retry.
-        // A pushed branch is still caught by the origin/<branch> check on the next run.
+        // The local branch is not needed once pushed; a pushed branch is found again on the remote next run.
         await git(["branch", "-D", branch], cwd).catch(() => undefined)
       }
     }
   } finally {
-    await git(["worktree", "remove", "--force", worktree], cwd).catch(() => undefined)
-    await fs.rm(worktree, { recursive: true, force: true }).catch(() => undefined)
+    if (worktree) {
+      await git(["worktree", "remove", "--force", worktree], cwd).catch(() => undefined)
+      await fs.rm(worktree, { recursive: true, force: true }).catch(() => undefined)
+    }
     await git(["worktree", "prune"], cwd).catch(() => undefined)
     await release()
   }
@@ -311,18 +464,6 @@ function commitMessage(memory: Memory): string {
   if (memory.intent === "retire") return `memory: retire ${memory.id}`
   const title = memory.title.length > 60 ? `${memory.title.slice(0, 60)}…` : memory.title
   return `memory: add ${memory.id} — ${title}`
-}
-
-async function branchExists(cwd: string, name: string): Promise<boolean> {
-  for (const ref of [name, `origin/${name}`]) {
-    try {
-      await git(["rev-parse", "--verify", "--quiet", ref], cwd)
-      return true
-    } catch {
-      // not found — check the next ref
-    }
-  }
-  return false
 }
 
 // ─── Watch / regenerate / CLI ───────────────────────────────────────────────
@@ -366,6 +507,7 @@ async function main(): Promise<void> {
   switch (command) {
     case "once": {
       const result = await processStagingOnce(projectDir)
+      if (result.recovered > 0) console.log(`recovered ${result.recovered} proposal${result.recovered === 1 ? "" : "s"} (branch already pushed)`)
       if (result.promoted > 0) console.log(`promoted ${result.promoted} proposal${result.promoted === 1 ? "" : "s"}`)
       else if (result.skipped > 0) console.log(`skipped ${result.skipped} proposal${result.skipped === 1 ? "" : "s"}`)
       else console.log("no staged proposals")

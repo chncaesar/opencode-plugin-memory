@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
-import { activeHash, buildAuditPrompt, createAuditScheduler, parseAuditResponse, relationToReason, orderBySimilarity, runAudit, splitIntoBatches, } from "./audit.js";
+import { activeHash, buildAuditPrompt, auditFailureHint, createAuditScheduler, describeAuditStatus, looksLikeContextOverflow, parseAuditResponse, relationToReason, orderBySimilarity, runAudit, splitIntoBatches, } from "./audit.js";
 import { activeDir, listStagedProposals, writeMemoryFile } from "./storage.js";
 import { DEFAULT_CONFIG } from "./types.js";
 const quietLogger = { async info() { }, async error() { } };
@@ -308,6 +308,87 @@ describe("batching", () => {
             // not marked as audited: a later run (after the interval) tries again
             const retry = await runAudit({ directory: dir, config: cfg({ auditBatchChars: 1_500 }), logger: quietLogger, call: findingReply([]), now: () => later(5) });
             assert.equal(retry, "done");
+        });
+    });
+});
+describe("audit failure visibility", () => {
+    const failing = (msg) => async () => {
+        throw new Error(msg);
+    };
+    it("recognises context-window errors from common providers", () => {
+        for (const m of [
+            "This model's maximum context length is 65536 tokens",
+            "context_length_exceeded",
+            "Input is too long for requested model",
+            "prompt is too long: 250000 tokens > 200000 maximum",
+            "HTTP 413 Request Entity Too Large",
+            "Request too large for gpt-4",
+        ])
+            assert.ok(looksLikeContextOverflow(m), m);
+        for (const m of ["fetch failed", "401 unauthorized", "rate limit reached", "model not found"])
+            assert.ok(!looksLikeContextOverflow(m), m);
+    });
+    it("tells the user to lower auditBatchChars on a context error and gives no advice otherwise", () => {
+        const hint = auditFailureHint("maximum context length exceeded", cfg({ auditBatchChars: 400_000 }));
+        assert.match(hint ?? "", /auditBatchChars/);
+        assert.match(hint ?? "", /400000/);
+        assert.match(hint ?? "", /100000/);
+        assert.equal(auditFailureHint("fetch failed", cfg()), null);
+    });
+    it("records a failed run, notifies once, and stays quiet for the same repeated error", async () => {
+        await withDir(async (dir) => {
+            await seed(dir, mem("mem-aaaa0001", "A"), mem("mem-bbbb0002", "B"));
+            const notices = [];
+            const deps = { directory: dir, config: cfg(), logger: quietLogger, notify: (m) => void notices.push(m) };
+            assert.equal(await runAudit({ ...deps, call: failing("maximum context length is 65536 tokens"), now: () => NOW }), "failed");
+            assert.equal(notices.length, 1);
+            assert.match(notices[0], /Memory audit failed/);
+            assert.match(notices[0], /auditBatchChars/);
+            // same error again, after the interval: still failed, no second notification
+            assert.equal(await runAudit({ ...deps, call: failing("maximum context length is 65536 tokens"), now: () => later(5) }), "failed");
+            assert.equal(notices.length, 1);
+            // a different error is new information
+            assert.equal(await runAudit({ ...deps, call: failing("401 unauthorized"), now: () => later(10) }), "failed");
+            assert.equal(notices.length, 2);
+        });
+    });
+    it("a notification that throws does not break the audit", async () => {
+        await withDir(async (dir) => {
+            await seed(dir, mem("mem-aaaa0001", "A"), mem("mem-bbbb0002", "B"));
+            const out = await runAudit({
+                directory: dir, config: cfg(), logger: quietLogger, call: failing("boom"), now: () => NOW,
+                notify: () => { throw new Error("no tui"); },
+            });
+            assert.equal(out, "failed");
+        });
+    });
+    it("an unusable model reply is recorded as a failure too", async () => {
+        await withDir(async (dir) => {
+            await seed(dir, mem("mem-aaaa0001", "A"), mem("mem-bbbb0002", "B"));
+            const out = await runAudit({ directory: dir, config: cfg(), logger: quietLogger, call: async () => "not json at all", now: () => NOW });
+            assert.equal(out, "failed");
+            const lines = await describeAuditStatus(dir, cfg());
+            assert.match(lines.join("\n"), /FAILED/);
+            assert.match(lines.join("\n"), /not usable/);
+        });
+    });
+    it("describeAuditStatus covers never-run, ok and disabled", async () => {
+        await withDir(async (dir) => {
+            assert.deepEqual(await describeAuditStatus(dir, cfg()), ["Not run yet in this project."]);
+            assert.match((await describeAuditStatus(dir, cfg({ backgroundAudit: false })))[0], /Disabled/);
+            await seed(dir, mem("mem-aaaa0001", "A"), mem("mem-bbbb0002", "B"));
+            await runAudit({ directory: dir, config: cfg(), logger: quietLogger, call: findingReply([]), now: () => NOW });
+            assert.match((await describeAuditStatus(dir, cfg()))[0], /Last run: .* — ok/);
+        });
+    });
+    it("a later successful run clears the failure", async () => {
+        await withDir(async (dir) => {
+            await seed(dir, mem("mem-aaaa0001", "A"), mem("mem-bbbb0002", "B"));
+            await runAudit({ directory: dir, config: cfg(), logger: quietLogger, call: failing("boom"), now: () => NOW });
+            await runAudit({ directory: dir, config: cfg(), logger: quietLogger, call: findingReply([]), now: () => later(5) });
+            const text = (await describeAuditStatus(dir, cfg())).join("\n");
+            assert.match(text, /ok/);
+            assert.ok(!/FAILED/.test(text));
         });
     });
 });

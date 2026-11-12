@@ -168,10 +168,8 @@ export async function migrateLegacyStores(projectDir: string, logger?: Logger): 
     }
   }
 
-  if (toWrite.length === 0) {
-    await generateSummary(projectDir)
-    return 0
-  }
+  // Nothing to convert: leave the disk untouched (no memory/ folder in directories without memories).
+  if (toWrite.length === 0) return 0
 
   const combined: MigrationMap = { ...existing, ...newAssignments }
 

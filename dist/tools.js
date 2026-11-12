@@ -3,6 +3,7 @@ import { MEMORY_WRITE_POLICY } from "./prompt.js";
 import { generateMemoryId, listActiveMemories, listRetiredMemories, listStagedProposals, memoryAge, resolveAuthor, writeProposal, StoreWriteError, } from "./storage.js";
 import { detectSecrets } from "./secret.js";
 import { processStagingOnce } from "./bot.js";
+import { describeAuditStatus } from "./audit.js";
 // Use the zod instance bundled with @opencode-ai/plugin to avoid version conflicts
 const z = tool.schema;
 const ID_SCHEMA = z.string().regex(/^mem-[A-Za-z0-9_-]{8}$/);
@@ -328,7 +329,7 @@ Returns full bodies of active memories, plus your own staged proposals (marked "
     const memory_review = tool({
         description: `A read-only overview of the memory store. Shows active memories (id + title), pending proposals, aging memories, and — on request — retired memories.
 
-Use this when the system prompt says memories need review, or when cleaning up memory. It never edits anything; use memory_propose / memory_update / memory_delete to propose changes.`,
+Use this when the system prompt says memories need review, or when cleaning up memory. It also reports how the background audit last went (including failures). It never edits anything; use memory_propose / memory_update / memory_delete to propose changes.`,
         args: {
             include_retired: z
                 .boolean()
@@ -366,6 +367,8 @@ Use this when the system prompt says memories need review, or when cleaning up m
             if (aging.length > 0) {
                 lines.push("", "For aging memories: check whether they still hold. If yes, propose a refresh with memory_update; if not, memory_delete with a reason.");
             }
+            lines.push("", "## Background audit");
+            lines.push(...(await describeAuditStatus(context.directory, config)));
             if (include_retired) {
                 lines.push("", `## Retired memories (${retired.length})`);
                 if (retired.length === 0)
@@ -388,13 +391,13 @@ Returns the opened PR URLs. Proposals whose push or PR step failed stay staged a
             try {
                 const lines = [];
                 const res = await processStagingOnce(context.directory, { log: (l) => lines.push(l) });
-                await logger.info("memory_publish", `promoted=${res.promoted} skipped=${res.skipped} failed=${res.failed}`);
+                await logger.info("memory_publish", `promoted=${res.promoted} recovered=${res.recovered} skipped=${res.skipped} failed=${res.failed}`);
                 if (res.busy)
                     return { title: "Memory publish busy", output: "Another memory bot run is in progress. Try again shortly." };
-                if (res.promoted + res.skipped + res.failed === 0) {
+                if (res.promoted + res.recovered + res.skipped + res.failed === 0) {
                     return { title: "Memory publish", output: "No staged proposals." };
                 }
-                const out = [`Opened ${res.promoted} PR${res.promoted === 1 ? "" : "s"}; skipped ${res.skipped}; failed ${res.failed}.`];
+                const out = [`Opened ${res.promoted} PR${res.promoted === 1 ? "" : "s"}; recovered ${res.recovered} already-pushed; skipped ${res.skipped}; failed ${res.failed}.`];
                 if (res.prs.length)
                     out.push("", ...res.prs.map((u) => `- ${u}`));
                 if (lines.length)

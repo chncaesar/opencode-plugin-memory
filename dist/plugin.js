@@ -1,6 +1,7 @@
 import { DEFAULT_CONFIG } from "./types.js";
 import { createMemoryTools } from "./tools.js";
-import { buildSystemPrompt, generateSummary, readSummaryContent } from "./summary.js";
+import { buildSummaryContent, buildSystemPrompt, readSummaryContent } from "./summary.js";
+import { listActiveMemories } from "./storage.js";
 import { createLogger } from "./logging.js";
 import { migrateLegacyStores } from "./migrate.js";
 import { createAuditScheduler, createSdkModelCall } from "./audit.js";
@@ -39,16 +40,16 @@ export function resolveConfig(options) {
     };
 }
 /**
- * Build the block injected into every system prompt. Bootstraps a missing
- * `memory/_summary.md` via generateSummary, then injects the committed index
- * plus the writing policy (never full bodies).
+ * Build the block injected into every system prompt: the committed
+ * `memory/_summary.md` index plus the writing policy (never full bodies). When
+ * the index file does not exist yet, the index is built in memory from the
+ * active memories. Nothing is written: running OpenCode in a directory must not
+ * create a `memory/` folder there.
  */
 async function injectMemoryBlock(directory, config) {
     let summary = await readSummaryContent(directory);
-    if (!summary) {
-        await generateSummary(directory);
-        summary = await readSummaryContent(directory);
-    }
+    if (!summary)
+        summary = buildSummaryContent(await listActiveMemories(directory));
     return buildSystemPrompt(summary, config.maxSummaryChars);
 }
 /**
@@ -83,9 +84,14 @@ export const server = async (input, options) => {
     // Throwaway sessions created by the background audit. Hooks ignore them so
     // the audit neither injects memory into itself nor triggers further audits.
     const auditSessions = new Set();
+    const notify = async (message) => {
+        const tui = input.client.tui;
+        await tui?.showToast?.({ body: { message, variant: "warning" } });
+    };
     const scheduler = createAuditScheduler({
         directory,
         config,
+        notify,
         logger,
         call: createSdkModelCall(input.client, directory, auditSessions),
     }, auditSessions);

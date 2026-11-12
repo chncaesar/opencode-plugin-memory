@@ -16,6 +16,7 @@ import {
 } from "./storage.js"
 import { detectSecrets } from "./secret.js"
 import { processStagingOnce } from "./bot.js"
+import { describeAuditStatus } from "./audit.js"
 
 // Use the zod instance bundled with @opencode-ai/plugin to avoid version conflicts
 const z = tool.schema
@@ -373,7 +374,7 @@ Returns full bodies of active memories, plus your own staged proposals (marked "
   const memory_review = tool({
     description: `A read-only overview of the memory store. Shows active memories (id + title), pending proposals, aging memories, and — on request — retired memories.
 
-Use this when the system prompt says memories need review, or when cleaning up memory. It never edits anything; use memory_propose / memory_update / memory_delete to propose changes.`,
+Use this when the system prompt says memories need review, or when cleaning up memory. It also reports how the background audit last went (including failures). It never edits anything; use memory_propose / memory_update / memory_delete to propose changes.`,
     args: {
       include_retired: z
         .boolean()
@@ -411,6 +412,9 @@ Use this when the system prompt says memories need review, or when cleaning up m
         lines.push("", "For aging memories: check whether they still hold. If yes, propose a refresh with memory_update; if not, memory_delete with a reason.")
       }
 
+      lines.push("", "## Background audit")
+      lines.push(...(await describeAuditStatus(context.directory, config)))
+
       if (include_retired) {
         lines.push("", `## Retired memories (${retired.length})`)
         if (retired.length === 0) lines.push("None.")
@@ -434,12 +438,12 @@ Returns the opened PR URLs. Proposals whose push or PR step failed stay staged a
       try {
         const lines: string[] = []
         const res = await processStagingOnce(context.directory, { log: (l) => lines.push(l) })
-        await logger.info("memory_publish", `promoted=${res.promoted} skipped=${res.skipped} failed=${res.failed}`)
+        await logger.info("memory_publish", `promoted=${res.promoted} recovered=${res.recovered} skipped=${res.skipped} failed=${res.failed}`)
         if (res.busy) return { title: "Memory publish busy", output: "Another memory bot run is in progress. Try again shortly." }
-        if (res.promoted + res.skipped + res.failed === 0) {
+        if (res.promoted + res.recovered + res.skipped + res.failed === 0) {
           return { title: "Memory publish", output: "No staged proposals." }
         }
-        const out = [`Opened ${res.promoted} PR${res.promoted === 1 ? "" : "s"}; skipped ${res.skipped}; failed ${res.failed}.`]
+        const out = [`Opened ${res.promoted} PR${res.promoted === 1 ? "" : "s"}; recovered ${res.recovered} already-pushed; skipped ${res.skipped}; failed ${res.failed}.`]
         if (res.prs.length) out.push("", ...res.prs.map((u) => `- ${u}`))
         if (lines.length) out.push("", "Log:", ...lines.map((l) => `  ${l}`))
         return { title: `Memory published (${res.promoted})`, output: out.join("\n") }

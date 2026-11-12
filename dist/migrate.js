@@ -151,10 +151,9 @@ export async function migrateLegacyStores(projectDir, logger) {
             toWrite.push({ entry, newId });
         }
     }
-    if (toWrite.length === 0) {
-        await generateSummary(projectDir);
+    // Nothing to convert: leave the disk untouched (no memory/ folder in directories without memories).
+    if (toWrite.length === 0)
         return 0;
-    }
     const combined = { ...existing, ...newAssignments };
     for (const { entry, newId } of toWrite) {
         if (entry.archived) {

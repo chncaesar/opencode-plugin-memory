@@ -222,10 +222,18 @@ function auditStatePath(projectDir) {
 async function readAuditState(projectDir) {
     try {
         const parsed = JSON.parse(await fs.readFile(auditStatePath(projectDir), "utf8"));
-        return {
+        const state = {
             lastHash: typeof parsed["lastHash"] === "string" ? parsed["lastHash"] : "",
             lastAuditAt: typeof parsed["lastAuditAt"] === "string" ? parsed["lastAuditAt"] : "",
         };
+        const outcome = parsed["lastOutcome"];
+        if (outcome === "done" || outcome === "failed" || outcome === "discarded-changed")
+            state.lastOutcome = outcome;
+        if (typeof parsed["lastOutcomeAt"] === "string")
+            state.lastOutcomeAt = parsed["lastOutcomeAt"];
+        if (typeof parsed["lastError"] === "string")
+            state.lastError = parsed["lastError"];
+        return state;
     }
     catch {
         return { lastHash: "", lastAuditAt: "" };
@@ -261,7 +269,7 @@ export async function runAudit(deps) {
         const hash = activeHash(active);
         if (active.length < 2) {
             if (state.lastHash !== hash)
-                await writeAuditState(directory, { lastHash: hash, lastAuditAt: state.lastAuditAt });
+                await writeAuditState(directory, { ...state, lastHash: hash });
             return "skipped-too-few";
         }
         if (hash === state.lastHash)
@@ -286,13 +294,13 @@ export async function runAudit(deps) {
                 reply = await call(AUDIT_SYSTEM_PROMPT, prompt);
             }
             catch (err) {
-                await markAttempt(directory, now());
+                await recordFailure(deps, err instanceof Error ? err.message : String(err), now());
                 await logger.error("audit", err);
                 return "failed";
             }
             const parsed = parseAuditResponse(reply, batch);
             if (parsed === null) {
-                await markAttempt(directory, now());
+                await recordFailure(deps, `The audit model's reply was not usable (batch ${i + 1} of ${batches.length}): ${clip(reply, 200)}`, now());
                 await logger.error("audit", `unparsable audit reply (batch ${i + 1}/${batches.length}): ` + clip(reply, 200));
                 return "failed";
             }
@@ -305,7 +313,7 @@ export async function runAudit(deps) {
         // text that no longer exists. Leave lastHash as is so the next idle re-audits.
         const fresh = await listActiveMemories(directory);
         if (activeHash(fresh) !== hash) {
-            await markAttempt(directory, now());
+            await markAttempt(directory, now(), "discarded-changed");
             await logger.info("audit", "discarded: memories changed during audit");
             return "discarded-changed";
         }
@@ -332,18 +340,79 @@ export async function runAudit(deps) {
             await writeProposal(directory, memory);
             emitted++;
         }
-        await writeAuditState(directory, { lastHash: hash, lastAuditAt: now().toISOString() });
+        const doneAt = now().toISOString();
+        await writeAuditState(directory, { lastHash: hash, lastAuditAt: doneAt, lastOutcome: "done", lastOutcomeAt: doneAt });
         await logger.info("audit", `${findings.length} finding(s) → ${emitted} proposal(s) over ${active.length} entries in ${batches.length} batch(es)`);
         return "done";
     }
     catch (err) {
+        await recordFailure(deps, err instanceof Error ? err.message : String(err), now());
         await logger.error("audit", err);
         return "failed";
     }
 }
-async function markAttempt(directory, at) {
+async function markAttempt(directory, at, outcome) {
     const state = await readAuditState(directory);
-    await writeAuditState(directory, { ...state, lastAuditAt: at.toISOString() });
+    const next = { ...state, lastAuditAt: at.toISOString() };
+    if (outcome) {
+        next.lastOutcome = outcome;
+        next.lastOutcomeAt = at.toISOString();
+        delete next.lastError;
+    }
+    await writeAuditState(directory, next);
+}
+// ─── Failure visibility ──────────────────────────────────────────────────────
+/** Does a model/transport error message look like the prompt was too large for the model? */
+export function looksLikeContextOverflow(message) {
+    return /context[_ -]?(length|window)|maximum context|too (long|large)|token limit|max(imum)? (input )?tokens|exceeds? (the )?(maximum|limit|context)|prompt is too long|request too large|payload too large|\b413\b/i.test(message);
+}
+/** What the user can do about a failure, or null when there is no specific advice. */
+export function auditFailureHint(message, config) {
+    if (!looksLikeContextOverflow(message))
+        return null;
+    const now = config.auditBatchChars;
+    const suggest = Math.max(10_000, Math.floor(now / 4));
+    return `The audit prompt probably exceeds the audit model's context window. Lower "auditBatchChars" in the memory plugin options (currently ${now}), for example to ${suggest}, or point "auditModel" at a model with a larger context.`;
+}
+/** Persist a failed run and, when the error is new, tell the user once. */
+async function recordFailure(deps, message, at) {
+    const error = clip(message.replace(/\s+/g, " ").trim(), 400);
+    const state = await readAuditState(deps.directory);
+    const isNew = state.lastOutcome !== "failed" || state.lastError !== error;
+    await writeAuditState(deps.directory, {
+        ...state,
+        lastAuditAt: at.toISOString(),
+        lastOutcome: "failed",
+        lastOutcomeAt: at.toISOString(),
+        lastError: error,
+    });
+    if (!isNew || !deps.notify)
+        return;
+    const hint = auditFailureHint(error, deps.config);
+    try {
+        await deps.notify(`Memory audit failed: ${clip(error, 160)}${hint ? ` — ${hint}` : ""}`);
+    }
+    catch {
+        // a notification problem must never break the audit
+    }
+}
+/** Lines for `memory_review`: how the background audit last went. */
+export async function describeAuditStatus(directory, config) {
+    if (!config.backgroundAudit)
+        return ["Disabled (backgroundAudit is off)."];
+    const state = await readAuditState(directory);
+    if (!state.lastOutcome)
+        return ["Not run yet in this project."];
+    const when = state.lastOutcomeAt ?? state.lastAuditAt;
+    if (state.lastOutcome === "done")
+        return [`Last run: ${when} — ok`];
+    if (state.lastOutcome === "discarded-changed")
+        return [`Last run: ${when} — discarded because memories changed during the audit; it will run again.`];
+    const lines = [`Last run: ${when} — FAILED`, `Error: ${state.lastError ?? "(no message)"}`];
+    const hint = auditFailureHint(state.lastError ?? "", config);
+    if (hint)
+        lines.push(`Likely cause: ${hint}`);
+    return lines;
 }
 const AUDIT_TIMEOUT_MS = 300_000;
 /**

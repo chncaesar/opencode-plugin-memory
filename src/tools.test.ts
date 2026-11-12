@@ -4,6 +4,7 @@ import fs from "fs/promises"
 import os from "os"
 import path from "path"
 import { createMemoryTools, mapRetireReason } from "./tools.js"
+import { runAudit } from "./audit.js"
 import { activeDir, listActiveMemories, listStagedProposals, writeMemoryFile } from "./storage.js"
 import { DEFAULT_CONFIG } from "./types.js"
 import type { Logger } from "./logging.js"
@@ -242,6 +243,31 @@ describe("memory_review", () => {
       // nothing has actually moved to retired/ yet (it is a proposal)
       assert.match(r.output, /Retired memories/)
       assert.doesNotMatch(r.output, /Active \(retired\)/)
+    })
+  })
+})
+
+describe("memory_review shows the background audit", () => {
+  it("reports an audit failure with the fix for a context-window error", async () => {
+    await withDir(async (dir) => {
+      await writeMemoryFile(activeDir(dir), { id: "mem-aaaa0001", title: "A", body: "a", proposedAt: "2026-01-01" })
+      await writeMemoryFile(activeDir(dir), { id: "mem-bbbb0002", title: "B", body: "b", proposedAt: "2026-01-01" })
+      await runAudit({
+        directory: dir, config: DEFAULT_CONFIG, logger,
+        call: async () => { throw new Error("This model's maximum context length is 65536 tokens") },
+      })
+      const r = await run(tools.memory_review, {}, dir)
+      assert.match(r.output, /## Background audit/)
+      assert.match(r.output, /FAILED/)
+      assert.match(r.output, /maximum context length/)
+      assert.match(r.output, /auditBatchChars/)
+    })
+  })
+
+  it("says the audit has not run yet in a fresh project", async () => {
+    await withDir(async (dir) => {
+      const r = await run(tools.memory_review, {}, dir)
+      assert.match(r.output, /## Background audit\nNot run yet/)
     })
   })
 })

@@ -43,6 +43,8 @@ export type AuditDeps = {
     config: PluginConfig;
     logger: Logger;
     call: ModelCall;
+    /** Show a short message to the user (e.g. a TUI toast). Called when a failure is new, never repeated for the same error. */
+    notify?: (message: string) => Promise<void> | void;
     now?: () => Date;
     /** Bypass the minimum interval (explicit refresh). Unchanged entries are still skipped. */
     force?: boolean;
@@ -56,6 +58,12 @@ export type AuditDeps = {
  * `superseded_by` for refinements) so the bot can open a PR for it.
  */
 export declare function runAudit(deps: AuditDeps): Promise<AuditOutcome>;
+/** Does a model/transport error message look like the prompt was too large for the model? */
+export declare function looksLikeContextOverflow(message: string): boolean;
+/** What the user can do about a failure, or null when there is no specific advice. */
+export declare function auditFailureHint(message: string, config: PluginConfig): string | null;
+/** Lines for `memory_review`: how the background audit last went. */
+export declare function describeAuditStatus(directory: string, config: PluginConfig): Promise<string[]>;
 /** The slice of the OpenCode SDK client the audit uses. */
 export type AuditClient = {
     session: {

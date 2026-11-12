@@ -58,6 +58,16 @@ describe("resolveConfig", () => {
 })
 
 describe("plugin entry", () => {
+  it("injecting the index in a directory without memories creates no memory/ folder", async () => {
+    await withDir(async (dir) => {
+      const hooks = await server(fakeInput(dir))
+      const out = { system: [] as string[] }
+      await (hooks["experimental.chat.system.transform"] as any)({ sessionID: "ses_x" }, out)
+      assert.match(out.system.join("\n"), /no active memories/)
+      await assert.rejects(fs.access(path.join(dir, "memory")))
+    })
+  })
+
   it("registers six tools, the event hook and the system transform hook", async () => {
     await withDir(async (dir) => {
       const hooks = await server(fakeInput(dir))
