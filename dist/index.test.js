@@ -5,8 +5,7 @@ import os from "os";
 import path from "path";
 import { createV2ModelCall, pendingPublishNotice, resolveConfig, server, setup } from "./plugin.js";
 import defaultExport from "./index.js";
-import { activeDir, stagingDir, writeMemoryFile, writeProposal } from "./storage.js";
-import { generateSummary } from "./summary.js";
+import { activeDir, listActiveMemories, stagingDir, writeMemoryFile, writeProposal } from "./storage.js";
 async function withDir(fn) {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mem-index-"));
     try {
@@ -164,8 +163,8 @@ describe("plugin entry", () => {
             await fs.mkdir(path.join(dir, ".opencode/memory"), { recursive: true });
             await fs.writeFile(path.join(dir, ".opencode/memory/MEMORY.md"), "# OpenCode Memory\n<!-- nextSeq: 2 -->\n\n## Active\n\n### [MEM-001] Legacy rule\n- added: 2026-01-01\nOld body.\n\n## Archived\n", "utf8");
             await server(fakeInput(dir));
-            const summary = await fs.readFile(path.join(dir, "memory/_summary.md"), "utf8");
-            assert.match(summary, /Legacy rule/);
+            const migrated = await listActiveMemories(dir);
+            assert.ok(migrated.some((m) => m.title === "Legacy rule"));
         });
     });
 });
@@ -200,7 +199,6 @@ describe("V2 entry", () => {
     it("setup registers six tools that execute, injects context, and disposes", async () => {
         await withDir(async (dir) => {
             await seedStale(dir);
-            await generateSummary(dir);
             const m = mockCtx(dir);
             const cleanup = await setup(m.ctx);
             assert.deepEqual(Object.keys(m.tools).sort(), [

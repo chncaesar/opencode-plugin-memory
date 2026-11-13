@@ -4,7 +4,7 @@ import fs from "fs/promises";
 import os from "os";
 import path from "path";
 import { migrateLegacyStores, parseLegacyMemory, mapArchivedReason } from "./migrate.js";
-import { listActiveMemories, listRetiredMemories, migrationFilePath, summaryFilePath } from "./storage.js";
+import { listActiveMemories, listRetiredMemories, migrationFilePath } from "./storage.js";
 async function withDir(fn) {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mem-migrate-"));
     try {
@@ -85,10 +85,8 @@ describe("migrateLegacyStores", () => {
             assert.equal(migrated.author, "unknown");
             assert.equal(migrated.source, "migrated from legacy MEMORY.md");
             assert.equal(migrated.proposedAt, "2026-08-26");
-            // Summary lists both active memories.
-            const summary = await fs.readFile(summaryFilePath(dir), "utf8");
-            assert.match(summary, /Use int for money/);
-            assert.match(summary, /Old rule/);
+            // No derived index file is written; the prompt index is computed later.
+            await assert.rejects(fs.access(path.join(dir, "memory/_summary.md")));
             // The mapping sidecar resolves old → new ids.
             const map = JSON.parse(await fs.readFile(migrationFilePath(dir), "utf8"));
             assert.equal(typeof map.mapped["MEM-001"], "string");
@@ -104,11 +102,9 @@ describe("migrateLegacyStores", () => {
             assert.equal(await migrateLegacyStores(dir), 3);
             const activeAfter = await listActiveMemories(dir);
             const retiredAfter = await listRetiredMemories(dir);
-            const summaryAfter = await fs.readFile(summaryFilePath(dir), "utf8");
             assert.equal(await migrateLegacyStores(dir), 0);
             assert.equal((await listActiveMemories(dir)).length, activeAfter.length);
             assert.equal((await listRetiredMemories(dir)).length, retiredAfter.length);
-            assert.equal(await fs.readFile(summaryFilePath(dir), "utf8"), summaryAfter);
         });
     });
     it("is a no-op when there is no legacy store and creates nothing on disk", async () => {
@@ -116,7 +112,6 @@ describe("migrateLegacyStores", () => {
             assert.equal(await migrateLegacyStores(dir), 0);
             assert.equal((await listActiveMemories(dir)).length, 0);
             await assert.rejects(fs.access(path.join(dir, "memory")));
-            await assert.rejects(fs.access(summaryFilePath(dir)));
         });
     });
     it("converts both legacy locations when both are present", async () => {

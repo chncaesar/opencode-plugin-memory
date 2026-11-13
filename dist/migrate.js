@@ -1,7 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
 import { activeDir, generateMemoryId, memoryRootDir, migrationFilePath, retiredDir, writeMemoryFile, } from "./storage.js";
-import { generateSummary } from "./summary.js";
 /**
  * One-time migration of the legacy single-file store into the per-file model.
  *
@@ -195,7 +194,6 @@ export async function migrateLegacyStores(projectDir, logger) {
     const finalMap = { ...existing, ...newAssignments };
     await fs.mkdir(memoryRootDir(projectDir), { recursive: true });
     await fs.writeFile(migrationFilePath(projectDir), JSON.stringify({ version: 1, mapped: finalMap }, null, 2) + "\n", "utf8");
-    await generateSummary(projectDir);
     if (logger) {
         await logger.info("migration", `converted ${toWrite.length} legacy entr${toWrite.length === 1 ? "y" : "ies"}`);
     }

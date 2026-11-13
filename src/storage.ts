@@ -11,14 +11,15 @@ import { INTENTS, RETIRED_REASONS, type Intent, type Memory, type MemoryStatus, 
 //   .memory/staging/     machine-local, git-ignored; the agent writes proposals here
 //   memory/active/       merged truth; the only memories injected into context
 //   memory/retired/      removed memories, with reason and provenance
-//   memory/_summary.md   committed index, one line per active memory
+//
+// The prompt index is derived from active/ at session start; there is no
+// committed index file to keep in sync.
 
 const MACHINE_DIR = ".memory"
 const STAGING_DIR = ".memory/staging"
 const MEMORY_ROOT = "memory"
 const ACTIVE_DIR = "memory/active"
 const RETIRED_DIR = "memory/retired"
-const SUMMARY_FILE = "_summary.md"
 const MIGRATION_FILE = ".migration.json"
 
 /** Machine-local `.memory` directory (staging + plugin.log). */
@@ -31,7 +32,7 @@ export function stagingDir(projectDir: string): string {
   return path.join(projectDir, STAGING_DIR)
 }
 
-/** The committed memory root (`memory/`), holding active/, retired/, _summary.md. */
+/** The committed memory root (`memory/`), holding active/ and retired/. */
 export function memoryRootDir(projectDir: string): string {
   return path.join(projectDir, MEMORY_ROOT)
 }
@@ -44,11 +45,6 @@ export function activeDir(projectDir: string): string {
 /** The committed retired-memory directory. */
 export function retiredDir(projectDir: string): string {
   return path.join(projectDir, RETIRED_DIR)
-}
-
-/** The committed index file, a sibling of `memory/active/`. */
-export function summaryFilePath(projectDir: string): string {
-  return path.join(projectDir, MEMORY_ROOT, SUMMARY_FILE)
 }
 
 /** The old-ID → new-ID mapping written by migration. */

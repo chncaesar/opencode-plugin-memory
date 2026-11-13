@@ -21,8 +21,8 @@ export declare function pendingPublishNotice(directory: string): Promise<string 
  *
  * The agent only PROPOSES memories by writing files into `.memory/staging/`. A
  * bot (see bot.ts) turns those into pull requests; a human merges them; merged
- * memories live under `memory/active/` and are indexed in `memory/_summary.md`,
- * which is the only memory content injected into the system prompt.
+ * memories live under `memory/active/`. Their titles are indexed on every
+ * session start; full bodies load lazily through `memory_read`.
  *
  * A background semantic audit runs after sessions go idle and asks a model to
  * flag duplicate / refining / contradicting memories; each finding becomes a
@@ -32,7 +32,6 @@ export declare function pendingPublishNotice(directory: string): Promise<string 
  *   .memory/staging/   machine-local proposals (git-ignored)
  *   memory/active/     merged truth
  *   memory/retired/    retired memories
- *   memory/_summary.md committed one-line-per-active index
  */
 export declare const server: Plugin;
 /** Minimal structural view of the V2 plugin context; only what this plugin uses. */

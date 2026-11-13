@@ -1,8 +1,8 @@
 import type { Config, Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
 import { DEFAULT_CONFIG, type PluginConfig } from "./types.js"
 import { createMemoryTools } from "./tools.js"
-import { buildSummaryContent, buildSystemPrompt, readSummaryContent } from "./summary.js"
-import { listActiveMemories, listStagedProposals } from "./storage.js"
+import { loadMemoryBlock } from "./summary.js"
+import { listStagedProposals } from "./storage.js"
 import { createLogger } from "./logging.js"
 import { migrateLegacyStores } from "./migrate.js"
 import { auditWarning, createAuditScheduler, createSdkModelCall, type AuditClient, type ModelCall } from "./audit.js"
@@ -49,16 +49,13 @@ export function resolveConfig(options?: PluginOptions): PluginConfig {
 }
 
 /**
- * Build the block injected into every system prompt: the committed
- * `memory/_summary.md` index plus the writing policy (never full bodies). When
- * the index file does not exist yet, the index is built in memory from the
- * active memories. Nothing is written: running OpenCode in a directory must not
- * create a `memory/` folder there.
+ * Build the block injected into every system prompt: the index derived from
+ * `memory/active/` (titles and ids only, never full bodies) plus the writing
+ * policy. Nothing is written to disk: running OpenCode in a directory must not
+ * create or modify a `memory/` folder there.
  */
 async function injectMemoryBlock(directory: string, config: PluginConfig): Promise<string> {
-  let summary = await readSummaryContent(directory)
-  if (!summary) summary = buildSummaryContent(await listActiveMemories(directory))
-  const block = buildSystemPrompt(summary, config.maxSummaryChars)
+  const block = await loadMemoryBlock(directory, config.maxSummaryChars)
   const notices: string[] = [block]
   const warning = await auditWarning(directory, config).catch(() => null)
   if (warning) notices.push(warning)
@@ -90,8 +87,8 @@ export async function pendingPublishNotice(directory: string): Promise<string | 
  *
  * The agent only PROPOSES memories by writing files into `.memory/staging/`. A
  * bot (see bot.ts) turns those into pull requests; a human merges them; merged
- * memories live under `memory/active/` and are indexed in `memory/_summary.md`,
- * which is the only memory content injected into the system prompt.
+ * memories live under `memory/active/`. Their titles are indexed on every
+ * session start; full bodies load lazily through `memory_read`.
  *
  * A background semantic audit runs after sessions go idle and asks a model to
  * flag duplicate / refining / contradicting memories; each finding becomes a
@@ -101,7 +98,6 @@ export async function pendingPublishNotice(directory: string): Promise<string | 
  *   .memory/staging/   machine-local proposals (git-ignored)
  *   memory/active/     merged truth
  *   memory/retired/    retired memories
- *   memory/_summary.md committed one-line-per-active index
  */
 export const server: Plugin = async (input: PluginInput, options?: PluginOptions): Promise<Hooks> => {
   const config = resolveConfig(options)

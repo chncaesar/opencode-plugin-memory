@@ -1,25 +1,18 @@
 import type { Memory } from "./types.js";
 /**
- * Build the committed index: one line per active memory, `[mem-XXXX] Title`,
- * ordered deterministically (by id) so regeneration is stable across runs.
+ * Build the index shown to the model: one `[mem-XXXX] Title` line per active
+ * memory, ordered by id so the prompt is stable across runs. The index is
+ * always derived from `memory/active/`; nothing is read from or written to a
+ * prebuilt index file.
  */
-export declare function buildSummaryContent(memories: Memory[]): string;
-/**
- * Regenerate `memory/_summary.md` from the active memories. Called by migration
- * and later by CI on merge. Never called when proposing (proposals must stay
- * invisible until merged).
- */
-export declare function generateSummary(projectDir: string): Promise<void>;
-/**
- * Read the committed index; empty string when it does not exist.
- */
-export declare function readSummaryContent(projectDir: string): Promise<string>;
-/** Extract just the `[mem-XXXX] Title` lines from raw summary content. */
-export declare function extractIndexLines(content: string): string[];
+export declare function buildIndexLines(memories: Memory[]): string[];
 /**
  * Build the block injected into every system prompt: the memory-system
- * introduction, the committed index (titles and ids only, never full bodies),
- * and the complete writing policy. `summaryContent` is the raw `_summary.md`.
+ * introduction, the index (titles and ids only, never full bodies), and the
+ * complete writing policy. Full bodies stay on disk and load lazily through
+ * `memory_read`, so a large store costs only one line per memory per turn.
  */
-export declare function buildSystemPrompt(summaryContent: string, maxChars: number): string;
+export declare function buildSystemPrompt(memories: Memory[], maxChars: number): string;
+/** Prompt block for a project, derived from its active memories on every call. */
+export declare function loadMemoryBlock(projectDir: string, maxChars: number): Promise<string>;
 //# sourceMappingURL=summary.d.ts.map

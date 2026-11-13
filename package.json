@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@chncaesar/opencode-plugin-memory",
   "version": "0.4.0",
-  "description": "PR-gated, project-scoped persistent memory plugin for OpenCode — the LLM proposes, a bot opens a PR, a human merges, CI regenerates the index",
+  "description": "PR-gated, project-scoped persistent memory plugin for OpenCode — the LLM proposes, a bot opens a PR, a human merges, the index is derived from active memories",
   "type": "module",
   "license": "MIT",
   "main": "./dist/index.js",

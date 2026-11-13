@@ -3,14 +3,12 @@ import { type Memory, type MemoryStatus } from "./types.js";
 export declare function machineDir(projectDir: string): string;
 /** The git-ignored folder the agent writes proposals into. */
 export declare function stagingDir(projectDir: string): string;
-/** The committed memory root (`memory/`), holding active/, retired/, _summary.md. */
+/** The committed memory root (`memory/`), holding active/ and retired/. */
 export declare function memoryRootDir(projectDir: string): string;
 /** The committed active-memory directory. */
 export declare function activeDir(projectDir: string): string;
 /** The committed retired-memory directory. */
 export declare function retiredDir(projectDir: string): string;
-/** The committed index file, a sibling of `memory/active/`. */
-export declare function summaryFilePath(projectDir: string): string;
 /** The old-ID → new-ID mapping written by migration. */
 export declare function migrationFilePath(projectDir: string): string;
 /** True when `value` is a well-formed memory id (`mem-` + 8 base64url chars). */

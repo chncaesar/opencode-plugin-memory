@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
-import { buildSummaryContent, buildSystemPrompt, extractIndexLines, generateSummary, readSummaryContent, } from "./summary.js";
+import { buildIndexLines, buildSystemPrompt, loadMemoryBlock } from "./summary.js";
 import { MEMORY_POLICY_EXAMPLES, MEMORY_WRITE_POLICY } from "./prompt.js";
-import { activeDir, summaryFilePath, writeMemoryFile } from "./storage.js";
+import { activeDir, writeMemoryFile } from "./storage.js";
 function mem(id, title) {
     return { id, title, body: "c", proposedAt: "2026-01-01" };
 }
@@ -18,54 +18,50 @@ async function withDir(fn) {
         await fs.rm(dir, { recursive: true, force: true });
     }
 }
-describe("buildSummaryContent", () => {
+describe("buildIndexLines", () => {
     it("emits one line per memory, sorted by id", () => {
-        const out = buildSummaryContent([mem("mem-bbbbbbbb", "B"), mem("mem-aaaaaaaa", "A")]);
-        assert.ok(out.indexOf("[mem-aaaaaaaa] A") < out.indexOf("[mem-bbbbbbbb] B"));
+        const lines = buildIndexLines([mem("mem-bbbbbbbb", "B"), mem("mem-aaaaaaaa", "A")]);
+        assert.deepEqual(lines, ["[mem-aaaaaaaa] A", "[mem-bbbbbbbb] B"]);
     });
-    it("marks an empty store", () => {
-        assert.match(buildSummaryContent([]), /no active memories/);
+    it("carries titles only, never bodies", () => {
+        const lines = buildIndexLines([{ ...mem("mem-aaaaaaaa", "Title"), body: "secret body text" }]);
+        assert.deepEqual(lines, ["[mem-aaaaaaaa] Title"]);
     });
 });
-describe("generateSummary / readSummaryContent", () => {
-    it("writes memory/_summary.md and reads it back", async () => {
+describe("loadMemoryBlock", () => {
+    it("derives the index from memory/active and writes nothing", async () => {
         await withDir(async (dir) => {
             await writeMemoryFile(activeDir(dir), mem("mem-aaaaaaaa", "First rule"));
-            await generateSummary(dir);
-            const text = await readSummaryContent(dir);
-            assert.match(text, /\[mem-aaaaaaaa\] First rule/);
-            await fs.access(summaryFilePath(dir));
+            const block = await loadMemoryBlock(dir, 2000);
+            assert.match(block, /\[mem-aaaaaaaa\] First rule/);
+            // No index file is created or expected.
+            await assert.rejects(fs.access(path.join(dir, "memory", "_summary.md")));
         });
     });
-    it("returns an empty string when the summary is absent", async () => {
+    it("renders an empty store without creating the memory folder", async () => {
         await withDir(async (dir) => {
-            assert.equal(await readSummaryContent(dir), "");
+            const block = await loadMemoryBlock(dir, 2000);
+            assert.match(block, /no active memories/);
+            await assert.rejects(fs.access(path.join(dir, "memory")));
         });
-    });
-});
-describe("extractIndexLines", () => {
-    it("keeps only [mem-XXXX] lines", () => {
-        const content = "<!-- header -->\n\n[mem-aaaaaaaa] A\n[mem-bbbbbbbb] B\nnoise\n";
-        assert.deepEqual(extractIndexLines(content), ["[mem-aaaaaaaa] A", "[mem-bbbbbbbb] B"]);
     });
 });
 describe("buildSystemPrompt", () => {
     it("injects the intro and policy, and no index lines when empty", () => {
-        const out = buildSystemPrompt("", 2000);
+        const out = buildSystemPrompt([], 2000);
         assert.match(out, /PR-gated project memory system/);
         assert.match(out, /no active memories/);
         assert.ok(out.includes(MEMORY_WRITE_POLICY));
     });
     it("injects the index lines and never full bodies", () => {
-        const content = buildSummaryContent([mem("mem-aaaaaaaa", "First rule")]);
-        const out = buildSystemPrompt(content, 2000);
+        const out = buildSystemPrompt([{ ...mem("mem-aaaaaaaa", "First rule"), body: "very long body" }], 2000);
         assert.match(out, /\[mem-aaaaaaaa\] First rule/);
         assert.ok(out.includes(MEMORY_WRITE_POLICY));
+        assert.ok(!out.includes("very long body"));
     });
     it("truncates a long index to maxChars with a notice", () => {
         const many = Array.from({ length: 40 }, (_, i) => mem(`mem-${String(i).padStart(8, "0")}`, `Title ${i} with some words`));
-        const content = buildSummaryContent(many);
-        const out = buildSystemPrompt(content, 200);
+        const out = buildSystemPrompt(many, 200);
         const indexPart = out.split("Project memory index:")[1].split("## When to propose")[0];
         assert.ok(indexPart.includes("showing a subset"));
         // The index section (titles only) is capped near maxChars; the policy is
@@ -105,10 +101,10 @@ describe("memory-writing policy", () => {
 });
 describe("buildSystemPrompt default cap", () => {
     it("fits all 56 realistic titles under the 10000-char default cap", () => {
-        const lines = Array.from({ length: 56 }, (_, i) => `[mem-${String(i).padStart(8, "0")}] ${"标题".repeat(40)} ${i}`);
-        const out = buildSystemPrompt(lines.join("\n"), 10000);
-        for (const l of lines)
-            assert.ok(out.includes(l));
+        const memories = Array.from({ length: 56 }, (_, i) => mem(`mem-${String(i).padStart(8, "0")}`, `${"标题".repeat(40)} ${i}`));
+        const out = buildSystemPrompt(memories, 10000);
+        for (const m of memories)
+            assert.ok(out.includes(`[${m.id}] ${m.title}`));
         assert.ok(!out.includes("showing a subset"));
     });
 });

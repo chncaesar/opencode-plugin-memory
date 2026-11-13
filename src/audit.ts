@@ -17,7 +17,7 @@ import { AUDIT_AGENT_NAME } from "./auditAgent.js"
  * human reviews and merges. There is no review.json: the PR is the durable
  * record of the suggestion and its outcome.
  *
- * The audit never edits `memory/active/` or `_summary.md`.
+ * The audit never edits `memory/active/`.
  */
 
 /** Entries repeated at the start of the next batch so neighbouring pairs are not split. */

@@ -10,12 +10,12 @@
  *   retire  → move `memory/active/<id>` to `memory/retired/` with a reason,
  *             open a PR, remove the staged file.
  *
- * It never edits `_summary.md`; CI regenerates the index on merge.
+ * There is no index file to maintain: the prompt index is derived from
+ * `memory/active/` at session start.
  *
  * Invocation (as a developer-machine daemon or CLI):
  *   node dist/bot.js once       process staged proposals, then exit
  *   node dist/bot.js watch      poll staging forever (default interval 2s)
- *   node dist/bot.js regenerate regenerate memory/_summary.md (used by CI)
  */
 import fs from "fs/promises";
 import os from "os";
@@ -24,7 +24,6 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { execFile } from "child_process";
 import { activeDir, listStagedProposals, readMemoryFile, retiredDir, stagingDir, writeMemoryFile, } from "./storage.js";
-import { generateSummary } from "./summary.js";
 // ─── Child processes ─────────────────────────────────────────────────────────
 function run(cmd, args, cwd) {
     return new Promise((resolve, reject) => {
@@ -444,7 +443,6 @@ function printUsage() {
         "Usage:",
         "  node dist/bot.js once [--dir <path>]        process staged proposals, then exit",
         "  node dist/bot.js watch [--dir <path>] [--interval <ms>]   poll staging forever",
-        "  node dist/bot.js regenerate [--dir <path>]  regenerate memory/_summary.md",
     ].join("\n"));
 }
 async function main() {
@@ -477,8 +475,8 @@ async function main() {
             return;
         }
         case "regenerate": {
-            await generateSummary(projectDir);
-            console.log(`regenerated ${path.join(projectDir, "memory", "_summary.md")}`);
+            // Kept as a no-op so older CI jobs that still call it fail nothing.
+            console.log("memory/_summary.md is no longer used; the index is derived from memory/active/ at session start");
             return;
         }
         case "help":

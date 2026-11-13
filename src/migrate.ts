@@ -10,7 +10,6 @@ import {
   retiredDir,
   writeMemoryFile,
 } from "./storage.js"
-import { generateSummary } from "./summary.js"
 
 /**
  * One-time migration of the legacy single-file store into the per-file model.
@@ -214,8 +213,6 @@ export async function migrateLegacyStores(projectDir: string, logger?: Logger): 
     JSON.stringify({ version: 1, mapped: finalMap }, null, 2) + "\n",
     "utf8",
   )
-
-  await generateSummary(projectDir)
 
   if (logger) {
     await logger.info("migration", `converted ${toWrite.length} legacy entr${toWrite.length === 1 ? "y" : "ies"}`)
