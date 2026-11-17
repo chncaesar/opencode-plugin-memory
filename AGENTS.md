@@ -179,6 +179,11 @@ npm test            # compile + run unit tests (Node built-in runner)
 
 Tests live next to modules as `*.test.ts`. `dist/` is committed for local plugin loading.
 
+## User Guide and Releases
+
+- The English user guide is maintained in [`docs/index.md`](docs/index.md) and published at https://chncaesar.github.io/opencode-plugin-memory/.
+- After each release, review and update the user guide to reflect the released version, including affected features, configuration options, defaults, and examples. Publish the updated guide with the release documentation.
+
 ## What This Is Not
 
 - Not a global memory store — scoped to the project directory OpenCode runs in
