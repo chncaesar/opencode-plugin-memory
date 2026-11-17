@@ -50,6 +50,74 @@ Add the package to the singular `plugin` array in your OpenCode configuration:
 
 Restart OpenCode after changing the configuration. The same plugin package supports both versions, but their configuration keys are different.
 
+### Configure the plugin
+
+All options are optional. If you do not specify them, the plugin uses the defaults below. Put options inside the plugin entry, not at the top level of your OpenCode configuration. Restart OpenCode after editing them.
+
+For example, this OpenCode 2.x configuration keeps an operation log, checks memories at most once every 30 minutes, and uses a smaller audit batch:
+
+```json
+{
+  "plugins": [
+    {
+      "package": "@chncaesar/opencode-plugin-memory",
+      "options": {
+        "enableLog": true,
+        "auditIntervalMinutes": 30,
+        "auditBatchChars": 100000
+      }
+    }
+  ]
+}
+```
+
+The equivalent OpenCode 1.x entry places the package and options together in a two-element array:
+
+```json
+{
+  "plugin": [
+    [
+      "@chncaesar/opencode-plugin-memory",
+      {
+        "enableLog": true,
+        "auditIntervalMinutes": 30,
+        "auditBatchChars": 100000
+      }
+    ]
+  ]
+}
+```
+
+These examples show the shape of a complete configuration file. If you already have other OpenCode settings or plugins, add the entry to your existing configuration instead of replacing it.
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `maxSummaryChars` | `10000` | Maximum characters in the injected index of memory titles. The separate memory-writing policy is not included in this limit. |
+| `enableLog` | `true` | Write an operation log to `.memory/plugin.log`. Set to `false` to disable it. |
+| `staleDays` | `90` | Age in days after which `memory_review` lists an active memory as aging. This is informational; it does not retire memories. |
+| `backgroundAudit` | `true` | Enable the model-assisted audit after sessions become idle. Set to `false` to disable it; proposals and manual review still work. |
+| `auditIntervalMinutes` | `1` | Minimum number of minutes between background audit attempts. Increase it to run audits less frequently. |
+| `auditBatchChars` | `400000` | Maximum characters of memory text per audit batch. Lower it when the audit model has a smaller context window. |
+| `auditModel` | Host default | OpenCode 2.x only: select the host model for audits as `providerID/modelID`. Ignored when `auditProvider` is set. |
+| `auditProvider` | Not configured | Use a separate OpenAI-compatible endpoint and credentials for audits instead of the host's model call. See [Use a separate audit provider](#use-a-separate-audit-provider). |
+
+An audit interval is a minimum, not a promise that an audit will run on a timer: the plugin also checks conditions such as whether the active memories have changed. Batch size is measured in characters, not tokens. The default assumes a large context window; leave room for the prompt and response when choosing a smaller value. Individual memories are not split, and related entries in different batches can still be missed.
+
+For example, to turn off automatic audits in OpenCode 2.x while keeping the rest of the plugin available:
+
+```json
+{
+  "plugins": [
+    {
+      "package": "@chncaesar/opencode-plugin-memory",
+      "options": { "backgroundAudit": false }
+    }
+  ]
+}
+```
+
+To select a configured OpenCode 2.x host model instead, set `"auditModel": "providerID/modelID"` in `options`, replacing both parts with an actual provider and model available in your OpenCode setup. On 1.x, the audit uses a restricted agent and prefers the host's `small_model`; `auditModel` is not available there.
+
 ## 2. Propose a memory
 
 Work in your project as usual. When you encounter a lesson that would help another session, you can ask:
@@ -122,6 +190,17 @@ For OpenCode 2.x:
 ```
 
 Replace the endpoint and model with your provider's values, set the environment variable, and restart OpenCode. The endpoint must support OpenAI-compatible chat completions. A `{file:path}` key reference is also supported. Keep actual API keys out of committed configuration.
+
+The `auditProvider` fields are:
+
+| Field | Required | Purpose |
+| --- | --- | --- |
+| `baseUrl` | Yes | Provider's base URL. Use the base appropriate for its OpenAI-compatible chat completions API, such as a URL ending in `/v1` if required by that provider. |
+| `apiKey` | Yes | API key, or a reference such as `{env:MEMORY_AUDIT_API_KEY}` or `{file:~/.secrets/audit-key}`. |
+| `model` | Yes | Model identifier accepted by that provider. |
+| `headers` | No | Object of additional HTTP request headers, for providers that require them. |
+
+For example, add `"headers": { "X-Provider-Header": "value" }` inside `auditProvider` only when your provider requires it. A custom `Authorization` header replaces the bearer authorization generated from `apiKey`; it is not added alongside it. Treat authentication headers as secrets and do not commit them.
 
 For OpenCode 1.x, options use a different shape:
 
