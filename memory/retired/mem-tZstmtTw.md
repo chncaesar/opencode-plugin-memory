@@ -9,6 +9,9 @@ tags:
 author: Jiachuan Zhu
 source: memory_propose
 proposed_at: 2026-11-17T01:26:53.123Z
+superseded_by: mem-od6N5eVj
+retired_at: 2026-11-17T02:54:59.513Z
+retired_reason: superseded
 ---
 推广 OpenCode 插件时，唯一官方列表是文档站的 ecosystem 页（`opencode.ai/docs/ecosystem`，当前会跳到 V1 路径），靠提 PR 上架，不是自动收录、也不是表单；源文件在 `anomalyco/opencode` 仓库的 `packages/web/src/content/docs/ecosystem.mdx`。这一条不要求 star 数，随时可提，而且头部插件基本都在上面，是最强的单一曝光位。V2 文档目前没有对应的 ecosystem 页。
 
