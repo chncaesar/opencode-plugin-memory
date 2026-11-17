@@ -1,5 +1,7 @@
 # opencode-plugin-memory
 
+[简体中文](README.zh-CN.md) | **English**
+
 [![npm version](https://img.shields.io/npm/v/@chncaesar/opencode-plugin-memory)](https://www.npmjs.com/package/@chncaesar/opencode-plugin-memory)
 
 PR-gated, project-scoped persistent memory for [OpenCode](https://opencode.ai). The LLM proposes durable knowledge; a human approves it by merging a pull request before it becomes shared truth. No cloud dependency, no vector database.
