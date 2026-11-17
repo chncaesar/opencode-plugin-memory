@@ -6,6 +6,8 @@
 
 PR-gated, project-scoped persistent memory for [OpenCode](https://opencode.ai). The LLM proposes durable knowledge; a human approves it by merging a pull request before it becomes shared truth. No cloud dependency, no vector database.
 
+New to the plugin? Start with the [English user guide](docs/index.md).
+
 ## How it works
 
 - Six tools (`memory_propose`, `memory_update`, `memory_delete`, `memory_read`, `memory_review`, `memory_publish`) are registered with OpenCode and available to the LLM during every session.
