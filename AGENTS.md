@@ -85,9 +85,9 @@ Commands: `once` (process staging and exit), `watch` (poll staging). `regenerate
 
 For each staged file it reads `intent`:
 - `propose` → branch `memory/<id>`, commit the file into `memory/active/` (moving any `supersedes` targets to `memory/retired/` with `superseded_by` + `retired_reason: superseded`), push, open a PR, remove the staged file.
-- `retire` → move `memory/active/<id>` to `memory/retired/` with the reason, open a PR, remove the staged file.
+- `retire` → branch `memory/retire/<id>-<timestamp>` (the add branch for that id is normally still present), move `memory/active/<id>` to `memory/retired/` with the reason, push, open a PR, remove the staged file.
 
-It is idempotent: a proposal whose branch already exists is skipped; a failed PR open leaves the staged file for the next poll.
+It is idempotent by recovery, not by skipping: a branch already on the remote means an earlier run pushed but stopped before the PR, so the bot finds that PR (or opens it) and clears the staged file. A failed git/`gh` step leaves the staged file for the next poll. A `retire` whose target is already gone is reported as `skipped` with the staged file left in place — retried on every later run until deleted by hand; a `propose` that would change no file fails instead, because git refuses an empty commit.
 
 ## System Prompt Injection
 
@@ -101,19 +101,26 @@ Full bodies load only on demand via `memory_read`. Nothing is written: the index
 
 ## Configuration
 
-In `opencode.json` / `opencode.jsonc`:
+In `opencode.json` / `opencode.jsonc`. OpenCode 2.x uses `plugins` (plural) with an object entry for options; 1.x uses `plugin` (singular) with a `[package, options]` pair:
 
 ```jsonc
+// OpenCode 2.x
+"plugins": [{ "package": "@chncaesar/opencode-plugin-memory", "options": { "maxSummaryChars": 3000 } }]
+
+// OpenCode 1.x
 "plugin": [["@chncaesar/opencode-plugin-memory", { "maxSummaryChars": 3000 }]]
 ```
 
+The plugin registers `setup` for the V2 loader and `server` for the V1 loader, so both work from one entry point.
+
 Options (all optional; see `types.ts` `PluginConfig` / `resolveConfig`):
 
-- `maxSummaryChars` (number, default 2000): max characters for the injected index. The policy is injected separately.
+- `maxSummaryChars` (number, default 10000): max characters for the injected index. The policy is injected separately.
 - `enableLog` (boolean, default true): write an operation log to `.memory/plugin.log`.
 - `staleDays` (number, default 90): active memories older than this are "aging" in `memory_review`. Informational only — nothing is retired on an age threshold.
 - `backgroundAudit` (boolean, default true): run the model-judged semantic audit after sessions go idle.
 - `auditIntervalMinutes` (number, default 1): minimum minutes between two background audits.
+- `auditProvider` (object, default none): make the audit call a provider directly instead of asking the host to generate the text — `{ baseUrl, apiKey, model }`, OpenAI-compatible `/chat/completions`. `apiKey` may be a literal, `{file:path}`, or `{env:NAME}`. OpenCode expands those references **before** the plugin sees the options, so a missing key file arrives as an empty string and the audit fails with `"auditProvider" is missing apiKey` (the plugin's own resolver only runs when a host passes the reference through verbatim). Use it when the host's account credential (a PAT or OAuth login) is rejected by an inference gateway. A partial `auditProvider` is not ignored: the audit fails with the missing-field message instead of silently falling back to the host's credential.
 
 ## Key Implementation Details
 
@@ -145,7 +152,9 @@ IDs are random and collision-free: `mem-` + `crypto.randomBytes(6).toString("bas
 
 ### Audit
 
-`audit.ts` runs after a session goes idle and, when the active set changed since the last audit and the interval has passed, asks a restricted `memory-audit` subagent (no tools, `small_model`) to compare every active memory for duplicate / refinement / contradiction. Each finding becomes an `intent: retire` staging proposal (with `superseded_by` for refinements), which the bot turns into a PR. The audit never edits `active/`. Guard state (`lastHash`, `lastAuditAt`) is machine-local in `.memory/audit-state.json` — the PR, not that file, is the durable record of a finding and its outcome.
+`audit.ts` runs after a session goes idle and, when the active set changed since the last audit and the interval has passed, asks a model to compare every active memory for duplicate / refinement / contradiction. Each finding becomes an `intent: retire` staging proposal (with `superseded_by` for refinements), which the bot turns into a PR. The audit never edits `active/`. Guard state (`lastHash`, `lastAuditAt`) is machine-local in `.memory/audit-state.json` — the PR, not that file, is the durable record of a finding and its outcome.
+
+The audit has **no credential of its own by default**: it asks the host to generate text, so it inherits the model and credential the host resolved. OpenCode 2.x relays model calls through its own inference gateway (`opencode.ai/inference/...`), which rejects an account token (PAT or OAuth login) with `HTTP 400 … Personal Access Tokens are not supported for this endpoint` — a credential-type rejection, not a quota error. Configuring `auditProvider` makes the plugin POST to the provider itself (OpenAI-compatible `/chat/completions`) with a key it reads from a literal, `{file:...}` or `{env:...}`, which is the only way to guarantee the audit never depends on the host's account state.
 
 ### `exactOptionalPropertyTypes`
 

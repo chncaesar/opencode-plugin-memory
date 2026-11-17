@@ -1,4 +1,4 @@
-import type { Memory, PluginConfig, RetiredReason } from "./types.js";
+import type { AuditProvider, Memory, PluginConfig, RetiredReason } from "./types.js";
 import type { Logger } from "./logging.js";
 export declare const AUDIT_SYSTEM_PROMPT: string;
 export declare function buildAuditPrompt(memories: Memory[]): string;
@@ -62,6 +62,8 @@ export declare function runAudit(deps: AuditDeps): Promise<AuditOutcome>;
 export declare function looksLikeContextOverflow(message: string): boolean;
 /** What the user can do about a failure, or null when there is no specific advice. */
 export declare function auditFailureHint(message: string, config: PluginConfig): string | null;
+/** Does an error look like a rejected or unusable credential (not a quota or context problem)? */
+export declare function looksLikeCredentialProblem(message: string): boolean;
 /**
  * A short warning for the system prompt when the last audit failed, or null.
  * This reaches the user on every host (OpenCode 2.x has no plugin toast), through
@@ -134,6 +136,31 @@ export type AuditClient = {
  * system-prompt hooks ignore it) and always deleted afterwards.
  */
 export declare function createSdkModelCall(client: AuditClient, directory: string, auditSessions: Set<string>, agentName?: string): ModelCall;
+/**
+ * Resolve a value that may be a `{file:path}` or `{env:NAME}` reference. Plain
+ * values are returned unchanged. An unresolvable reference throws, so a broken
+ * key path fails the audit loudly instead of authenticating as nobody.
+ */
+export declare function resolveSecretValue(raw: string, home?: string): Promise<string>;
+/** `<baseUrl>/chat/completions`, tolerating a base URL that already ends in it. */
+export declare function chatCompletionsUrl(baseUrl: string): string;
+/**
+ * Scrub known secret values out of text that is about to be logged, persisted in
+ * `audit-state.json` (and from there injected into the model's system prompt), or
+ * thrown as an error. Providers normally mask keys, but a proxy or a validation
+ * error may echo the whole value.
+ */
+export declare function redactSecrets(text: string, secrets: Array<string | undefined>): string;
+/**
+ * Build a ModelCall that talks to an OpenAI-compatible provider directly, using
+ * the plugin's own credential. Same timeout and single-flight guard as the
+ * host-mediated call: while one request is unsettled, the next call fails fast
+ * instead of piling a second request on top of a slow provider.
+ *
+ * Every error path is redacted: the resolved key (and any custom header value)
+ * never reaches an error message, the audit log, or the audit state file.
+ */
+export declare function createHttpModelCall(provider: AuditProvider, timeoutMs?: number): ModelCall;
 export type AuditScheduler = {
     /** Call when any session goes idle. Fire-and-forget; safe to call often. */
     onSessionIdle(sessionID: string): void;

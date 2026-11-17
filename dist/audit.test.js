@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
-import { activeHash, buildAuditPrompt, auditFailureHint, auditWarning, createAuditScheduler, describeAuditStatus, looksLikeContextOverflow, parseAuditResponse, relationToReason, orderBySimilarity, runAudit, splitIntoBatches, } from "./audit.js";
+import { activeHash, buildAuditPrompt, auditFailureHint, auditWarning, chatCompletionsUrl, createAuditScheduler, createHttpModelCall, describeAuditStatus, looksLikeContextOverflow, looksLikeCredentialProblem, parseAuditResponse, relationToReason, orderBySimilarity, resolveSecretValue, runAudit, splitIntoBatches, } from "./audit.js";
 import { activeDir, listStagedProposals, writeMemoryFile } from "./storage.js";
 import { DEFAULT_CONFIG } from "./types.js";
 const quietLogger = { async info() { }, async error() { } };
@@ -414,6 +414,253 @@ describe("auditWarning (system prompt)", () => {
             await runAudit({ directory: dir, config: cfg(), logger: quietLogger, call: findingReply([]), now: () => later(5) });
             assert.equal(await auditWarning(dir, cfg()), null);
         });
+    });
+});
+describe("direct provider call (auditProvider)", () => {
+    function stubFetch(handler) {
+        const original = globalThis.fetch;
+        const calls = [];
+        globalThis.fetch = (async (input, init) => {
+            calls.push({ url: String(input), init });
+            return handler(String(input), init);
+        });
+        return {
+            calls,
+            restore: () => {
+                globalThis.fetch = original;
+            },
+        };
+    }
+    const reply = (text, status = 200) => new Response(JSON.stringify({ choices: [{ message: { content: text } }] }), { status });
+    it("posts to /chat/completions with the configured model, bearer key and both messages", async () => {
+        const stub = stubFetch(async () => reply('{"findings":[]}'));
+        try {
+            const call = createHttpModelCall({ baseUrl: "https://api.deepseek.com/", apiKey: "sk-test", model: "deepseek-flash" });
+            assert.equal(await call("audit instructions", "memory entries"), '{"findings":[]}');
+            assert.equal(stub.calls.length, 1);
+            assert.equal(stub.calls[0].url, "https://api.deepseek.com/chat/completions");
+            assert.equal(new Headers(stub.calls[0].init.headers).get("authorization"), "Bearer sk-test");
+            const body = JSON.parse(String(stub.calls[0].init.body));
+            assert.equal(body.model, "deepseek-flash");
+            assert.equal(body.stream, false);
+            assert.deepEqual(body.messages.map((m) => m.role), ["system", "user"]);
+            assert.equal(body.messages[0].content, "audit instructions");
+            assert.equal(body.messages[1].content, "memory entries");
+        }
+        finally {
+            stub.restore();
+        }
+    });
+    it("keeps a base URL that already ends in /chat/completions, and appends otherwise", () => {
+        assert.equal(chatCompletionsUrl("https://api.openai.com/v1"), "https://api.openai.com/v1/chat/completions");
+        assert.equal(chatCompletionsUrl("https://x.test/v1///"), "https://x.test/v1/chat/completions");
+        assert.equal(chatCompletionsUrl("https://x.test/v1/chat/completions"), "https://x.test/v1/chat/completions");
+    });
+    it("keeps a query string, drops a fragment, and does not append the path inside a query", () => {
+        assert.equal(chatCompletionsUrl("https://x.test/v1?api-version=2"), "https://x.test/v1/chat/completions?api-version=2");
+        assert.equal(chatCompletionsUrl("https://x.test/v1#frag"), "https://x.test/v1/chat/completions");
+        assert.equal(chatCompletionsUrl("https://x.test/v1/chat/completions?api-version=2"), "https://x.test/v1/chat/completions?api-version=2");
+    });
+    it("merges custom headers case-insensitively, so authorization is overridden rather than duplicated", async () => {
+        const stub = stubFetch(async () => reply("ok"));
+        try {
+            const call = createHttpModelCall({
+                baseUrl: "https://x.test",
+                apiKey: "sk-0123456789",
+                model: "m",
+                headers: { Authorization: "Token other", "X-Extra": "1" },
+            });
+            assert.equal(await call("s", "u"), "ok");
+            const sent = new Headers(stub.calls[0].init.headers);
+            assert.equal(sent.get("authorization"), "Token other");
+            assert.equal(sent.get("content-type"), "application/json");
+            assert.equal(sent.get("x-extra"), "1");
+            assert.equal(sent.get("authorization")?.includes(","), false);
+        }
+        finally {
+            stub.restore();
+        }
+    });
+    it("resolves a {file:...} api key reference", async () => {
+        await withDir(async (dir) => {
+            const keyFile = path.join(dir, "key");
+            await fs.writeFile(keyFile, "sk-from-file\n", "utf8");
+            const stub = stubFetch(async () => reply("ok"));
+            try {
+                const call = createHttpModelCall({ baseUrl: "https://x.test", apiKey: `{file:${keyFile}}`, model: "m" });
+                assert.equal(await call("s", "u"), "ok");
+                assert.equal(new Headers(stub.calls[0].init.headers).get("authorization"), "Bearer sk-from-file");
+            }
+            finally {
+                stub.restore();
+            }
+        });
+    });
+    it("fails loudly on an unreadable key file or an empty env reference", async () => {
+        await assert.rejects(() => resolveSecretValue("{file:/nope/missing-key}"), /could not read the api key file/);
+        await assert.rejects(() => resolveSecretValue("{env:MEMORY_PLUGIN_TEST_UNSET_VAR}"), /environment variable/);
+        assert.equal(await resolveSecretValue("  sk-plain  "), "sk-plain");
+    });
+    it("surfaces the provider status and body instead of a mystery failure", async () => {
+        const stub = stubFetch(async () => new Response('{"error":{"message":"invalid api key"}}', { status: 401 }));
+        try {
+            const call = createHttpModelCall({ baseUrl: "https://x.test", apiKey: "k", model: "m" });
+            await assert.rejects(() => call("s", "u"), /HTTP 401/);
+            await assert.rejects(() => call("s", "u"), /invalid api key/);
+        }
+        finally {
+            stub.restore();
+        }
+    });
+    it("reports a non-JSON or empty completion as a failure", async () => {
+        const html = stubFetch(async () => new Response("<html>gateway</html>", { status: 200 }));
+        try {
+            await assert.rejects(() => createHttpModelCall({ baseUrl: "https://x.test", apiKey: "k", model: "m" })("s", "u"), /non-JSON/);
+        }
+        finally {
+            html.restore();
+        }
+        const empty = stubFetch(async () => new Response(JSON.stringify({ choices: [{ message: {} }] }), { status: 200 }));
+        try {
+            await assert.rejects(() => createHttpModelCall({ baseUrl: "https://x.test", apiKey: "k", model: "m" })("s", "u"), /no text/);
+        }
+        finally {
+            empty.restore();
+        }
+    });
+    it("refuses a second call while one is unsettled, and times out the first", async () => {
+        const stub = stubFetch((_url, init) => new Promise((_, reject) => {
+            ;
+            init.signal.addEventListener("abort", () => reject(new Error("aborted")));
+        }));
+        try {
+            const call = createHttpModelCall({ baseUrl: "https://x.test", apiKey: "k", model: "m" }, 30);
+            const first = call("s", "u").then(() => null, (err) => err);
+            await assert.rejects(() => call("s", "u"), /still running/);
+            assert.match(String((await first)?.message), /timed out/);
+        }
+        finally {
+            stub.restore();
+        }
+    });
+    it("advice names auditProvider when the host credential is rejected", () => {
+        const patMessage = 'Provider request failed with HTTP 400: checking third-party user token: bad request: Personal Access Tokens are not supported for this endpoint';
+        assert.ok(looksLikeCredentialProblem(patMessage));
+        assert.ok(!looksLikeCredentialProblem("fetch failed"));
+        assert.ok(!looksLikeCredentialProblem("maximum context length is 65536 tokens"));
+        const hostHint = auditFailureHint(patMessage, cfg());
+        assert.match(hostHint ?? "", /auditProvider/);
+        const directHint = auditFailureHint(patMessage, cfg({
+            auditProvider: { baseUrl: "https://api.deepseek.com", apiKey: "k", model: "deepseek-flash" },
+        }));
+        assert.match(directHint ?? "", /api\.deepseek\.com/);
+        assert.match(directHint ?? "", /deepseek-flash/);
+    });
+});
+describe("no secret escapes the direct provider call", () => {
+    function stubFetch(handler) {
+        const original = globalThis.fetch;
+        const calls = [];
+        globalThis.fetch = (async (input, init) => {
+            calls.push({ url: String(input), init });
+            return handler(String(input), init);
+        });
+        return {
+            calls,
+            restore: () => {
+                globalThis.fetch = original;
+            },
+        };
+    }
+    const LIVE_KEY = "sk-live-0123456789abcdefghij";
+    const HEADER_SECRET = "hdrtoken-abcdefghijklmnop";
+    it("redacts a key the provider echoes back in an error body", async () => {
+        const stub = stubFetch(async () => new Response(JSON.stringify({ error: { message: `invalid key ${LIVE_KEY}` } }), { status: 401 }));
+        try {
+            const call = createHttpModelCall({ baseUrl: "https://x.test", apiKey: LIVE_KEY, model: "m" });
+            await assert.rejects(() => call("s", "u"), (err) => {
+                assert.ok(!err.message.includes(LIVE_KEY), `key leaked: ${err.message}`);
+                assert.match(err.message, /HTTP 401/);
+                assert.match(err.message, /\*\*\*/);
+                return true;
+            });
+        }
+        finally {
+            stub.restore();
+        }
+    });
+    it("redacts a key read from a file and a custom header value", async () => {
+        await withDir(async (dir) => {
+            const keyFile = path.join(dir, "key");
+            await fs.writeFile(keyFile, LIVE_KEY + "\n", "utf8");
+            const stub = stubFetch(async () => new Response(`bad ${LIVE_KEY} and ${HEADER_SECRET}`, { status: 500 }));
+            try {
+                const call = createHttpModelCall({
+                    baseUrl: "https://x.test",
+                    apiKey: `{file:${keyFile}}`,
+                    model: "m",
+                    headers: { "x-api-key": HEADER_SECRET },
+                });
+                await assert.rejects(() => call("s", "u"), (err) => {
+                    assert.ok(!err.message.includes(LIVE_KEY), "file key leaked");
+                    assert.ok(!err.message.includes(HEADER_SECRET), "header value leaked");
+                    return true;
+                });
+            }
+            finally {
+                stub.restore();
+            }
+        });
+    });
+    it("keeps the key out of the audit log and the audit state file, which feeds the system prompt", async () => {
+        await withDir(async (dir) => {
+            await seed(dir, mem("mem-aaaa0001", "A"), mem("mem-bbbb0002", "B"));
+            const logged = [];
+            const logger = {
+                async info(line) {
+                    logged.push(line);
+                },
+                async error(_scope, err) {
+                    logged.push(String(err));
+                },
+            };
+            const stub = stubFetch(async () => new Response(JSON.stringify({ error: { message: `nope ${LIVE_KEY}` } }), { status: 401 }));
+            try {
+                const provider = { baseUrl: "https://x.test", apiKey: LIVE_KEY, model: "m" };
+                const out = await runAudit({
+                    directory: dir,
+                    config: cfg({ auditProvider: provider }),
+                    logger,
+                    call: createHttpModelCall(provider),
+                    now: () => NOW,
+                });
+                assert.equal(out, "failed");
+            }
+            finally {
+                stub.restore();
+            }
+            const state = await fs.readFile(path.join(dir, ".memory", "audit-state.json"), "utf8");
+            const warning = (await auditWarning(dir, cfg())) ?? "";
+            assert.ok(!state.includes(LIVE_KEY), "key persisted in audit-state.json");
+            assert.ok(!logged.join("\n").includes(LIVE_KEY), "key written to the plugin log");
+            assert.ok(!warning.includes(LIVE_KEY), "key reached the system prompt warning");
+            assert.match(state, /HTTP 401/);
+        });
+    });
+    it("treats a 200 with a JSON null body as a clear failure", async () => {
+        const stub = stubFetch(async () => new Response("null", { status: 200 }));
+        try {
+            await assert.rejects(() => createHttpModelCall({ baseUrl: "https://x.test", apiKey: "sk-0123456789", model: "m" })("s", "u"), /no completion object/);
+        }
+        finally {
+            stub.restore();
+        }
+    });
+    it("points at the configured provider model, not auditModel, when the context overflows", () => {
+        const hint = auditFailureHint("maximum context length is 65536 tokens", cfg({ auditProvider: { baseUrl: "https://x.test", apiKey: "k", model: "qwen3.7-plus" } }));
+        assert.match(hint ?? "", /qwen3\.7-plus/);
+        assert.ok(!/"auditModel"/.test(hint ?? ""), "hint still names auditModel in direct mode");
+        assert.match(auditFailureHint("maximum context length is 65536 tokens", cfg()) ?? "", /"auditModel"/);
     });
 });
 //# sourceMappingURL=audit.test.js.map

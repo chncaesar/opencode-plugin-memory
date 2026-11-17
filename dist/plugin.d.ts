@@ -1,14 +1,29 @@
 import type { Plugin, PluginOptions } from "@opencode-ai/plugin";
-import { type PluginConfig } from "./types.js";
+import { type AuditProvider, type PluginConfig } from "./types.js";
 import { type ModelCall } from "./audit.js";
 /**
  * Parse and validate plugin options from opencode.json.
  * All options are optional; missing values fall back to DEFAULT_CONFIG.
  *
- * Example opencode.json entry:
- *   "plugin": [["opencode-plugin-memory", { "maxSummaryChars": 10000 }]]
+ * Example opencode.json entry (OpenCode 2.x):
+ *   "plugins": [{ "package": "@chncaesar/opencode-plugin-memory", "options": { "maxSummaryChars": 10000 } }]
  */
 export declare function resolveConfig(options?: PluginOptions): PluginConfig;
+/**
+ * Validate the `auditProvider` option. A provider that is present but incomplete
+ * yields an error rather than being dropped: silently falling back to the host's
+ * credential would look like the option worked.
+ */
+export declare function parseAuditProvider(raw: unknown): {
+    provider?: AuditProvider;
+    error?: string;
+};
+/**
+ * Pick the model call the audit will use: a direct provider call when one is
+ * configured, a clear failure when the configuration is unusable, otherwise the
+ * host-mediated call.
+ */
+export declare function resolveAuditCall(config: PluginConfig, hostCall: ModelCall): ModelCall;
 /**
  * Tell the model when staged proposals have no pull request yet. The background
  * audit stages retire proposals while no model is in the loop, so without this

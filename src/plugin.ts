@@ -1,11 +1,18 @@
 import type { Config, Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
-import { DEFAULT_CONFIG, type PluginConfig } from "./types.js"
+import { DEFAULT_CONFIG, type AuditProvider, type PluginConfig } from "./types.js"
 import { createMemoryTools } from "./tools.js"
 import { loadMemoryBlock } from "./summary.js"
 import { listStagedProposals } from "./storage.js"
 import { createLogger } from "./logging.js"
 import { migrateLegacyStores } from "./migrate.js"
-import { auditWarning, createAuditScheduler, createSdkModelCall, type AuditClient, type ModelCall } from "./audit.js"
+import {
+  auditWarning,
+  createAuditScheduler,
+  createHttpModelCall,
+  createSdkModelCall,
+  type AuditClient,
+  type ModelCall,
+} from "./audit.js"
 import { registerAuditAgent } from "./auditAgent.js"
 import { tool } from "@opencode-ai/plugin/tool"
 
@@ -13,14 +20,14 @@ import { tool } from "@opencode-ai/plugin/tool"
  * Parse and validate plugin options from opencode.json.
  * All options are optional; missing values fall back to DEFAULT_CONFIG.
  *
- * Example opencode.json entry:
- *   "plugin": [["opencode-plugin-memory", { "maxSummaryChars": 10000 }]]
+ * Example opencode.json entry (OpenCode 2.x):
+ *   "plugins": [{ "package": "@chncaesar/opencode-plugin-memory", "options": { "maxSummaryChars": 10000 } }]
  */
 export function resolveConfig(options?: PluginOptions): PluginConfig {
   if (!options || typeof options !== "object") return DEFAULT_CONFIG
   const raw = options as Record<string, unknown>
 
-  return {
+  const config: PluginConfig = {
     maxSummaryChars:
       typeof raw["maxSummaryChars"] === "number" && raw["maxSummaryChars"] > 0
         ? raw["maxSummaryChars"]
@@ -46,6 +53,59 @@ export function resolveConfig(options?: PluginOptions): PluginConfig {
         ? raw["auditBatchChars"]
         : DEFAULT_CONFIG.auditBatchChars,
   }
+
+  const audit = parseAuditProvider(raw["auditProvider"])
+  if (audit.provider) config.auditProvider = audit.provider
+  if (audit.error) config.auditProviderError = audit.error
+  return config
+}
+
+/**
+ * Validate the `auditProvider` option. A provider that is present but incomplete
+ * yields an error rather than being dropped: silently falling back to the host's
+ * credential would look like the option worked.
+ */
+export function parseAuditProvider(raw: unknown): { provider?: AuditProvider; error?: string } {
+  if (raw === undefined || raw === null) return {}
+  if (typeof raw !== "object") {
+    return { error: '"auditProvider" must be an object with baseUrl, apiKey and model' }
+  }
+  const o = raw as Record<string, unknown>
+  const text = (key: string): string =>
+    typeof o[key] === "string" ? (o[key] as string).trim() : ""
+
+  const baseUrl = text("baseUrl")
+  const apiKey = text("apiKey")
+  const model = text("model")
+  const missing = [baseUrl ? "" : "baseUrl", apiKey ? "" : "apiKey", model ? "" : "model"].filter(Boolean)
+  if (missing.length > 0) {
+    return { error: `"auditProvider" is missing ${missing.join(", ")}` }
+  }
+
+  const provider: AuditProvider = { baseUrl, apiKey, model }
+  const rawHeaders = o["headers"]
+  if (rawHeaders && typeof rawHeaders === "object") {
+    const entries = Object.entries(rawHeaders as Record<string, unknown>).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    )
+    if (entries.length > 0) provider.headers = Object.fromEntries(entries)
+  }
+  return { provider }
+}
+
+/**
+ * Pick the model call the audit will use: a direct provider call when one is
+ * configured, a clear failure when the configuration is unusable, otherwise the
+ * host-mediated call.
+ */
+export function resolveAuditCall(config: PluginConfig, hostCall: ModelCall): ModelCall {
+  if (config.auditProvider) return createHttpModelCall(config.auditProvider)
+  if (config.auditProviderError) {
+    return async () => {
+      throw new Error(`audit: ${config.auditProviderError}`)
+    }
+  }
+  return hostCall
 }
 
 /**
@@ -124,7 +184,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
       config,
       notify,
       logger,
-      call: createSdkModelCall(input.client as unknown as AuditClient, directory, auditSessions),
+      call: resolveAuditCall(config, createSdkModelCall(input.client as unknown as AuditClient, directory, auditSessions)),
     },
     auditSessions,
   )
@@ -133,7 +193,8 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
   const hooks: Hooks = {
     // ── Register the restricted audit agent ───────────────────────────────
     config: async (cfg: Config) => {
-      if (!config.backgroundAudit) return
+      // A configured auditProvider calls the model directly; no agent is needed.
+      if (!config.backgroundAudit || config.auditProvider) return
       registerAuditAgent(cfg as unknown as { agent?: Record<string, unknown>; small_model?: string })
     },
 
@@ -267,7 +328,8 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
   }
 
   // Read ctx.experimental lazily: a host without it must not stop the plugin from loading.
-  const call = createV2ModelCall((input, opts) => ctx.experimental.generate.text(input, opts), auditModel)
+  const hostCall = createV2ModelCall((input, opts) => ctx.experimental.generate.text(input, opts), auditModel)
+  const call = resolveAuditCall(config, hostCall)
 
   const scheduler = createAuditScheduler({ directory, config, logger, call }, new Set<string>())
   const memoryTools = createMemoryTools(config, logger)

@@ -1,7 +1,8 @@
 import crypto from "crypto"
 import fs from "fs/promises"
+import os from "os"
 import path from "path"
-import type { Memory, PluginConfig, RetiredReason } from "./types.js"
+import type { AuditProvider, Memory, PluginConfig, RetiredReason } from "./types.js"
 import type { Logger } from "./logging.js"
 import { listActiveMemories, listStagedProposals, machineDir, writeProposal } from "./storage.js"
 import { AUDIT_AGENT_NAME } from "./auditAgent.js"
@@ -422,10 +423,29 @@ export function looksLikeContextOverflow(message: string): boolean {
 
 /** What the user can do about a failure, or null when there is no specific advice. */
 export function auditFailureHint(message: string, config: PluginConfig): string | null {
-  if (!looksLikeContextOverflow(message)) return null
-  const now = config.auditBatchChars
-  const suggest = Math.max(10_000, Math.floor(now / 4))
-  return `The audit prompt probably exceeds the audit model's context window. Lower "auditBatchChars" in the memory plugin options (currently ${now}), for example to ${suggest}, or point "auditModel" at a model with a larger context.`
+  if (looksLikeContextOverflow(message)) {
+    const now = config.auditBatchChars
+    const suggest = Math.max(10_000, Math.floor(now / 4))
+    const switchTo = config.auditProvider
+      ? `the model configured in "auditProvider" (currently ${config.auditProvider.model})`
+      : `"auditModel"`
+    return `The audit prompt probably exceeds the audit model's context window. Lower "auditBatchChars" in the memory plugin options (currently ${now}), for example to ${suggest}, or point ${switchTo} at a model with a larger context.`
+  }
+  if (looksLikeCredentialProblem(message)) {
+    if (config.auditProvider) {
+      const where = `${config.auditProvider.baseUrl} (model ${config.auditProvider.model})`
+      return `The audit provider rejected the credential at ${where}. Check "auditProvider" in the memory plugin options: the apiKey must be valid, and a {file:...} reference must point at a readable file.`
+    }
+    return 'The credential the host used for the audit call was rejected. Set "auditProvider" in the memory plugin options ({ baseUrl, apiKey, model }) so the audit uses its own API key instead of the host account token.'
+  }
+  return null
+}
+
+/** Does an error look like a rejected or unusable credential (not a quota or context problem)? */
+export function looksLikeCredentialProblem(message: string): boolean {
+  return /\b(401|403)\b|unauthori[sz]ed|forbidden|invalid[ _-]?api[ _-]?key|personal access token|\bPATs?\b|api key|authentication/i.test(
+    message,
+  )
 }
 
 /** Persist a failed run and, when the error is new, tell the user once. */
@@ -559,6 +579,168 @@ export function createSdkModelCall(
       setTimeout(() => auditSessions.delete(id), 60_000).unref?.()
     }
   }
+}
+
+// ─── Direct provider call (own endpoint, own key) ────────────────────────────
+
+/**
+ * Resolve a value that may be a `{file:path}` or `{env:NAME}` reference. Plain
+ * values are returned unchanged. An unresolvable reference throws, so a broken
+ * key path fails the audit loudly instead of authenticating as nobody.
+ */
+export async function resolveSecretValue(raw: string, home: string = os.homedir()): Promise<string> {
+  const value = raw.trim()
+  const match = /^\{(file|env):(.+)\}$/.exec(value)
+  if (!match) return value
+  const kind = match[1]!
+  const arg = match[2]!
+
+  if (kind === "env") {
+    const fromEnv = process.env[arg]
+    if (!fromEnv) throw new Error(`audit: environment variable ${arg} is empty`)
+    return fromEnv
+  }
+  const file = arg.startsWith("~/") ? path.join(home, arg.slice(2)) : arg
+  try {
+    const text = (await fs.readFile(file, "utf8")).trim()
+    if (!text) throw new Error("the file is empty")
+    return text
+  } catch (err) {
+    throw new Error(`audit: could not read the api key file ${arg}: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
+/** `<baseUrl>/chat/completions`, tolerating a base URL that already ends in it. */
+export function chatCompletionsUrl(baseUrl: string): string {
+  const raw = baseUrl.trim()
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    // Not an absolute URL: fall back to plain concatenation.
+    const base = raw.replace(/\/+$/, "")
+    return /\/chat\/completions$/.test(base) ? base : `${base}/chat/completions`
+  }
+  const path = url.pathname.replace(/\/+$/, "")
+  url.pathname = /\/chat\/completions$/.test(path) ? path : `${path}/chat/completions`
+  // A fragment is never sent; a query string (e.g. ?api-version=...) is kept.
+  url.hash = ""
+  return url.toString()
+}
+
+/**
+ * Scrub known secret values out of text that is about to be logged, persisted in
+ * `audit-state.json` (and from there injected into the model's system prompt), or
+ * thrown as an error. Providers normally mask keys, but a proxy or a validation
+ * error may echo the whole value.
+ */
+export function redactSecrets(text: string, secrets: Array<string | undefined>): string {
+  let out = text
+  for (const secret of secrets) {
+    if (!secret || secret.length < 8) continue
+    out = out.split(secret).join("***")
+  }
+  return out
+}
+
+/**
+ * Build a ModelCall that talks to an OpenAI-compatible provider directly, using
+ * the plugin's own credential. Same timeout and single-flight guard as the
+ * host-mediated call: while one request is unsettled, the next call fails fast
+ * instead of piling a second request on top of a slow provider.
+ *
+ * Every error path is redacted: the resolved key (and any custom header value)
+ * never reaches an error message, the audit log, or the audit state file.
+ */
+export function createHttpModelCall(provider: AuditProvider, timeoutMs: number = AUDIT_TIMEOUT_MS): ModelCall {
+  const url = chatCompletionsUrl(provider.baseUrl)
+  let inFlight: Promise<void> | null = null
+
+  return async (system, prompt) => {
+    if (inFlight) throw new Error("audit: the previous model call is still running; not starting another")
+
+    const controller = new AbortController()
+    const started = (async () => {
+      const apiKey = await resolveSecretValue(provider.apiKey)
+      const secrets: Array<string | undefined> = [apiKey, ...Object.values(provider.headers ?? {})]
+      try {
+        const headers = new Headers({
+          "content-type": "application/json",
+          authorization: `Bearer ${apiKey}`,
+        })
+        // Case-insensitive merge; a custom header wins, including `authorization`
+        // for endpoints that authenticate with something other than a bearer token.
+        for (const [name, value] of Object.entries(provider.headers ?? {})) headers.set(name, value)
+
+        const res = await fetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            model: provider.model,
+            messages: [
+              { role: "system", content: system },
+              { role: "user", content: prompt },
+            ],
+            stream: false,
+          }),
+          signal: controller.signal,
+        })
+        const body = await res.text()
+        if (!res.ok) throw new Error(`audit: provider HTTP ${res.status} from ${url}: ${clip(body, 300)}`)
+        return readCompletionText(body, url)
+      } catch (err) {
+        throw new Error(redactSecrets(err instanceof Error ? err.message : String(err), secrets))
+      }
+    })()
+
+    const settled: Promise<void> = started.then(
+      () => undefined,
+      () => undefined,
+    )
+    inFlight = settled
+    void settled.then(() => {
+      if (inFlight === settled) inFlight = null
+    })
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`audit: model call timed out after ${Math.round(timeoutMs / 1000)}s`))
+        controller.abort()
+      }, timeoutMs)
+    })
+    try {
+      return await Promise.race([started, timeout])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+}
+
+/** Pull the assistant text out of an OpenAI-compatible response body. */
+function readCompletionText(body: string, url: string): string {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    throw new Error(`audit: provider returned a non-JSON body from ${url}: ${clip(body, 200)}`)
+  }
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error(`audit: provider returned no completion object from ${url}: ${clip(body, 200)}`)
+  }
+  const content = (parsed as { choices?: Array<{ message?: { content?: unknown } }> }).choices?.[0]?.message?.content
+  if (typeof content === "string" && content.trim().length > 0) return content
+  if (Array.isArray(content)) {
+    const joined = content
+      .map((part) => {
+        if (typeof part === "string") return part
+        const text = (part as { text?: unknown })?.text
+        return typeof text === "string" ? text : ""
+      })
+      .join("")
+    if (joined.trim().length > 0) return joined
+  }
+  throw new Error(`audit: provider returned no text from ${url}: ${clip(body, 200)}`)
 }
 
 // ─── Scheduler ───────────────────────────────────────────────────────────────

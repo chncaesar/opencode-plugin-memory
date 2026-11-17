@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
-import { createV2ModelCall, pendingPublishNotice, resolveConfig, server, setup } from "./plugin.js";
+import { createV2ModelCall, pendingPublishNotice, resolveAuditCall, resolveConfig, server, setup } from "./plugin.js";
 import defaultExport from "./index.js";
 import { activeDir, listActiveMemories, stagingDir, writeMemoryFile, writeProposal } from "./storage.js";
 async function withDir(fn) {
@@ -40,6 +40,43 @@ describe("resolveConfig", () => {
         assert.equal(c.backgroundAudit, false);
         assert.equal(c.enableLog, false);
         assert.equal(resolveConfig({ staleDays: -5 }).staleDays, 90);
+    });
+    it("parses an auditProvider and its optional headers", () => {
+        const c = resolveConfig({
+            auditProvider: {
+                baseUrl: " https://api.deepseek.com ",
+                apiKey: "{file:~/.secrets/opencode/deepseek-api-key}",
+                model: "deepseek-flash",
+                headers: { "x-extra": "1", junk: 2 },
+            },
+        });
+        assert.deepEqual(c.auditProvider, {
+            baseUrl: "https://api.deepseek.com",
+            apiKey: "{file:~/.secrets/opencode/deepseek-api-key}",
+            model: "deepseek-flash",
+            headers: { "x-extra": "1" },
+        });
+        assert.equal(c.auditProviderError, undefined);
+        assert.equal(resolveConfig().auditProvider, undefined);
+    });
+    it("records an unusable auditProvider instead of silently using the host credential", () => {
+        const c = resolveConfig({ auditProvider: { baseUrl: "https://api.deepseek.com" } });
+        assert.equal(c.auditProvider, undefined);
+        assert.match(c.auditProviderError ?? "", /missing apiKey, model/);
+        const notObject = resolveConfig({ auditProvider: "deepseek" });
+        assert.match(notObject.auditProviderError ?? "", /must be an object/);
+    });
+});
+describe("resolveAuditCall", () => {
+    const hostCall = (async () => "host");
+    it("uses the host call when no auditProvider is configured", async () => {
+        const call = resolveAuditCall(resolveConfig(), hostCall);
+        assert.equal(await call("s", "p"), "host");
+        assert.equal(await resolveAuditCall(resolveConfig({ auditProvider: undefined }), hostCall)("s", "p"), "host");
+    });
+    it("fails with the configuration error rather than falling back to the host", async () => {
+        const call = resolveAuditCall(resolveConfig({ auditProvider: { baseUrl: "https://x.test" } }), hostCall);
+        await assert.rejects(() => call("s", "p"), /missing apiKey, model/);
     });
 });
 describe("V2 model call (timeout, abort signal and the no-overlap guard)", () => {

@@ -53,6 +53,25 @@ export type Memory = {
  */
 export type MemoryStatus = "active" | "retired" | "staging";
 /**
+ * An endpoint the audit can call itself, with its own credential.
+ *
+ * The host-mediated audit asks the host to generate text, so it inherits
+ * whatever model and credential the host resolved — including an account token
+ * (PAT or OAuth login) that an inference gateway may reject. Configuring this
+ * makes the plugin send the request directly (OpenAI-compatible
+ * `/chat/completions`) with a key it reads itself.
+ */
+export type AuditProvider = {
+    /** Base URL, e.g. `https://api.deepseek.com` or `https://api.openai.com/v1`. */
+    baseUrl: string;
+    /** Literal key, or a `{file:path}` / `{env:NAME}` reference. */
+    apiKey: string;
+    /** Model id at that provider, e.g. `deepseek-flash`. */
+    model: string;
+    /** Extra request headers, if the endpoint needs them. */
+    headers?: Record<string, string>;
+};
+/**
  * Plugin configuration (user-provided via opencode.json plugin options).
  */
 export type PluginConfig = {
@@ -96,6 +115,20 @@ export type PluginConfig = {
      * @default 400000
      */
     auditBatchChars: number;
+    /**
+     * Call this provider directly with its own API key instead of asking the host
+     * to generate the audit text. Use it when the host's account credential (a PAT
+     * or an OAuth login) is rejected by an inference gateway, or to keep the audit
+     * off the main model's quota.
+     * @default undefined (host-mediated)
+     */
+    auditProvider?: AuditProvider;
+    /**
+     * Set when an `auditProvider` was supplied but is unusable (e.g. a missing
+     * field). The audit then fails with this message rather than silently falling
+     * back to the host's credential.
+     */
+    auditProviderError?: string;
 };
 export declare const DEFAULT_CONFIG: PluginConfig;
 //# sourceMappingURL=types.d.ts.map

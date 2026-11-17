@@ -144,6 +144,9 @@ different trigger and remit:
 - Scope: reads `active/` only; never edits `active/`.
 - Detects contradiction, duplication, refinement, and staleness.
 - Emits a proposal to staging (retirement or supersession), which the bot turns into a PR.
+- Credential: the audit owns one only when an explicit provider endpoint is configured;
+  otherwise it borrows the host's, and a host that relays model calls through a gateway may
+  reject that borrowed credential. Borrowed credentials also mean borrowed quota.
 - `review.json` no longer exists; the PR is the durable record of a suggestion and its
   outcome.
 
@@ -216,14 +219,20 @@ Resolved at implementation:
 - **PR title/body template** — title `memory: <title>` for proposals and
   `memory: retire <id>` for retirements; body carries ID, title, author, intent
   (and supersedes/reason when present) plus the memory checklist.
-- **Bot retry policy** — the bot is idempotent: a proposal whose branch already
-  exists is skipped; a failed PR open leaves the staged file in place for the
-  next poll (it never spins). A crash after promotion leaves the working tree
-  changed but never double-commits.
+- **Bot retry policy** — the bot is idempotent: a proposal whose branch is already
+  on the remote is *recovered* — its PR is found or opened and the staged file is
+  cleared — rather than skipped, so a crash after the push never strands a
+  proposal or duplicates the commit. A failed PR open leaves the staged file in
+  place for the next poll (it never spins). A crash after promotion leaves the
+  working tree changed but never double-commits.
 - **Audit form** — the audit is model-judged, not age-based. After a session
-  goes idle, a restricted `memory-audit` agent (no tools, `small_model`) reads
-  every active memory and reports duplicate / refinement / contradiction
-  findings. Each finding becomes an `intent: retire` proposal (with
-  `superseded_by` for refinements), which the bot turns into a PR. Staleness is
-  only the informational "aging" list in `memory_review`; nothing is retired on
-  an age threshold.
+  goes idle, a restricted `memory-audit` agent (no tools, `small_model`) or the
+  host's stateless text generation (V2) reads every active memory and reports
+  duplicate / refinement / contradiction findings. Each finding becomes an
+  `intent: retire` proposal (with `superseded_by` for refinements), which the bot
+  turns into a PR. Staleness is only the informational "aging" list in
+  `memory_review`; nothing is retired on an age threshold.
+- **Audit credential** — borrowed from the host by default, which couples the
+  audit to the host's account state and quota. An explicit provider endpoint in
+  the plugin options is the escape hatch: it is optional, but when it is present
+  and incomplete it is an error, never a silent fallback.
