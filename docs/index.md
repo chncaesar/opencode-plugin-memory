@@ -118,59 +118,11 @@ For example, to turn off automatic audits in OpenCode 2.x while keeping the rest
 
 To select a configured OpenCode 2.x host model instead, set `"auditModel": "providerID/modelID"` in `options`, replacing both parts with an actual provider and model available in your OpenCode setup. On 1.x, the audit uses a restricted agent and prefers the host's `small_model`; `auditModel` is not available there.
 
-## 2. Propose a memory
+#### Use a separate audit provider
 
-Work in your project as usual. When you encounter a lesson that would help another session, you can ask:
+The audit can call an OpenAI-compatible endpoint with its own credentials instead of using the host's model call. This can help if the host's account credential is rejected by the audit endpoint, or if you want to separate audit usage from the main model's quota.
 
-> Remember that reports must identify inventory records by both product and batch.
-
-The agent may also propose durable knowledge without an explicit request, for example after discovering a project convention or receiving a correction about how to work. A good memory captures an actionable lesson, not a transcript of one task.
-
-The proposal is written to a local staging area. **It is not active yet**, and other checkouts do not receive it. Ask the agent to show you the proposal if you want to inspect it before publishing.
-
-Prefer project instructions for mandatory, explicitly maintained rules. Avoid storing secrets, one-off task details, or facts that are already documented and easy to look up.
-
-## 3. Publish and review
-
-Ask the agent to publish the staged proposals. It can call `memory_publish`, which runs the local bot once. The bot uses a temporary Git worktree to create a branch and open a pull request for each proposal; it does not switch your current branch or modify your uncommitted work.
-
-You can also run the bot yourself from the project directory:
-
-```bash
-npx -p @chncaesar/opencode-plugin-memory opencode-memory-bot once
-```
-
-Review each pull request on GitHub. Check whether the proposed knowledge is correct, useful beyond the current task, and consistent with existing project instructions. **Merging the pull request is the approval step.** Until then, the proposal is not shared truth.
-
-If publishing fails, the proposal remains staged for a later retry. A previously pushed branch can be recovered without creating a duplicate commit. If the bot reports a skipped retirement because its target is no longer active, the staged proposal remains and requires attention.
-
-## 4. Use a memory in a later session
-
-After the pull request is merged, update the working branch where you want to use the memory so it contains the merged change. In a new session, the plugin derives an index of active memory titles and IDs from that checkout. When a title is relevant, the agent can read the full entry.
-
-Only the index is injected by default, not every memory body. The index has a configurable size limit; if it is full, the agent can use `memory_review` or `memory_read` to inspect entries beyond the injected subset.
-
-For example, after the inventory lesson is merged and pulled into a checkout, a later session working on another inventory report can find and read the lesson before choosing how to identify records.
-
-## 5. Update or retire a memory
-
-When a project convention changes, tell the agent what changed and ask it to update the old memory. An update stages a replacement that supersedes the old entry; it does not modify active memory immediately.
-
-When a memory is wrong or no longer useful, ask the agent to retire it. That, too, is a proposal. Review and merge its pull request to make the change active. Retired entries are kept in the repository for history rather than silently erased.
-
-Ask the agent to review the memory collection when you want an overview of active, pending, or aging entries. Age is informational: a memory is not retired merely because it is old.
-
-## Background audit
-
-By default, the plugin can audit active memories after a session becomes idle. It looks for possible duplicates, refinements, and contradictions. Audit findings become retirement proposals, not automatic changes; a person still reviews and merges the resulting pull requests.
-
-The audit can split a large collection into overlapping batches. This keeps individual model calls bounded, but it can miss a relationship between entries placed in different batches. Treat the findings as review suggestions, not a complete or infallible analysis.
-
-### Use a separate audit provider
-
-Version 0.6 allows the audit to call an OpenAI-compatible endpoint with its own credentials. This can help if the host's account credential is rejected by the audit endpoint, or if you want to separate audit usage from the main model's quota.
-
-For OpenCode 2.x:
+For OpenCode 2.x, add an `auditProvider` object to `options`:
 
 ```json
 {
@@ -222,6 +174,56 @@ For OpenCode 1.x, options use a different shape:
 ```
 
 An explicit `auditProvider` takes precedence over `auditModel`. If the provider configuration is incomplete, the audit reports an error rather than silently switching credentials. For a model with a smaller context window, lower `auditBatchChars`; see the [configuration reference](https://github.com/chncaesar/opencode-plugin-memory#configuration) for all options.
+
+## 2. Propose a memory
+
+Work in your project as usual. When you encounter a lesson that would help another session, you can ask:
+
+> Remember that reports must identify inventory records by both product and batch.
+
+The agent may also propose durable knowledge without an explicit request, for example after discovering a project convention or receiving a correction about how to work. A good memory captures an actionable lesson, not a transcript of one task.
+
+The proposal is written to a local staging area. **It is not active yet**, and other checkouts do not receive it. Ask the agent to show you the proposal if you want to inspect it before publishing.
+
+Prefer project instructions for mandatory, explicitly maintained rules. Avoid storing secrets, one-off task details, or facts that are already documented and easy to look up.
+
+## 3. Publish and review
+
+Ask the agent to publish the staged proposals. It can call `memory_publish`, which runs the local bot once. The bot uses a temporary Git worktree to create a branch and open a pull request for each proposal; it does not switch your current branch or modify your uncommitted work.
+
+You can also run the bot yourself from the project directory:
+
+```bash
+npx -p @chncaesar/opencode-plugin-memory opencode-memory-bot once
+```
+
+Review each pull request on GitHub. Check whether the proposed knowledge is correct, useful beyond the current task, and consistent with existing project instructions. **Merging the pull request is the approval step.** Until then, the proposal is not shared truth.
+
+If publishing fails, the proposal remains staged for a later retry. A previously pushed branch can be recovered without creating a duplicate commit. If the bot reports a skipped retirement because its target is no longer active, the staged proposal remains and requires attention.
+
+## 4. Use a memory in a later session
+
+After the pull request is merged, update the working branch where you want to use the memory so it contains the merged change. In a new session, the plugin derives an index of active memory titles and IDs from that checkout. When a title is relevant, the agent can read the full entry.
+
+Only the index is injected by default, not every memory body. The index has a configurable size limit; if it is full, the agent can use `memory_review` or `memory_read` to inspect entries beyond the injected subset.
+
+For example, after the inventory lesson is merged and pulled into a checkout, a later session working on another inventory report can find and read the lesson before choosing how to identify records.
+
+## 5. Update or retire a memory
+
+When a project convention changes, tell the agent what changed and ask it to update the old memory. An update stages a replacement that supersedes the old entry; it does not modify active memory immediately.
+
+When a memory is wrong or no longer useful, ask the agent to retire it. That, too, is a proposal. Review and merge its pull request to make the change active. Retired entries are kept in the repository for history rather than silently erased.
+
+Ask the agent to review the memory collection when you want an overview of active, pending, or aging entries. Age is informational: a memory is not retired merely because it is old.
+
+## Background audit
+
+By default, the plugin can audit active memories after a session becomes idle. It looks for possible duplicates, refinements, and contradictions. Audit findings become retirement proposals, not automatic changes; a person still reviews and merges the resulting pull requests.
+
+The audit can split a large collection into overlapping batches. This keeps individual model calls bounded, but it can miss a relationship between entries placed in different batches. Treat the findings as review suggestions, not a complete or infallible analysis.
+
+The audit uses the host's model by default. To send audits to a separate OpenAI-compatible endpoint with its own credentials, configure `auditProvider` as described in [Use a separate audit provider](#use-a-separate-audit-provider).
 
 ## Where the information lives
 
