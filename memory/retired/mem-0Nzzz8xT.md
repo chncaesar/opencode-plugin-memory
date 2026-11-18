@@ -9,6 +9,9 @@ tags:
 author: Jiachuan Zhu
 source: memory_propose
 proposed_at: 2026-11-17T03:23:59.728Z
+superseded_by: mem-ZNpdEfT7
+retired_at: 2026-11-18T01:13:38.771Z
+retired_reason: superseded
 ---
 向 r/opencode 发布插件/工具帖时，真正会杀掉帖子的不是版主，而是 Reddit 的站级垃圾过滤器。实测 400 条近期帖中移除率 12.75%，**51 条移除全部标记为 `reddit`，版主移除数量为 0**；这个区实际上没有成文版规（版主唯一的公开表态是"和 OpenCode 相关的都可以发"），也没有强制分类标签（400 条帖全部无标签）。
 
