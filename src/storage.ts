@@ -1,4 +1,5 @@
 import fs from "fs/promises"
+import { constants as fsConstants } from "fs"
 import path from "path"
 import crypto from "crypto"
 import { execFile } from "child_process"
@@ -145,6 +146,15 @@ export function serializeMemory(memory: Memory): string {
   return serializeFrontmatter(memoryToFrontmatter(memory), memory.body)
 }
 
+function parseMemoryText(text: string): Memory | null {
+  const parsed = parseFrontmatter(text)
+  if (!parsed) return null
+  const memory = frontmatterToMemory(parsed.frontmatter)
+  if (!memory) return null
+  memory.body = parsed.body
+  return memory
+}
+
 /** Read a single memory file; `null` if missing or invalid (bad/missing frontmatter). */
 export async function readMemoryFile(filePath: string): Promise<Memory | null> {
   let text: string
@@ -154,18 +164,41 @@ export async function readMemoryFile(filePath: string): Promise<Memory | null> {
     if (isNodeError(err) && err.code === "ENOENT") return null
     throw err
   }
-  const parsed = parseFrontmatter(text)
-  if (!parsed) return null
-  const memory = frontmatterToMemory(parsed.frontmatter)
-  if (!memory) return null
-  memory.body = parsed.body
-  return memory
+  return parseMemoryText(text)
+}
+
+/**
+ * Read a single memory file, refusing to follow a symlink at `filePath`.
+ * Only the leaf is protected: parent directories are the caller's concern.
+ * `null` when the file is missing, invalid, or a symlink (`ELOOP`).
+ *
+ * Used by the bot, which must not let a staged or committed path redirect a
+ * read outside the memory store.
+ */
+export async function readMemoryFileNoFollow(filePath: string): Promise<Memory | null> {
+  const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0)
+  let handle: fs.FileHandle
+  try {
+    handle = await fs.open(filePath, flags)
+  } catch (err: unknown) {
+    if (isNodeError(err) && (err.code === "ENOENT" || err.code === "ELOOP")) return null
+    throw err
+  }
+  try {
+    return parseMemoryText(await handle.readFile("utf8"))
+  } finally {
+    await handle.close()
+  }
+}
+
+function isMemoryFileName(name: string): boolean {
+  return name.startsWith("mem-") && name.endsWith(".md")
 }
 
 async function listFiles(dir: string): Promise<string[]> {
   try {
     const names = await fs.readdir(dir)
-    return names.filter((n) => n.startsWith("mem-") && n.endsWith(".md"))
+    return names.filter(isMemoryFileName)
   } catch (err: unknown) {
     if (isNodeError(err) && err.code === "ENOENT") return []
     throw err
@@ -195,6 +228,71 @@ export function listRetiredMemories(projectDir: string): Promise<Memory[]> {
 /** List the agent's staged proposals. */
 export function listStagedProposals(projectDir: string): Promise<Memory[]> {
   return readMemories(stagingDir(projectDir))
+}
+
+// ─── Tolerant read (prompt index only) ───────────────────────────────────────
+//
+// Tools, the audit and migration use the strict readers above: a store that
+// cannot be read must fail loudly there, because acting on a partial view of
+// `active/` could propose a duplicate or delete the wrong memory. The prompt
+// index is different: it is rebuilt on every request, and a machine-local
+// permissions problem must never break a normal conversation. This reader
+// therefore returns whatever it could read and reports the rest.
+
+/** One skipped entry, described without a filesystem message. */
+export type StoreReadProblem = {
+  /** Absolute path of the folder or file that could not be read. */
+  file: string
+  /** Short cause: an errno code ("EACCES", "EISDIR", …) or "invalid" for missing/bad frontmatter. */
+  code: string
+}
+
+/** Result of a tolerant read: what was readable, plus what was skipped. */
+export type MemoryListing = {
+  memories: Memory[]
+  problems: StoreReadProblem[]
+  /** True when the folder itself could not be listed, so the listing is empty by failure, not by absence. */
+  folderUnreadable: boolean
+}
+
+function causeCode(err: unknown): string {
+  return isNodeError(err) && typeof err.code === "string" ? err.code : "error"
+}
+
+/**
+ * Read the memories in `dir` without throwing. An unreadable folder yields an
+ * empty listing with one problem; an unreadable or invalid entry is skipped and
+ * reported while the remaining memories are still returned.
+ */
+export async function readMemoriesTolerant(dir: string): Promise<MemoryListing> {
+  let names: string[]
+  try {
+    names = await fs.readdir(dir)
+  } catch (err: unknown) {
+    if (isNodeError(err) && err.code === "ENOENT") {
+      return { memories: [], problems: [], folderUnreadable: false }
+    }
+    return { memories: [], problems: [{ file: dir, code: causeCode(err) }], folderUnreadable: true }
+  }
+
+  const memories: Memory[] = []
+  const problems: StoreReadProblem[] = []
+  for (const name of names.filter(isMemoryFileName)) {
+    const filePath = path.join(dir, name)
+    try {
+      const memory = await readMemoryFile(filePath)
+      if (memory) memories.push(memory)
+      else problems.push({ file: filePath, code: "invalid" })
+    } catch (err: unknown) {
+      problems.push({ file: filePath, code: causeCode(err) })
+    }
+  }
+  return { memories, problems, folderUnreadable: false }
+}
+
+/** Tolerant read of the committed active store, for the prompt index. */
+export function listActiveMemoriesForIndex(projectDir: string): Promise<MemoryListing> {
+  return readMemoriesTolerant(activeDir(projectDir))
 }
 
 export type MemoryWithStatus = { memory: Memory; status: MemoryStatus }
@@ -227,10 +325,26 @@ export class StoreWriteError extends Error {
   }
 }
 
-/** Write a memory file into `dir` (creating it). Used by migration and the bot. */
+/** Publish a complete memory file into `dir` (creating it). */
 export async function writeMemoryFile(dir: string, memory: Memory): Promise<void> {
+  if (!isMemoryId(memory.id)) throw new Error("Invalid memory ID")
+  const text = serializeMemory(memory)
   await fs.mkdir(dir, { recursive: true })
-  await fs.writeFile(path.join(dir, `${memory.id}.md`), serializeMemory(memory), "utf8")
+  const target = path.join(dir, `${memory.id}.md`)
+  // Readers only enumerate mem-*.md; keep unfinished writes out of sight.
+  const temp = path.join(dir, `.memory-write-${crypto.randomUUID()}.tmp`)
+  const handle = await fs.open(temp, "wx")
+  try {
+    try {
+      await handle.writeFile(text, "utf8")
+    } finally {
+      await handle.close()
+    }
+    await fs.rename(temp, target)
+  } catch (err) {
+    await fs.rm(temp, { force: true }).catch(() => undefined)
+    throw err
+  }
 }
 
 /**

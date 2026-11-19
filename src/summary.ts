@@ -1,4 +1,4 @@
-import { listActiveMemories } from "./storage.js"
+import { activeDir, listActiveMemoriesForIndex, type MemoryListing, type StoreReadProblem } from "./storage.js"
 import type { Memory } from "./types.js"
 import { MEMORY_WRITE_POLICY } from "./prompt.js"
 
@@ -8,6 +8,20 @@ const MEMORY_SYSTEM_INTRO = [
   "You have a PR-gated, project-scoped memory system (tools: memory_propose, memory_update, memory_delete, memory_read, memory_review).",
   "You only PROPOSE memories; a human approves each one by merging a pull request before it becomes active.",
 ].join("\n")
+
+/**
+ * Shown instead of the index when the committed store could not be read at all.
+ * Deliberately says nothing about the underlying cause: a filesystem message in
+ * the system prompt is noise to the model and can leak machine paths.
+ */
+const INDEX_UNAVAILABLE = "(memory index unavailable this turn — the committed store could not be read; continue without it)"
+
+export type SystemPromptOptions = {
+  /** Replace the index entirely: the store could not be listed. */
+  indexUnavailable?: boolean
+  /** Readable memories skipped because their file was unreadable or invalid. */
+  omitted?: number
+}
 
 /**
  * Build the index shown to the model: one `[mem-XXXX] Title` line per active
@@ -26,12 +40,18 @@ export function buildIndexLines(memories: Memory[]): string[] {
  * introduction, the index (titles and ids only, never full bodies), and the
  * complete writing policy. Full bodies stay on disk and load lazily through
  * `memory_read`, so a large store costs only one line per memory per turn.
+ *
+ * `options.indexUnavailable` replaces the index when the store could not be
+ * listed; `options.omitted` is the number of memory files skipped because they
+ * were unreadable or invalid, so the model knows the list may be incomplete.
  */
-export function buildSystemPrompt(memories: Memory[], maxChars: number): string {
+export function buildSystemPrompt(memories: Memory[], maxChars: number, options: SystemPromptOptions = {}): string {
   const lines = buildIndexLines(memories)
   let index: string
 
-  if (lines.length === 0) {
+  if (options.indexUnavailable) {
+    index = INDEX_UNAVAILABLE
+  } else if (lines.length === 0) {
     index = "(no active memories — propose your first with memory_propose)"
   } else {
     let body = lines.join("\n")
@@ -50,10 +70,61 @@ export function buildSystemPrompt(memories: Memory[], maxChars: number): string 
     index = body
   }
 
+  const omitted = options.omitted ?? 0
+  if (!options.indexUnavailable && omitted > 0) {
+    index += `\n… (${omitted} memory file${omitted === 1 ? "" : "s"} could not be read and ${omitted === 1 ? "is" : "are"} omitted from this index)`
+  }
+
   return [MEMORY_SYSTEM_INTRO, "", "Project memory index:", index, MEMORY_WRITE_POLICY, ""].join("\n\n")
 }
 
-/** Prompt block for a project, derived from its active memories on every call. */
-export async function loadMemoryBlock(projectDir: string, maxChars: number): Promise<string> {
-  return buildSystemPrompt(await listActiveMemories(projectDir), maxChars)
+/**
+ * Called once per prompt build with the entries that were skipped, so the host
+ * can log them without putting a filesystem message in the prompt. The callback
+ * must not throw; a failing reporter never fails the prompt.
+ */
+export type IndexProblemReporter = (problems: StoreReadProblem[]) => void | Promise<void>
+
+async function reportProblems(reporter: IndexProblemReporter | undefined, problems: StoreReadProblem[]): Promise<void> {
+  if (problems.length === 0 || !reporter) return
+  try {
+    await reporter(problems)
+  } catch {
+    // Diagnostics are best effort: never let reporting break the prompt.
+  }
+}
+
+/**
+ * Prompt block for a project, derived from its active memories on every call.
+ *
+ * Reading the store is tolerant by design: a normal conversation must not fail
+ * because `memory/active/` is unreadable, one entry file is corrupt, or the
+ * folder is a file. Unreadable entries are skipped and reported through
+ * `onProblems`; when the folder itself cannot be read, the block falls back to
+ * the writing policy with an index-unavailable notice. Raw filesystem errors
+ * never reach the prompt.
+ */
+export async function loadMemoryBlock(
+  projectDir: string,
+  maxChars: number,
+  onProblems?: IndexProblemReporter,
+): Promise<string> {
+  let listing: MemoryListing
+  try {
+    listing = await listActiveMemoriesForIndex(projectDir)
+  } catch (err: unknown) {
+    // Defensive: the tolerant reader is written not to throw. If it ever does,
+    // the prompt still renders.
+    const code = err instanceof Error && "code" in err && typeof (err as NodeJS.ErrnoException).code === "string"
+      ? (err as NodeJS.ErrnoException).code!
+      : "error"
+    await reportProblems(onProblems, [{ file: activeDir(projectDir), code }])
+    return buildSystemPrompt([], maxChars, { indexUnavailable: true })
+  }
+
+  await reportProblems(onProblems, listing.problems)
+  if (listing.folderUnreadable) {
+    return buildSystemPrompt(listing.memories, maxChars, { indexUnavailable: true })
+  }
+  return buildSystemPrompt(listing.memories, maxChars, { omitted: listing.problems.length })
 }

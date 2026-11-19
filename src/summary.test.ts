@@ -51,6 +51,49 @@ describe("loadMemoryBlock", () => {
       await assert.rejects(fs.access(path.join(dir, "memory")))
     })
   })
+
+  it("does not throw when the active store cannot be read, and keeps the policy", async () => {
+    await withDir(async (dir) => {
+      await fs.mkdir(path.dirname(activeDir(dir)), { recursive: true })
+      await fs.writeFile(activeDir(dir), "not a directory", "utf8")
+      const reported: string[][] = []
+      const block = await loadMemoryBlock(dir, 2000, (problems) => {
+        reported.push(problems.map((p) => p.code))
+      })
+      assert.match(block, /memory index unavailable/)
+      assert.ok(block.includes(MEMORY_WRITE_POLICY))
+      assert.ok(!block.includes("no active memories"))
+      assert.deepEqual(reported, [["ENOTDIR"]])
+      // No filesystem text or path leaks into the prompt.
+      assert.ok(!/ENOTDIR|EACCES|no such file|\.memory/i.test(block.split("## When to propose")[0]!))
+    })
+  })
+
+  it("keeps the readable entries and reports a skipped file without leaking its error", async () => {
+    await withDir(async (dir) => {
+      await writeMemoryFile(activeDir(dir), mem("mem-aaaaaaaa", "Readable rule"))
+      await fs.mkdir(path.join(activeDir(dir), "mem-bbbbbbbb.md"))
+      const reported: string[][] = []
+      const block = await loadMemoryBlock(dir, 2000, (problems) => {
+        reported.push(problems.map((p) => p.code))
+      })
+      assert.match(block, /\[mem-aaaaaaaa\] Readable rule/)
+      assert.match(block, /1 memory file could not be read/)
+      assert.deepEqual(reported, [["EISDIR"]])
+      const indexPart = block.split("Project memory index:")[1]!.split("## When to propose")[0]!
+      assert.ok(!/EISDIR|EACCES|cannot read/i.test(indexPart))
+    })
+  })
+
+  it("still renders the prompt when the diagnostics reporter throws", async () => {
+    await withDir(async (dir) => {
+      await fs.mkdir(path.join(activeDir(dir), "mem-bbbbbbbb.md"), { recursive: true })
+      const block = await loadMemoryBlock(dir, 2000, () => {
+        throw new Error("reporter exploded")
+      })
+      assert.ok(block.includes(MEMORY_WRITE_POLICY))
+    })
+  })
 })
 
 describe("buildSystemPrompt", () => {

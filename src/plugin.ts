@@ -1,9 +1,9 @@
 import type { Config, Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
 import { DEFAULT_CONFIG, type AuditProvider, type PluginConfig } from "./types.js"
 import { createMemoryTools } from "./tools.js"
-import { loadMemoryBlock } from "./summary.js"
+import { buildSystemPrompt, loadMemoryBlock } from "./summary.js"
 import { listStagedProposals } from "./storage.js"
-import { createLogger } from "./logging.js"
+import { createLogger, type Logger } from "./logging.js"
 import { migrateLegacyStores } from "./migrate.js"
 import {
   auditWarning,
@@ -113,15 +113,27 @@ export function resolveAuditCall(config: PluginConfig, hostCall: ModelCall): Mod
  * `memory/active/` (titles and ids only, never full bodies) plus the writing
  * policy. Nothing is written to disk: running OpenCode in a directory must not
  * create or modify a `memory/` folder there.
+ *
+ * This runs inside the system-prompt hook, so it must never throw: an unreadable
+ * memory store is a diagnostic, not a reason to break a normal conversation. A
+ * store that cannot be read degrades to the policy alone, and the filesystem
+ * detail goes to the machine-local log, never into the prompt.
  */
-async function injectMemoryBlock(directory: string, config: PluginConfig): Promise<string> {
-  const block = await loadMemoryBlock(directory, config.maxSummaryChars)
-  const notices: string[] = [block]
-  const warning = await auditWarning(directory, config).catch(() => null)
-  if (warning) notices.push(warning)
-  const pending = await pendingPublishNotice(directory).catch(() => null)
-  if (pending) notices.push(pending)
-  return notices.join("\n\n")
+async function injectMemoryBlock(directory: string, config: PluginConfig, logger: Logger): Promise<string> {
+  try {
+    const block = await loadMemoryBlock(directory, config.maxSummaryChars, async (problems) => {
+      for (const problem of problems) await logger.error("index", `${problem.code} ${problem.file}`)
+    })
+    const notices: string[] = [block]
+    const warning = await auditWarning(directory, config).catch(() => null)
+    if (warning) notices.push(warning)
+    const pending = await pendingPublishNotice(directory).catch(() => null)
+    if (pending) notices.push(pending)
+    return notices.join("\n\n")
+  } catch (err) {
+    await logger.error("system-prompt", err)
+    return buildSystemPrompt([], config.maxSummaryChars, { indexUnavailable: true })
+  }
 }
 
 /**
@@ -216,7 +228,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
     // ── Inject the committed memory index into every system prompt ─────────
     "experimental.chat.system.transform": async (hookInput, output) => {
       if (hookInput.sessionID && auditSessions.has(hookInput.sessionID)) return
-      output.system.push(await injectMemoryBlock(directory, config))
+      output.system.push(await injectMemoryBlock(directory, config, logger))
     },
   }
 
@@ -356,7 +368,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
 
   registrations.push(
     await ctx.session.hook("context", async (event: { system: Array<{ type: "text"; text: string }> }) => {
-      event.system.push({ type: "text", text: await injectMemoryBlock(directory, config) })
+      event.system.push({ type: "text", text: await injectMemoryBlock(directory, config, logger) })
     }),
   )
 

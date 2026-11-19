@@ -28,7 +28,7 @@ State is positional: `memory/active/` is shared truth, `memory/retired/` holds r
 opencode plugin add @chncaesar/opencode-plugin-memory@latest
 ```
 
-This works on OpenCode 2.x. On 1.x the config key is singular (`plugin`), and on either version the package name is `@chncaesar/opencode-plugin-memory`. Restart OpenCode afterwards. See the [user guide](https://chncaesar.github.io/opencode-plugin-memory/) for manual config entries, local-clone installs, and all plugin options.
+This plugin supports OpenCode 2.x only. See the [user guide](https://chncaesar.github.io/opencode-plugin-memory/) for manual config entries, local-clone installs, and all plugin options.
 
 ## Development
 

@@ -18,12 +18,13 @@
  *   node dist/bot.js watch      poll staging forever (default interval 2s)
  */
 import fs from "fs/promises";
+import { realpathSync } from "fs";
 import os from "os";
 import crypto from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
 import { execFile } from "child_process";
-import { activeDir, listStagedProposals, readMemoryFile, retiredDir, stagingDir, writeMemoryFile, } from "./storage.js";
+import { activeDir, isMemoryId, machineDir, memoryRootDir, readMemoryFileNoFollow, retiredDir, stagingDir, writeMemoryFile, } from "./storage.js";
 // ─── Child processes ─────────────────────────────────────────────────────────
 function run(cmd, args, cwd) {
     return new Promise((resolve, reject) => {
@@ -88,6 +89,129 @@ export async function defaultBranch(cwd, repo) {
     }
     return "main";
 }
+// ─── Filesystem boundary ────────────────────────────────────────────────────
+//
+// The bot turns files it did not create into git commits and deletes files
+// after pushing. Both directions must stay inside the memory store: a symlink
+// at `.memory/`, a directory at a leaf path, or a file whose frontmatter id
+// disagrees with its name would silently redirect a read, a write or a delete.
+//
+// Every path is classified with `lstat` (never following a link) before use,
+// reads use O_NOFOLLOW where available and writes replace the leaf by rename. A path of the
+// wrong kind is refused rather than repaired. This is a boundary check, not a
+// transaction: a concurrent process can still swap a validated path before the
+// operation (TOCTOU). Defeating that would need directory handles and
+// openat-style calls; the residual window is accepted and every operation
+// re-checks its leaf where it can.
+/** Thrown when a path the bot is about to touch is not the expected kind of entry. */
+export class MemoryBoundaryError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = "MemoryBoundaryError";
+    }
+}
+function errorCode(err) {
+    return err instanceof Error && "code" in err ? err.code : undefined;
+}
+/** Classify a path without following a symlink. */
+async function entryKind(filePath) {
+    let stat;
+    try {
+        stat = await fs.lstat(filePath);
+    }
+    catch (err) {
+        if (errorCode(err) === "ENOENT")
+            return "missing";
+        throw err;
+    }
+    if (stat.isSymbolicLink())
+        return "symlink";
+    if (stat.isDirectory())
+        return "dir";
+    if (stat.isFile())
+        return stat.nlink === 1 ? "file" : "hardlink";
+    return "other";
+}
+function describeKind(kind) {
+    switch (kind) {
+        case "symlink":
+            return "a symlink";
+        case "hardlink":
+            return "a multiply linked file";
+        case "dir":
+            return "a directory";
+        case "file":
+            return "a regular file";
+        case "other":
+            return "a special file";
+        case "missing":
+            return "missing";
+    }
+}
+/** Allow a real directory or a missing one (to be created); refuse everything else. */
+async function assertRealDir(dirPath, label) {
+    const kind = await entryKind(dirPath);
+    if (kind === "dir" || kind === "missing")
+        return kind;
+    throw new MemoryBoundaryError(`${label} is ${describeKind(kind)}, not a real directory; refusing to touch it`);
+}
+/** Allow a regular file or a missing one; refuse symlinks and directories. */
+async function assertRegularFileOrMissing(filePath, label) {
+    const kind = await entryKind(filePath);
+    if (kind === "file" || kind === "missing")
+        return kind;
+    throw new MemoryBoundaryError(`${label} is ${describeKind(kind)}, not a regular file; refusing to touch it`);
+}
+async function ensureRealDir(dirPath, label) {
+    if ((await assertRealDir(dirPath, label)) === "dir")
+        return;
+    await fs.mkdir(dirPath, { recursive: true });
+    // mkdir does not follow a symlink that appears at the final component, but a
+    // racing process could still have put one there.
+    if ((await entryKind(dirPath)) !== "dir") {
+        throw new MemoryBoundaryError(`${label} was not created as a real directory; refusing to write`);
+    }
+}
+/**
+ * Write `memory` into `dirPath` without following a symlink at the leaf. An
+ * existing file must be readable and carry the same id, so a re-run overwrites
+ * only the file it meant to write.
+ */
+async function writeMemoryFileAt(dirPath, memory, label) {
+    const file = path.join(dirPath, `${memory.id}.md`);
+    if ((await assertRegularFileOrMissing(file, label)) === "file") {
+        const existing = await readMemoryFileNoFollow(file);
+        if (!existing || existing.id !== memory.id) {
+            throw new MemoryBoundaryError(`${label} does not contain ${memory.id}; refusing to overwrite it`);
+        }
+    }
+    await writeMemoryFile(dirPath, memory);
+    return file;
+}
+/**
+ * Read and validate every active memory a proposal supersedes, before anything
+ * is written. Missing targets are skipped (already retired, an idempotent
+ * re-run); present ones must be regular, readable and named after their id.
+ */
+async function inspectSupersedeTargets(projectDir, ids) {
+    const targets = [];
+    for (const id of ids) {
+        if (!isMemoryId(id)) {
+            throw new MemoryBoundaryError(`supersedes reference ${JSON.stringify(id)} is not a memory id`);
+        }
+        const file = path.join(activeDir(projectDir), `${id}.md`);
+        if ((await assertRegularFileOrMissing(file, `active memory ${id}`)) === "missing")
+            continue;
+        const memory = await readMemoryFileNoFollow(file);
+        if (!memory)
+            throw new MemoryBoundaryError(`active memory ${id} is not a readable memory file; refusing to retire it`);
+        if (memory.id !== id) {
+            throw new MemoryBoundaryError(`active file ${id}.md contains ${memory.id}; refusing to retire it`);
+        }
+        targets.push({ id, file, memory });
+    }
+    return targets;
+}
 // ─── Pure filesystem transforms (no git) ────────────────────────────────────
 /**
  * Promote a `propose` proposal into `memory/active/`, retiring any superseded
@@ -95,23 +219,64 @@ export async function defaultBranch(cwd, repo) {
  * after the PR opens). Idempotent: re-running overwrites the active file and
  * skips supersede targets that are already gone.
  *
- * Returns the list of filesystem paths changed (for logging).
+ * Every path it will read, write or delete is validated first, so a bad
+ * directory or leaf aborts the transform before the first write. Returns the
+ * list of filesystem paths changed (for logging).
  */
 export async function applyPropose(projectDir, memory) {
+    if (!isMemoryId(memory.id)) {
+        throw new MemoryBoundaryError(`proposal id ${JSON.stringify(memory.id)} is not a memory id`);
+    }
+    const supersedes = memory.supersedes ?? [];
+    for (const id of supersedes) {
+        if (!isMemoryId(id)) {
+            throw new MemoryBoundaryError(`supersedes reference ${JSON.stringify(id)} is not a memory id`);
+        }
+    }
+    const active = activeDir(projectDir);
+    const retired = retiredDir(projectDir);
+    // Preflight — nothing is created or written until every touched path is known.
+    await assertRealDir(memoryRootDir(projectDir), "memory root");
+    await assertRealDir(active, "memory/active");
+    if (supersedes.length > 0)
+        await assertRealDir(retired, "memory/retired");
+    const target = path.join(active, `${memory.id}.md`);
+    if ((await assertRegularFileOrMissing(target, `active memory ${memory.id}`)) === "file") {
+        const existing = await readMemoryFileNoFollow(target);
+        if (!existing || existing.id !== memory.id) {
+            throw new MemoryBoundaryError(`active file ${memory.id}.md does not contain ${memory.id}; refusing to overwrite it`);
+        }
+    }
+    const retiring = await inspectSupersedeTargets(projectDir, supersedes);
+    for (const item of retiring) {
+        const retiredFile = path.join(retired, `${item.id}.md`);
+        if ((await assertRegularFileOrMissing(retiredFile, `retired memory ${item.id}`)) === "file") {
+            const existing = await readMemoryFileNoFollow(retiredFile);
+            if (!existing || existing.id !== item.id) {
+                throw new MemoryBoundaryError(`retired file ${item.id}.md does not contain ${item.id}; refusing to overwrite it`);
+            }
+        }
+    }
+    // Boundary is sound: create directories, then write.
+    await ensureRealDir(memoryRootDir(projectDir), "memory root");
+    await ensureRealDir(active, "memory/active");
     const promoted = { ...memory };
     delete promoted.intent; // staging-only directive, never written to active/
-    await writeMemoryFile(activeDir(projectDir), promoted);
-    const changed = [path.join(activeDir(projectDir), `${memory.id}.md`)];
-    for (const oldId of memory.supersedes ?? []) {
-        const old = await readMemoryFile(path.join(activeDir(projectDir), `${oldId}.md`));
-        if (!old)
-            continue; // already retired (idempotent re-run)
+    const changed = [await writeMemoryFileAt(active, promoted, `active memory ${memory.id}`)];
+    for (const item of retiring) {
+        const old = { ...item.memory };
         old.supersededBy = memory.id;
         old.retiredReason = "superseded";
         old.retiredAt = new Date().toISOString();
-        await writeMemoryFile(retiredDir(projectDir), old);
-        await fs.rm(path.join(activeDir(projectDir), `${oldId}.md`), { force: true });
-        changed.push(path.join(retiredDir(projectDir), `${oldId}.md`));
+        await ensureRealDir(retired, "memory/retired");
+        await writeMemoryFileAt(retired, old, `retired memory ${item.id}`);
+        // Re-check the leaf immediately before unlinking it.
+        const kind = await entryKind(item.file);
+        if (kind !== "missing" && kind !== "file") {
+            throw new MemoryBoundaryError(`active memory ${item.id} changed to ${describeKind(kind)}; refusing to delete it`);
+        }
+        await fs.rm(item.file, { force: true });
+        changed.push(path.join(retired, `${item.id}.md`));
     }
     return changed;
 }
@@ -119,19 +284,142 @@ export async function applyPropose(projectDir, memory) {
  * Promote a `retire` proposal: move `memory/active/<id>` to `memory/retired/`
  * with the reason from the staged file. Does NOT remove the staged file.
  * Idempotent: a missing active file means it was already retired.
+ *
+ * Every touched path is validated before the first write, so a symlinked or
+ * malformed entry is left for a human instead of being followed.
  */
 export async function applyRetire(projectDir, staged) {
     const id = staged.id;
-    const active = await readMemoryFile(path.join(activeDir(projectDir), `${id}.md`));
-    if (!active)
+    if (!isMemoryId(id)) {
+        throw new MemoryBoundaryError(`retire target ${JSON.stringify(id)} is not a memory id`);
+    }
+    if (staged.supersededBy !== undefined && !isMemoryId(staged.supersededBy)) {
+        throw new MemoryBoundaryError(`superseded_by ${JSON.stringify(staged.supersededBy)} is not a memory id`);
+    }
+    const active = activeDir(projectDir);
+    const retired = retiredDir(projectDir);
+    await assertRealDir(memoryRootDir(projectDir), "memory root");
+    await assertRealDir(active, "memory/active");
+    const activeFile = path.join(active, `${id}.md`);
+    if ((await assertRegularFileOrMissing(activeFile, `active memory ${id}`)) === "missing") {
         return []; // already retired
-    active.retiredReason = staged.retiredReason ?? "stale";
-    active.retiredAt = new Date().toISOString();
+    }
+    const memory = await readMemoryFileNoFollow(activeFile);
+    if (!memory)
+        throw new MemoryBoundaryError(`active memory ${id} is not a readable memory file; refusing to retire it`);
+    if (memory.id !== id) {
+        throw new MemoryBoundaryError(`active file ${id}.md contains ${memory.id}; refusing to retire it`);
+    }
+    await assertRealDir(retired, "memory/retired");
+    const retiredFile = path.join(retired, `${id}.md`);
+    if ((await assertRegularFileOrMissing(retiredFile, `retired memory ${id}`)) === "file") {
+        const existing = await readMemoryFileNoFollow(retiredFile);
+        if (!existing || existing.id !== id) {
+            throw new MemoryBoundaryError(`retired file ${id}.md does not contain ${id}; refusing to overwrite it`);
+        }
+    }
+    memory.retiredReason = staged.retiredReason ?? "stale";
+    memory.retiredAt = new Date().toISOString();
     if (staged.supersededBy)
-        active.supersededBy = staged.supersededBy;
-    await writeMemoryFile(retiredDir(projectDir), active);
-    await fs.rm(path.join(activeDir(projectDir), `${id}.md`), { force: true });
-    return [path.join(retiredDir(projectDir), `${id}.md`)];
+        memory.supersededBy = staged.supersededBy;
+    await ensureRealDir(retired, "memory/retired");
+    await writeMemoryFileAt(retired, memory, `retired memory ${id}`);
+    const kind = await entryKind(activeFile);
+    if (kind !== "missing" && kind !== "file") {
+        throw new MemoryBoundaryError(`active memory ${id} changed to ${describeKind(kind)}; refusing to delete it`);
+    }
+    await fs.rm(activeFile, { force: true });
+    return [retiredFile];
+}
+/** Ids a proposal points at must be well-formed, or the bot would touch a path it cannot name safely. */
+function invalidStagedReference(memory) {
+    for (const ref of memory.supersedes ?? []) {
+        if (!isMemoryId(ref))
+            return `supersedes reference ${JSON.stringify(ref)} is not a memory id`;
+    }
+    if (memory.supersededBy !== undefined && !isMemoryId(memory.supersededBy)) {
+        return `superseded_by ${JSON.stringify(memory.supersededBy)} is not a memory id`;
+    }
+    if (memory.intent !== undefined && memory.intent !== "propose" && memory.intent !== "retire") {
+        return `intent ${JSON.stringify(memory.intent)} is not propose or retire`;
+    }
+    return undefined;
+}
+/**
+ * Validate the staging boundary before anything else runs. The lock lives in
+ * `.memory`, so a symlinked or non-directory `.memory` / `.memory/staging` (or a
+ * symlinked lock file) would redirect the lock and every staged read; those
+ * cases abort the whole run. Individual files are judged one by one: an invalid
+ * entry is reported and left untouched while valid proposals still proceed.
+ */
+async function scanStaging(projectDir) {
+    const staging = stagingDir(projectDir);
+    if ((await assertRealDir(machineDir(projectDir), ".memory")) === "missing") {
+        return { items: [], rejected: [], disappeared: [] };
+    }
+    if ((await assertRealDir(staging, ".memory/staging")) === "missing") {
+        return { items: [], rejected: [], disappeared: [] };
+    }
+    await assertRegularFileOrMissing(lockPath(projectDir), ".memory/bot.lock");
+    const names = (await fs.readdir(staging)).filter((name) => name.endsWith(".md")).sort();
+    const items = [];
+    const rejected = [];
+    const disappeared = [];
+    for (const name of names) {
+        const id = name.slice(0, -".md".length);
+        if (!isMemoryId(id)) {
+            // Only names that claim to be proposals are judged; other .md files are not ours.
+            if (name.startsWith("mem-"))
+                rejected.push({ name, reason: `${JSON.stringify(id)} is not a memory id` });
+            continue;
+        }
+        const file = path.join(staging, name);
+        const kind = await entryKind(file);
+        if (kind === "missing") {
+            disappeared.push(name);
+            continue;
+        }
+        if (kind !== "file") {
+            rejected.push({ name, reason: `expected a regular file, found ${describeKind(kind)}` });
+            continue;
+        }
+        const memory = await readMemoryFileNoFollow(file);
+        if (!memory) {
+            rejected.push({ name, reason: "not a readable memory file" });
+            continue;
+        }
+        if (memory.id !== id) {
+            rejected.push({ name, reason: `frontmatter id ${memory.id} does not match file name ${id}` });
+            continue;
+        }
+        const badReference = invalidStagedReference(memory);
+        if (badReference) {
+            rejected.push({ name, reason: badReference });
+            continue;
+        }
+        items.push({ name, memory });
+    }
+    return { items, rejected, disappeared };
+}
+/**
+ * Delete a staged file only if it is still a regular file. A symlink or a
+ * directory is left in place for a human; the proposal it replaced stays
+ * rejected rather than being followed or removed.
+ */
+async function removeStagedFile(projectDir, name, log) {
+    if ((await assertRealDir(machineDir(projectDir), ".memory")) === "missing")
+        return;
+    if ((await assertRealDir(stagingDir(projectDir), ".memory/staging")) === "missing")
+        return;
+    const file = path.join(stagingDir(projectDir), name);
+    const kind = await entryKind(file);
+    if (kind === "missing")
+        return;
+    if (kind !== "file") {
+        log(`left ${name} in staging: expected a regular file, found ${describeKind(kind)}`);
+        return;
+    }
+    await fs.rm(file, { force: true });
 }
 // ─── PR title / body template ───────────────────────────────────────────────
 const CHECKLIST = [
@@ -284,31 +572,25 @@ export async function acquireLock(projectDir) {
         await fs.rm(tmp, { force: true }).catch(() => undefined);
     }
 }
-// ─── Worktree housekeeping ───────────────────────────────────────────────────
+// ─── Worktree lifecycle ──────────────────────────────────────────────────────
 /**
- * Remove worktrees left behind by an earlier crashed run (named memory-bot-*),
- * then prune records of worktrees whose directory is gone. Safe because the
- * caller holds the single-run lock, so no live run owns one.
+ * Remove the one worktree this invocation created, using Git. Nothing here
+ * scans for or deletes other worktrees: a directory whose name happens to start
+ * with the bot's temp prefix may be the developer's checkout or an unrelated
+ * worktree holding uncommitted work, and a name is not proof of ownership.
+ *
+ * The removal is Git's decision, so a refusal (locked worktree, permissions,
+ * submodules) is honoured: the directory is logged and preserved for a human.
+ * A leftover temp directory costs disk space; guessing ownership costs the
+ * user their work.
  */
-async function cleanStaleWorktrees(cwd, log) {
-    let listing = "";
+async function removeOwnWorktree(cwd, worktree, log) {
     try {
-        listing = await git(["worktree", "list", "--porcelain"], cwd);
+        await git(["worktree", "remove", "--force", worktree], cwd);
     }
-    catch {
-        return;
+    catch (err) {
+        log(`could not remove worktree ${worktree}; leaving it in place for manual cleanup: ${err instanceof Error ? err.message : String(err)}`);
     }
-    for (const line of listing.split("\n")) {
-        if (!line.startsWith("worktree "))
-            continue;
-        const dir = line.slice("worktree ".length).trim();
-        if (!path.basename(dir).startsWith("memory-bot-"))
-            continue;
-        await git(["worktree", "remove", "--force", dir], cwd).catch(() => undefined);
-        await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
-        log(`removed stale worktree ${dir}`);
-    }
-    await git(["worktree", "prune"], cwd).catch(() => undefined);
 }
 async function remoteBranchExists(cwd, branch) {
     const out = await git(["ls-remote", "--heads", "origin", branch], cwd);
@@ -320,8 +602,9 @@ async function remoteBranchExists(cwd, branch) {
  * never touched. For each proposal:
  *   1. if its branch is already on the remote (an earlier run pushed it but did
  *      not finish), find its PR, or open one, and drop the staged file;
- *   2. otherwise branch off the fetched default branch in the worktree, apply
- *      the transform, commit, push, open PR, drop the staged file;
+ *   2. otherwise start from the fetched default branch in the worktree (detached,
+ *      no local branch), apply the transform, commit, push an explicit ref, open
+ *      PR, drop the staged file;
  *   3. on failure leave the staged file for the next run.
  */
 export async function processStagingOnce(projectDir, opts = {}) {
@@ -330,8 +613,19 @@ export async function processStagingOnce(projectDir, opts = {}) {
     const openPr = opts.openPr ?? defaultOpenPr;
     const findPr = opts.findPr ?? defaultFindPr;
     const result = { promoted: 0, skipped: 0, failed: 0, recovered: 0, prs: [] };
-    const staged = await listStagedProposals(projectDir);
-    if (staged.length === 0)
+    // Validate the staging boundary (including `.memory` itself, where the lock
+    // will be created) before taking the shared lock. An invalid staging root is
+    // a hard refusal: nothing is read, locked or changed.
+    const scan = await scanStaging(projectDir);
+    for (const name of scan.disappeared) {
+        log(`skip ${name}: disappeared while scanning`);
+        result.skipped++;
+    }
+    for (const bad of scan.rejected) {
+        log(`rejected ${bad.name}: ${bad.reason}`);
+        result.failed++;
+    }
+    if (scan.items.length === 0)
         return result;
     const release = await acquireLock(projectDir);
     if (!release) {
@@ -340,7 +634,6 @@ export async function processStagingOnce(projectDir, opts = {}) {
     }
     let worktree;
     try {
-        await cleanStaleWorktrees(cwd, log);
         const repo = await repoSlug(cwd);
         const base = await defaultBranch(cwd, repo);
         try {
@@ -356,26 +649,36 @@ export async function processStagingOnce(projectDir, opts = {}) {
         catch {
             startRef = base;
         }
-        worktree = await fs.mkdtemp(path.join(os.tmpdir(), "memory-bot-"));
-        await git(["worktree", "add", "--detach", worktree, startRef], cwd);
+        const created = await fs.mkdtemp(path.join(os.tmpdir(), "memory-bot-"));
+        try {
+            await git(["worktree", "add", "--detach", created, startRef], cwd);
+        }
+        catch (err) {
+            // Only remove the placeholder if it is still empty after the failed add.
+            await fs.rmdir(created).catch(() => undefined);
+            throw err;
+        }
+        worktree = created;
         // Process deterministically (by id) so behaviour is stable across runs.
-        for (const memory of [...staged].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
+        for (const item of [...scan.items].sort((a, b) => (a.memory.id < b.memory.id ? -1 : a.memory.id > b.memory.id ? 1 : 0))) {
+            const { name, memory } = item;
             const branch = branchFor(memory);
             const title = buildPrTitle(memory);
             const body = buildPrBody(memory);
             try {
                 if (await remoteBranchExists(cwd, branch)) {
                     const url = (await findPr({ cwd: worktree, ...(repo ? { repo } : {}), branch })) ?? (await openPr({ cwd: worktree, ...(repo ? { repo } : {}), base, branch, title, body }));
-                    await fs.rm(path.join(stagingDir(projectDir), `${memory.id}.md`), { force: true });
+                    await removeStagedFile(projectDir, name, log);
                     log(`recovered ${memory.id}: branch ${branch} was already pushed${url ? ` ${url}` : ""}`);
                     result.recovered++;
                     if (url)
                         result.prs.push(url);
                     continue;
                 }
-                // A local branch that never reached the remote must not block a fresh attempt.
-                await git(["branch", "-D", branch], cwd).catch(() => undefined);
-                await git(["checkout", "-b", branch, startRef], worktree);
+                // Commit on a detached HEAD and push an explicit ref. A prior crashed run
+                // may still hold a `memory/<id>` branch checked out in its leftover
+                // worktree; that leftover is preserved (not deleted), so depending on the
+                // local branch would block every later attempt.
                 const changed = memory.intent === "retire" ? await applyRetire(worktree, memory) : await applyPropose(worktree, memory);
                 if (changed.length === 0) {
                     log(`skip ${memory.id}: nothing to change`);
@@ -384,9 +687,9 @@ export async function processStagingOnce(projectDir, opts = {}) {
                 }
                 await git(["add", "--all", "memory"], worktree);
                 await git(["commit", "-m", commitMessage(memory)], worktree);
-                await git(["push", "-u", "origin", branch], worktree);
+                await git(["push", "origin", `HEAD:refs/heads/${branch}`], worktree);
                 const url = await openPr({ cwd: worktree, ...(repo ? { repo } : {}), base, branch, title, body });
-                await fs.rm(path.join(stagingDir(projectDir), `${memory.id}.md`), { force: true });
+                await removeStagedFile(projectDir, name, log);
                 log(`promoted ${memory.id} (${memory.intent === "retire" ? "retire" : "propose"})${url ? ` ${url}` : ""}`);
                 result.promoted++;
                 if (url)
@@ -397,19 +700,23 @@ export async function processStagingOnce(projectDir, opts = {}) {
                 result.failed++;
             }
             finally {
-                await git(["checkout", "--detach", startRef], worktree).catch(() => undefined);
-                // The local branch is not needed once pushed; a pushed branch is found again on the remote next run.
-                await git(["branch", "-D", branch], cwd).catch(() => undefined);
+                // Restore this run's own throwaway worktree to the fetched default branch
+                // so the next proposal starts clean. Any commit already pushed lives on
+                // the remote, and a half-applied failed attempt must not leak into the
+                // next proposal's PR.
+                await git(["reset", "--hard", startRef], worktree);
+                await git(["clean", "-fd", "--", "memory"], worktree);
             }
         }
     }
     finally {
-        if (worktree) {
-            await git(["worktree", "remove", "--force", worktree], cwd).catch(() => undefined);
-            await fs.rm(worktree, { recursive: true, force: true }).catch(() => undefined);
+        try {
+            if (worktree)
+                await removeOwnWorktree(cwd, worktree, log);
         }
-        await git(["worktree", "prune"], cwd).catch(() => undefined);
-        await release();
+        finally {
+            await release();
+        }
     }
     return result;
 }
@@ -461,7 +768,7 @@ async function main() {
                 console.log(`promoted ${result.promoted} proposal${result.promoted === 1 ? "" : "s"}`);
             else if (result.skipped > 0)
                 console.log(`skipped ${result.skipped} proposal${result.skipped === 1 ? "" : "s"}`);
-            else
+            else if (result.failed === 0 && result.recovered === 0)
                 console.log("no staged proposals");
             if (result.failed > 0) {
                 console.error(`${result.failed} proposal${result.failed === 1 ? "" : "s"} failed; left in staging`);
@@ -489,9 +796,18 @@ async function main() {
             process.exitCode = 2;
     }
 }
-// Run the CLI only when executed directly (not when imported by tests).
-const isMain = process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (isMain) {
+// npm bin links can leave argv[1] pointing at the link, not this module.
+function isMain() {
+    if (process.argv[1] === undefined)
+        return false;
+    try {
+        return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+    }
+    catch {
+        return false;
+    }
+}
+if (isMain()) {
     main().catch((err) => {
         console.error(err instanceof Error ? err.message : String(err));
         process.exitCode = 1;

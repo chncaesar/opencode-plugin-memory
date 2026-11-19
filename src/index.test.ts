@@ -232,6 +232,60 @@ describe("plugin entry", () => {
   })
 })
 
+describe("normal conversation survives memory-store read failures", () => {
+  async function transformText(hooks: any): Promise<string> {
+    const out = { system: [] as string[] }
+    await hooks["experimental.chat.system.transform"]({ sessionID: "ses_x", model: {} as never }, out)
+    return out.system.join("\n")
+  }
+
+  async function logText(dir: string): Promise<string> {
+    return fs.readFile(path.join(dir, ".memory", "plugin.log"), "utf8").catch(() => "")
+  }
+
+  it("keeps the policy when memory/active cannot be listed, logging the cause instead of prompting it", async () => {
+    await withDir(async (dir) => {
+      await fs.mkdir(path.dirname(activeDir(dir)), { recursive: true })
+      await fs.writeFile(activeDir(dir), "not a directory", "utf8")
+      const hooks = await server(fakeInput(dir))
+
+      const text = await transformText(hooks)
+      assert.match(text, /PR-gated project memory system/)
+      assert.match(text, /memory index unavailable/)
+      assert.ok(!/ENOTDIR|EACCES|no such file/i.test(text))
+      assert.match(await logText(dir), /ERROR.*\bENOTDIR\b/)
+    })
+  })
+
+  it("keeps the readable entries when one entry file is unreadable", async () => {
+    await withDir(async (dir) => {
+      await seedStale(dir)
+      await fs.mkdir(path.join(activeDir(dir), "mem-bbbbbbbb.md"))
+      const hooks = await server(fakeInput(dir))
+
+      const text = await transformText(hooks)
+      assert.match(text, /Ancient rule/)
+      assert.match(text, /1 memory file could not be read/)
+      assert.ok(!/EISDIR/.test(text))
+      assert.match(await logText(dir), /ERROR.*\bEISDIR\b/)
+    })
+  })
+
+  it("still injects the policy when the staging folder is unreadable", async () => {
+    await withDir(async (dir) => {
+      await seedStale(dir)
+      await fs.mkdir(path.dirname(stagingDir(dir)), { recursive: true })
+      await fs.writeFile(stagingDir(dir), "not a directory", "utf8")
+      const hooks = await server(fakeInput(dir))
+
+      const text = await transformText(hooks)
+      assert.match(text, /Ancient rule/)
+      assert.match(text, /PR-gated project memory system/)
+      assert.ok(!/Call memory_publish/.test(text))
+    })
+  })
+})
+
 describe("V2 entry", () => {
   function mockCtx(dir: string, options?: Record<string, unknown>) {
     const tools: Record<string, any> = {}
@@ -290,6 +344,22 @@ describe("V2 entry", () => {
       const m = mockCtx(dir, { backgroundAudit: false })
       await setup(m.ctx as never)
       assert.equal(m.hooks["experimental.idle"], undefined)
+    })
+  })
+
+  it("keeps the memory context working when the active store cannot be read", async () => {
+    await withDir(async (dir) => {
+      await fs.mkdir(path.dirname(activeDir(dir)), { recursive: true })
+      await fs.writeFile(activeDir(dir), "not a directory", "utf8")
+      const m = mockCtx(dir)
+      const cleanup = await setup(m.ctx as never)
+
+      const event = { sessionID: "s1", system: [] as Array<{ type: string; text: string }> }
+      await m.hooks["context"]!(event)
+      assert.equal(event.system.length, 1)
+      assert.match(event.system[0]!.text, /memory index unavailable/)
+      assert.ok(!/ENOTDIR|EACCES/.test(event.system[0]!.text))
+      await cleanup()
     })
   })
 })

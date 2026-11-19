@@ -28,7 +28,7 @@ LLM 从不直接写入共享事实，它只能把一条提议写成文件，丢�
 opencode plugin add @chncaesar/opencode-plugin-memory@latest
 ```
 
-适用于 OpenCode 2.x。1.x 的配置键是单数（`plugin`）；两个版本使用的包名都是 `@chncaesar/opencode-plugin-memory`。改完要重启 OpenCode。手写配置、从本地目录加载、以及全部插件选项，见[使用手册](https://chncaesar.github.io/opencode-plugin-memory/)。
+本插件仅支持 OpenCode 2.x。手写配置、从本地目录加载和全部插件选项，请参阅[使用手册](https://chncaesar.github.io/opencode-plugin-memory/)。
 
 ## 开发
 

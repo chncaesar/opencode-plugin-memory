@@ -101,17 +101,13 @@ Full bodies load only on demand via `memory_read`. Nothing is written: the index
 
 ## Configuration
 
-In `opencode.json` / `opencode.jsonc`. OpenCode 2.x uses `plugins` (plural) with an object entry for options; 1.x uses `plugin` (singular) with a `[package, options]` pair:
+See the [user guide](docs/index.md#before-you-begin) for supported host versions. In `opencode.json` / `opencode.jsonc`, use `plugins` (plural) with an object entry for options:
 
 ```jsonc
-// OpenCode 2.x
 "plugins": [{ "package": "@chncaesar/opencode-plugin-memory", "options": { "maxSummaryChars": 3000 } }]
-
-// OpenCode 1.x
-"plugin": [["@chncaesar/opencode-plugin-memory", { "maxSummaryChars": 3000 }]]
 ```
 
-The plugin registers `setup` for the V2 loader and `server` for the V1 loader, so both work from one entry point.
+The supported loader uses `setup`. The legacy `server` entry is not a support guarantee.
 
 Options (all optional; see `types.ts` `PluginConfig` / `resolveConfig`):
 

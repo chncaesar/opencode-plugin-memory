@@ -1,4 +1,5 @@
 import fs from "fs/promises";
+import { constants as fsConstants } from "fs";
 import path from "path";
 import crypto from "crypto";
 import { execFile } from "child_process";
@@ -146,6 +147,16 @@ function frontmatterToMemory(fm) {
 export function serializeMemory(memory) {
     return serializeFrontmatter(memoryToFrontmatter(memory), memory.body);
 }
+function parseMemoryText(text) {
+    const parsed = parseFrontmatter(text);
+    if (!parsed)
+        return null;
+    const memory = frontmatterToMemory(parsed.frontmatter);
+    if (!memory)
+        return null;
+    memory.body = parsed.body;
+    return memory;
+}
 /** Read a single memory file; `null` if missing or invalid (bad/missing frontmatter). */
 export async function readMemoryFile(filePath) {
     let text;
@@ -157,19 +168,41 @@ export async function readMemoryFile(filePath) {
             return null;
         throw err;
     }
-    const parsed = parseFrontmatter(text);
-    if (!parsed)
-        return null;
-    const memory = frontmatterToMemory(parsed.frontmatter);
-    if (!memory)
-        return null;
-    memory.body = parsed.body;
-    return memory;
+    return parseMemoryText(text);
+}
+/**
+ * Read a single memory file, refusing to follow a symlink at `filePath`.
+ * Only the leaf is protected: parent directories are the caller's concern.
+ * `null` when the file is missing, invalid, or a symlink (`ELOOP`).
+ *
+ * Used by the bot, which must not let a staged or committed path redirect a
+ * read outside the memory store.
+ */
+export async function readMemoryFileNoFollow(filePath) {
+    const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
+    let handle;
+    try {
+        handle = await fs.open(filePath, flags);
+    }
+    catch (err) {
+        if (isNodeError(err) && (err.code === "ENOENT" || err.code === "ELOOP"))
+            return null;
+        throw err;
+    }
+    try {
+        return parseMemoryText(await handle.readFile("utf8"));
+    }
+    finally {
+        await handle.close();
+    }
+}
+function isMemoryFileName(name) {
+    return name.startsWith("mem-") && name.endsWith(".md");
 }
 async function listFiles(dir) {
     try {
         const names = await fs.readdir(dir);
-        return names.filter((n) => n.startsWith("mem-") && n.endsWith(".md"));
+        return names.filter(isMemoryFileName);
     }
     catch (err) {
         if (isNodeError(err) && err.code === "ENOENT")
@@ -199,6 +232,46 @@ export function listRetiredMemories(projectDir) {
 export function listStagedProposals(projectDir) {
     return readMemories(stagingDir(projectDir));
 }
+function causeCode(err) {
+    return isNodeError(err) && typeof err.code === "string" ? err.code : "error";
+}
+/**
+ * Read the memories in `dir` without throwing. An unreadable folder yields an
+ * empty listing with one problem; an unreadable or invalid entry is skipped and
+ * reported while the remaining memories are still returned.
+ */
+export async function readMemoriesTolerant(dir) {
+    let names;
+    try {
+        names = await fs.readdir(dir);
+    }
+    catch (err) {
+        if (isNodeError(err) && err.code === "ENOENT") {
+            return { memories: [], problems: [], folderUnreadable: false };
+        }
+        return { memories: [], problems: [{ file: dir, code: causeCode(err) }], folderUnreadable: true };
+    }
+    const memories = [];
+    const problems = [];
+    for (const name of names.filter(isMemoryFileName)) {
+        const filePath = path.join(dir, name);
+        try {
+            const memory = await readMemoryFile(filePath);
+            if (memory)
+                memories.push(memory);
+            else
+                problems.push({ file: filePath, code: "invalid" });
+        }
+        catch (err) {
+            problems.push({ file: filePath, code: causeCode(err) });
+        }
+    }
+    return { memories, problems, folderUnreadable: false };
+}
+/** Tolerant read of the committed active store, for the prompt index. */
+export function listActiveMemoriesForIndex(projectDir) {
+    return readMemoriesTolerant(activeDir(projectDir));
+}
 /** Read one memory by id from active, then retired, then staging. */
 export async function readMemoryById(projectDir, id) {
     const locations = [
@@ -225,10 +298,29 @@ export class StoreWriteError extends Error {
         this.name = "StoreWriteError";
     }
 }
-/** Write a memory file into `dir` (creating it). Used by migration and the bot. */
+/** Publish a complete memory file into `dir` (creating it). */
 export async function writeMemoryFile(dir, memory) {
+    if (!isMemoryId(memory.id))
+        throw new Error("Invalid memory ID");
+    const text = serializeMemory(memory);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, `${memory.id}.md`), serializeMemory(memory), "utf8");
+    const target = path.join(dir, `${memory.id}.md`);
+    // Readers only enumerate mem-*.md; keep unfinished writes out of sight.
+    const temp = path.join(dir, `.memory-write-${crypto.randomUUID()}.tmp`);
+    const handle = await fs.open(temp, "wx");
+    try {
+        try {
+            await handle.writeFile(text, "utf8");
+        }
+        finally {
+            await handle.close();
+        }
+        await fs.rename(temp, target);
+    }
+    catch (err) {
+        await fs.rm(temp, { force: true }).catch(() => undefined);
+        throw err;
+    }
 }
 /**
  * Write a proposal file to `.memory/staging/`. Unwritable/read-only paths raise

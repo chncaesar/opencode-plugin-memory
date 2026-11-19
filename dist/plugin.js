@@ -1,6 +1,6 @@
 import { DEFAULT_CONFIG } from "./types.js";
 import { createMemoryTools } from "./tools.js";
-import { loadMemoryBlock } from "./summary.js";
+import { buildSystemPrompt, loadMemoryBlock } from "./summary.js";
 import { listStagedProposals } from "./storage.js";
 import { createLogger } from "./logging.js";
 import { migrateLegacyStores } from "./migrate.js";
@@ -94,17 +94,31 @@ export function resolveAuditCall(config, hostCall) {
  * `memory/active/` (titles and ids only, never full bodies) plus the writing
  * policy. Nothing is written to disk: running OpenCode in a directory must not
  * create or modify a `memory/` folder there.
+ *
+ * This runs inside the system-prompt hook, so it must never throw: an unreadable
+ * memory store is a diagnostic, not a reason to break a normal conversation. A
+ * store that cannot be read degrades to the policy alone, and the filesystem
+ * detail goes to the machine-local log, never into the prompt.
  */
-async function injectMemoryBlock(directory, config) {
-    const block = await loadMemoryBlock(directory, config.maxSummaryChars);
-    const notices = [block];
-    const warning = await auditWarning(directory, config).catch(() => null);
-    if (warning)
-        notices.push(warning);
-    const pending = await pendingPublishNotice(directory).catch(() => null);
-    if (pending)
-        notices.push(pending);
-    return notices.join("\n\n");
+async function injectMemoryBlock(directory, config, logger) {
+    try {
+        const block = await loadMemoryBlock(directory, config.maxSummaryChars, async (problems) => {
+            for (const problem of problems)
+                await logger.error("index", `${problem.code} ${problem.file}`);
+        });
+        const notices = [block];
+        const warning = await auditWarning(directory, config).catch(() => null);
+        if (warning)
+            notices.push(warning);
+        const pending = await pendingPublishNotice(directory).catch(() => null);
+        if (pending)
+            notices.push(pending);
+        return notices.join("\n\n");
+    }
+    catch (err) {
+        await logger.error("system-prompt", err);
+        return buildSystemPrompt([], config.maxSummaryChars, { indexUnavailable: true });
+    }
 }
 /**
  * Tell the model when staged proposals have no pull request yet. The background
@@ -193,7 +207,7 @@ export const server = async (input, options) => {
         "experimental.chat.system.transform": async (hookInput, output) => {
             if (hookInput.sessionID && auditSessions.has(hookInput.sessionID))
                 return;
-            output.system.push(await injectMemoryBlock(directory, config));
+            output.system.push(await injectMemoryBlock(directory, config, logger));
         },
     };
     return hooks;
@@ -296,7 +310,7 @@ export async function setup(ctx) {
         }
     }));
     registrations.push(await ctx.session.hook("context", async (event) => {
-        event.system.push({ type: "text", text: await injectMemoryBlock(directory, config) });
+        event.system.push({ type: "text", text: await injectMemoryBlock(directory, config, logger) });
     }));
     if (config.backgroundAudit) {
         registrations.push(await ctx.session.hook("experimental.idle", (event) => {

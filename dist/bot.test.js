@@ -3,9 +3,10 @@ import assert from "node:assert/strict";
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
-import { execFileSync } from "child_process";
+import { execFileSync, spawnSync } from "child_process";
+import { fileURLToPath } from "url";
 import { acquireLock, applyPropose, applyRetire, branchFor, buildPrBody, buildPrCreateArgs, buildPrListArgs, buildPrTitle, defaultBranch, parseRemoteUrl, processStagingOnce } from "./bot.js";
-import { activeDir, listActiveMemories, listRetiredMemories, stagingDir, writeMemoryFile, writeProposal } from "./storage.js";
+import { activeDir, listActiveMemories, listRetiredMemories, retiredDir, stagingDir, writeMemoryFile, writeProposal } from "./storage.js";
 async function withDir(fn) {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mem-bot-"));
     try {
@@ -15,6 +16,16 @@ async function withDir(fn) {
         await fs.rm(dir, { recursive: true, force: true });
     }
 }
+it("prints CLI help when launched through an npm-style bin symlink", { skip: process.platform === "win32" }, async () => {
+    await withDir(async (dir) => {
+        const bin = path.join(dir, "opencode-memory-bot");
+        await fs.symlink(fileURLToPath(new URL("./bot.js", import.meta.url)), bin);
+        const run = spawnSync(process.execPath, [bin, "--help"], { cwd: dir, encoding: "utf8" });
+        assert.ifError(run.error);
+        assert.equal(run.status, 0, run.stderr);
+        assert.match(run.stderr, /Usage:/);
+    });
+});
 function active(id, title, body = "content") {
     return { id, title, body, proposedAt: "2026-01-01", approvedAt: "2026-01-01" };
 }
@@ -186,9 +197,9 @@ describe("processStagingOnce (worktree isolation)", () => {
 // ─── helpers for the git-backed tests below ──────────────────────────────────
 const sh = (cwd, ...args) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 /** A project repo with a bare remote, an initial commit and (optionally) active memories on main. */
-async function setupRepo(root, activeMemories = []) {
+async function setupRepo(root, activeMemories = [], name = "repo") {
     const remote = path.join(root, "remote.git");
-    const repo = path.join(root, "repo");
+    const repo = path.join(root, name);
     await fs.mkdir(repo);
     sh(root, "init", "--bare", "-b", "main", remote);
     sh(repo, "init", "-b", "main");
@@ -204,6 +215,60 @@ async function setupRepo(root, activeMemories = []) {
     return repo;
 }
 const quiet = () => undefined;
+describe("failure isolation between proposals", () => {
+    it("a proposal that fails at the commit step leaves no trace in the next proposal's commit", async () => {
+        await withDir(async (root) => {
+            const repo = await setupRepo(root);
+            const remote = path.join(root, "remote.git");
+            // Synthetic, network-free commit failure: a pre-commit hook (shared with the
+            // bot's worktree) refuses only proposal A's commit, and only after A's files
+            // have already been written and staged. The hook matches on an exact staged
+            // set, so a leaked A file would make B's commit pass the hook instead — which
+            // is what makes the diff assertion below able to catch the leak.
+            const hook = path.join(repo, ".git", "hooks", "pre-commit");
+            await fs.writeFile(hook, [
+                "#!/bin/sh",
+                'staged=$(git diff --cached --name-only -- memory)',
+                'if [ "$staged" = "memory/active/mem-aaaa0001.md" ]; then',
+                '  echo "synthetic commit failure" >&2',
+                "  exit 1",
+                "fi",
+                "exit 0",
+                "",
+            ].join("\n"), "utf8");
+            await fs.chmod(hook, 0o755);
+            await writeProposal(repo, { id: "mem-aaaa0001", title: "A", body: "body a", proposedAt: "2026-01-01", intent: "propose" });
+            await writeProposal(repo, { id: "mem-bbbb0002", title: "B", body: "body b", proposedAt: "2026-01-01", intent: "propose" });
+            const logs = [];
+            const prs = [];
+            const res = await processStagingOnce(repo, {
+                log: (line) => logs.push(line),
+                findPr: async () => null,
+                openPr: async (r) => {
+                    prs.push(r.branch);
+                    return `https://example.test/pr/${prs.length}`;
+                },
+            });
+            // A failed after its filesystem changes were applied; B still succeeded.
+            assert.equal(res.failed, 1);
+            assert.equal(res.promoted, 1);
+            assert.deepEqual(prs, ["memory/mem-bbbb0002"]);
+            assert.ok(logs.some((line) => line.includes("failed mem-aaaa0001")), logs.join(" | "));
+            // A stays staged for the next run; B was published and dropped.
+            await fs.access(path.join(stagingDir(repo), "mem-aaaa0001.md"));
+            await assert.rejects(fs.access(path.join(stagingDir(repo), "mem-bbbb0002.md")));
+            // A never reached the remote.
+            assert.equal(sh(repo, "ls-remote", "--heads", "origin", "memory/mem-aaaa0001"), "");
+            // B's actual committed diff carries B and only B — no leaked A file.
+            assert.deepEqual(sh(remote, "diff", "--name-only", "main", "memory/mem-bbbb0002").split("\n"), [
+                "memory/active/mem-bbbb0002.md",
+            ]);
+            const committed = sh(remote, "show", "memory/mem-bbbb0002:memory/active/mem-bbbb0002.md");
+            assert.match(committed, /body b/);
+            assert.doesNotMatch(committed, /mem-aaaa0001/);
+        });
+    });
+});
 describe("branch names", () => {
     it("keeps memory/<id> for proposals and gives retires their own namespace", () => {
         const base = { id: "mem-aaaaaaaa", title: "t", body: "", proposedAt: "2026-11-12T10:20:30.000Z" };
@@ -320,18 +385,93 @@ describe("recovery of an already-pushed proposal", () => {
         });
     });
 });
-describe("stale worktrees", () => {
-    it("removes a worktree left by a crashed run and still publishes", async () => {
+describe("worktree ownership", () => {
+    it("publishes from a checkout whose directory name starts with the bot's temp prefix", async () => {
         await withDir(async (root) => {
-            const repo = await setupRepo(root);
-            const leftover = await fs.mkdtemp(path.join(os.tmpdir(), "memory-bot-"));
-            sh(repo, "worktree", "add", "-b", "memory/mem-gggggggg", leftover, "main"); // crashed run: branch checked out there
-            await writeProposal(repo, { id: "mem-gggggggg", title: "G", body: "g", proposedAt: "2026-01-01", intent: "propose" });
-            const res = await processStagingOnce(repo, { log: quiet, findPr: async () => null, openPr: async () => "https://example.test/pr/5" });
+            const repo = await setupRepo(root, [], "memory-bot-primary");
+            sh(repo, "checkout", "-b", "feature");
+            await fs.writeFile(path.join(repo, "wip.txt"), "uncommitted work");
+            await writeProposal(repo, { id: "mem-jjjjjjjj", title: "J", body: "j", proposedAt: "2026-01-01", intent: "propose" });
+            const res = await processStagingOnce(repo, { log: quiet, findPr: async () => null, openPr: async () => "https://example.test/pr/7" });
             assert.equal(res.promoted, 1);
             assert.equal(res.failed, 0);
-            assert.ok(!sh(repo, "worktree", "list").includes("memory-bot-"));
-            await assert.rejects(fs.access(leftover));
+            // The checkout itself is untouched: same branch, same edits, no extra worktree.
+            assert.equal(sh(repo, "rev-parse", "--abbrev-ref", "HEAD"), "feature");
+            assert.equal(await fs.readFile(path.join(repo, "wip.txt"), "utf8"), "uncommitted work");
+            assert.equal(sh(repo, "worktree", "list").split("\n").length, 1);
+        });
+    });
+    it("leaves an unrelated linked worktree with the same prefix and uncommitted changes alone", async () => {
+        await withDir(async (root) => {
+            const repo = await setupRepo(root);
+            const unrelated = path.join(root, "memory-bot-scratch");
+            sh(repo, "worktree", "add", "-b", "scratch", unrelated, "main");
+            await fs.writeFile(path.join(unrelated, "notes.txt"), "user work");
+            await writeProposal(repo, { id: "mem-kkkkkkkk", title: "K", body: "k", proposedAt: "2026-01-01", intent: "propose" });
+            try {
+                const res = await processStagingOnce(repo, { log: quiet, findPr: async () => null, openPr: async () => "https://example.test/pr/8" });
+                assert.equal(res.promoted, 1);
+                assert.equal(res.failed, 0);
+                assert.equal(await fs.readFile(path.join(unrelated, "notes.txt"), "utf8"), "user work");
+                assert.match(sh(repo, "worktree", "list"), /memory-bot-scratch/);
+            }
+            finally {
+                sh(repo, "worktree", "remove", "--force", unrelated);
+            }
+        });
+    });
+    it("preserves the current run's worktree when Git refuses to remove it", async () => {
+        await withDir(async (root) => {
+            const repo = await setupRepo(root);
+            await writeProposal(repo, { id: "mem-llllllll", title: "L", body: "l", proposedAt: "2026-01-01", intent: "propose" });
+            const logs = [];
+            let temp = "";
+            try {
+                const res = await processStagingOnce(repo, {
+                    log: (line) => logs.push(line),
+                    findPr: async () => null,
+                    openPr: async (r) => {
+                        temp = r.cwd;
+                        // A locked worktree makes `git worktree remove --force` refuse.
+                        execFileSync("git", ["worktree", "lock", "."], { cwd: r.cwd });
+                        return "https://example.test/pr/9";
+                    },
+                });
+                assert.equal(res.promoted, 1);
+                assert.ok(temp, "the run used a worktree");
+                await fs.access(temp); // still on disk
+                assert.match(sh(repo, "worktree", "list"), new RegExp(temp.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+                assert.ok(logs.some((line) => line.includes("could not remove worktree") && line.includes(temp)), `expected a preservation log line, got: ${logs.join(" | ")}`);
+            }
+            finally {
+                if (temp) {
+                    try {
+                        sh(repo, "worktree", "remove", "--force", "--force", temp);
+                    }
+                    catch {
+                        // fixture teardown only
+                    }
+                    await fs.rm(temp, { recursive: true, force: true });
+                }
+            }
+        });
+    });
+    it("publishes even when a preserved crashed-run worktree still holds the local proposal branch", async () => {
+        await withDir(async (root) => {
+            const repo = await setupRepo(root);
+            const leftover = path.join(root, "memory-bot-crashed");
+            sh(repo, "worktree", "add", "-b", "memory/mem-mmmmmmmm", leftover, "main");
+            await writeProposal(repo, { id: "mem-mmmmmmmm", title: "M", body: "m", proposedAt: "2026-01-01", intent: "propose" });
+            try {
+                const res = await processStagingOnce(repo, { log: quiet, findPr: async () => null, openPr: async () => "https://example.test/pr/10" });
+                assert.equal(res.promoted, 1);
+                assert.equal(res.failed, 0);
+                assert.match(sh(repo, "ls-remote", "--heads", "origin", "memory/mem-mmmmmmmm"), /memory\/mem-mmmmmmmm/);
+                await fs.access(leftover); // preserved, not deleted
+            }
+            finally {
+                sh(repo, "worktree", "remove", "--force", leftover);
+            }
         });
     });
 });
@@ -399,6 +539,142 @@ describe("single-run lock", () => {
             await writeProposal(notARepo, { id: "mem-iiiiiiii", title: "I", body: "i", proposedAt: "2026-01-01", intent: "propose" });
             await assert.rejects(processStagingOnce(notARepo, { log: quiet, findPr: async () => null, openPr: async () => "x" }));
             await assert.rejects(fs.access(lockFile(notARepo)));
+        });
+    });
+});
+describe("filesystem boundary", () => {
+    const stagedFile = (repo, name) => path.join(stagingDir(repo), name);
+    it("applyPropose refuses a symlinked active file and leaves its target alone", async () => {
+        await withDir(async (dir) => {
+            const sentinel = path.join(dir, "sentinel.txt");
+            await fs.writeFile(sentinel, "keep me");
+            await fs.mkdir(activeDir(dir), { recursive: true });
+            await fs.symlink(sentinel, path.join(activeDir(dir), "mem-aaaa0001.md"));
+            await assert.rejects(applyPropose(dir, { id: "mem-aaaa0001", title: "T", body: "b", intent: "propose" }), /not a regular file/);
+            assert.equal(await fs.readFile(sentinel, "utf8"), "keep me");
+            assert.equal((await fs.lstat(path.join(activeDir(dir), "mem-aaaa0001.md"))).isSymbolicLink(), true);
+        });
+    });
+    it("applyPropose refuses a symlinked active directory before writing", async () => {
+        await withDir(async (dir) => {
+            const elsewhere = path.join(dir, "elsewhere");
+            await fs.mkdir(elsewhere);
+            await fs.mkdir(path.join(dir, "memory"));
+            await fs.symlink(elsewhere, activeDir(dir));
+            await assert.rejects(applyPropose(dir, { id: "mem-aaaa0001", title: "T", body: "b", intent: "propose" }), /not a real directory/);
+            assert.deepEqual(await fs.readdir(elsewhere), []);
+        });
+    });
+    it("applyPropose refuses an invalid supersedes reference before writing", async () => {
+        await withDir(async (dir) => {
+            await assert.rejects(applyPropose(dir, { id: "mem-aaaa0001", title: "T", body: "b", supersedes: ["not-a-memory-id"], intent: "propose" }), /is not a memory id/);
+            await assert.rejects(fs.access(path.join(activeDir(dir), "mem-aaaa0001.md")));
+        });
+    });
+    it("applyRetire refuses a symlinked active memory and leaves it in place", async () => {
+        await withDir(async (dir) => {
+            const sentinel = path.join(dir, "sentinel.txt");
+            await fs.writeFile(sentinel, "keep me");
+            await fs.mkdir(activeDir(dir), { recursive: true });
+            await fs.symlink(sentinel, path.join(activeDir(dir), "mem-aaaa0001.md"));
+            await assert.rejects(applyRetire(dir, { id: "mem-aaaa0001", title: "T", body: "", intent: "retire", retiredReason: "stale" }), /not a regular file/);
+            assert.equal(await fs.readFile(sentinel, "utf8"), "keep me");
+            await assert.rejects(fs.access(path.join(retiredDir(dir), "mem-aaaa0001.md")));
+        });
+    });
+    it("rejects a symlinked staged proposal without opening a PR or taking the lock", async () => {
+        await withDir(async (dir) => {
+            const sentinel = path.join(dir, "sentinel.txt");
+            await fs.writeFile(sentinel, "keep me");
+            await fs.mkdir(stagingDir(dir), { recursive: true });
+            const link = stagedFile(dir, "mem-aaaa0001.md");
+            await fs.symlink(sentinel, link);
+            let opened = 0;
+            const res = await processStagingOnce(dir, {
+                log: quiet,
+                openPr: async () => {
+                    opened++;
+                    return "https://example.test/pr/1";
+                },
+            });
+            assert.equal(res.failed, 1);
+            assert.equal(res.promoted, 0);
+            assert.equal(opened, 0);
+            assert.equal(await fs.readFile(sentinel, "utf8"), "keep me");
+            assert.equal((await fs.lstat(link)).isSymbolicLink(), true);
+            await assert.rejects(fs.access(path.join(dir, ".memory", "bot.lock")));
+        });
+    });
+    it("rejects a directory that claims to be a staged proposal", async () => {
+        await withDir(async (dir) => {
+            const bogus = stagedFile(dir, "mem-aaaa0001.md");
+            await fs.mkdir(bogus, { recursive: true });
+            const res = await processStagingOnce(dir, { log: quiet, openPr: async () => "https://example.test/pr/1" });
+            assert.equal(res.failed, 1);
+            assert.equal(res.promoted, 0);
+            assert.equal((await fs.lstat(bogus)).isDirectory(), true);
+        });
+    });
+    it("rejects a staged file whose frontmatter id disagrees with its name", async () => {
+        await withDir(async (dir) => {
+            const file = stagedFile(dir, "mem-aaaa0001.md");
+            await fs.mkdir(stagingDir(dir), { recursive: true });
+            await fs.writeFile(file, "---\nid: mem-bbbb0002\ntitle: X\nintent: propose\n---\nbody\n");
+            const res = await processStagingOnce(dir, { log: quiet, openPr: async () => "https://example.test/pr/1" });
+            assert.equal(res.failed, 1);
+            assert.equal(res.promoted, 0);
+            await fs.access(file); // preserved for a human
+        });
+    });
+    it("rejects a staged proposal with an invalid supersedes reference", async () => {
+        await withDir(async (dir) => {
+            const file = stagedFile(dir, "mem-aaaa0001.md");
+            await fs.mkdir(stagingDir(dir), { recursive: true });
+            await fs.writeFile(file, "---\nid: mem-aaaa0001\ntitle: X\nintent: propose\nsupersedes:\n  - not-a-memory-id\n---\nbody\n");
+            const res = await processStagingOnce(dir, { log: quiet, openPr: async () => "https://example.test/pr/1" });
+            assert.equal(res.failed, 1);
+            assert.equal(res.promoted, 0);
+            await fs.access(file);
+        });
+    });
+    it("refuses a symlinked staging directory before taking the lock", async () => {
+        await withDir(async (dir) => {
+            const elsewhere = path.join(dir, "elsewhere");
+            await fs.mkdir(elsewhere);
+            await fs.writeFile(path.join(elsewhere, "mem-aaaa0001.md"), "---\nid: mem-aaaa0001\ntitle: X\nintent: propose\n---\nbody\n");
+            await fs.mkdir(path.join(dir, ".memory"));
+            await fs.symlink(elsewhere, path.join(dir, ".memory", "staging"));
+            await assert.rejects(processStagingOnce(dir, { log: quiet }), /not a real directory/);
+            await assert.rejects(fs.access(path.join(dir, ".memory", "bot.lock")));
+            assert.equal((await fs.lstat(path.join(dir, ".memory", "staging"))).isSymbolicLink(), true);
+            await fs.access(path.join(elsewhere, "mem-aaaa0001.md"));
+        });
+    });
+    it("does not recover an already-pushed branch for a proposal that fails validation", async () => {
+        await withDir(async (root) => {
+            const repo = await setupRepo(root);
+            // The branch a real proposal with this file name would have pushed.
+            sh(repo, "push", "origin", "main:refs/heads/memory/mem-aaaa0001");
+            const file = stagedFile(repo, "mem-aaaa0001.md");
+            await fs.mkdir(stagingDir(repo), { recursive: true });
+            await fs.writeFile(file, "---\nid: mem-cccc0003\ntitle: X\nintent: propose\n---\nbody\n");
+            let opened = 0;
+            const res = await processStagingOnce(repo, {
+                log: quiet,
+                findPr: async () => {
+                    throw new Error("must not look up a PR for a rejected proposal");
+                },
+                openPr: async () => {
+                    opened++;
+                    return "https://example.test/pr/1";
+                },
+            });
+            assert.equal(res.recovered, 0);
+            assert.equal(res.promoted, 0);
+            assert.equal(res.failed, 1);
+            assert.equal(opened, 0);
+            await fs.access(file); // still staged
+            assert.match(sh(repo, "ls-remote", "--heads", "origin", "memory/mem-aaaa0001"), /memory\/mem-aaaa0001/);
         });
     });
 });

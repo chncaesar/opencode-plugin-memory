@@ -8,6 +8,7 @@ import {
   generateMemoryId,
   isMemoryId,
   listActiveMemories,
+  listActiveMemoriesForIndex,
   listRetiredMemories,
   listStagedProposals,
   memoryAge,
@@ -116,6 +117,36 @@ describe("writeProposal and staging", () => {
     })
   })
 
+  it("keeps an in-progress reader on the complete old proposal while publishing a replacement", { skip: process.platform === "win32" }, async () => {
+    await withDir(async (dir) => {
+      const proposal: Memory = { id: "mem-aaaaaaaa", title: "Rule", body: "Original proposal", intent: "propose" }
+      await writeProposal(dir, proposal)
+      const name = `${proposal.id}.md`
+      const reader = await fs.open(path.join(stagingDir(dir), name), "r")
+      try {
+        const original = await reader.readFile("utf8")
+        const body = "Complete replacement paragraph.\n".repeat(1000).trimEnd()
+        await writeProposal(dir, { ...proposal, body })
+        assert.equal((await listStagedProposals(dir))[0]?.body, body)
+        assert.equal((await reader.read({ buffer: Buffer.alloc(Buffer.byteLength(original)), position: 0 })).buffer.toString("utf8"), original)
+        assert.deepEqual(await fs.readdir(stagingDir(dir)), [name])
+      } finally {
+        await reader.close()
+      }
+    })
+  })
+
+  it("cleans up the temporary file if publishing the proposal fails", async () => {
+    await withDir(async (dir) => {
+      const name = "mem-aaaaaaaa.md"
+      const target = path.join(stagingDir(dir), name)
+      await fs.mkdir(target, { recursive: true })
+      await assert.rejects(writeProposal(dir, { id: "mem-aaaaaaaa", title: "Rule", body: "Body" }))
+      assert.deepEqual(await fs.readdir(stagingDir(dir)), [name])
+      assert.ok((await fs.stat(target)).isDirectory())
+    })
+  })
+
   it("throws a clean StoreWriteError when staging is not writable", async () => {
     const file = path.join(os.tmpdir(), `mem-notdir-${process.pid}`)
     await fs.writeFile(file, "x", "utf8")
@@ -176,6 +207,69 @@ describe("active and retired reads", () => {
   it("readMemoryFile returns null for a missing file", async () => {
     await withDir(async (dir) => {
       assert.equal(await readMemoryFile(path.join(activeDir(dir), "mem-aaaaaaaa.md")), null)
+    })
+  })
+})
+
+// ─── tolerant index read ────────────────────────────────────────────────────
+
+describe("listActiveMemoriesForIndex", () => {
+  it("returns every readable memory and reports nothing for a clean store", async () => {
+    await withDir(async (dir) => {
+      await writeMemoryFile(activeDir(dir), activeMemory("mem-aaaaaaaa", "First"))
+      await writeMemoryFile(activeDir(dir), activeMemory("mem-bbbbbbbb", "Second"))
+      const listing = await listActiveMemoriesForIndex(dir)
+      assert.deepEqual(listing.memories.map((m) => m.id), ["mem-aaaaaaaa", "mem-bbbbbbbb"])
+      assert.deepEqual(listing.problems, [])
+      assert.equal(listing.folderUnreadable, false)
+    })
+  })
+
+  it("treats a missing store as empty, not as a failure", async () => {
+    await withDir(async (dir) => {
+      const listing = await listActiveMemoriesForIndex(dir)
+      assert.deepEqual(listing.memories, [])
+      assert.deepEqual(listing.problems, [])
+      assert.equal(listing.folderUnreadable, false)
+    })
+  })
+
+  it("skips an unreadable entry, keeps the rest, and reports the errno code only", async () => {
+    await withDir(async (dir) => {
+      await writeMemoryFile(activeDir(dir), activeMemory("mem-aaaaaaaa", "Good"))
+      // A directory named like a memory file: reading it fails with EISDIR,
+      // which is deterministic across platforms and users.
+      await fs.mkdir(path.join(activeDir(dir), "mem-bbbbbbbb.md"))
+      const listing = await listActiveMemoriesForIndex(dir)
+      assert.deepEqual(listing.memories.map((m) => m.id), ["mem-aaaaaaaa"])
+      assert.equal(listing.problems.length, 1)
+      assert.equal(listing.problems[0]!.code, "EISDIR")
+      assert.equal(listing.folderUnreadable, false)
+    })
+  })
+
+  it("reports a file with invalid frontmatter as a skipped entry", async () => {
+    await withDir(async (dir) => {
+      await writeMemoryFile(activeDir(dir), activeMemory("mem-aaaaaaaa", "Good"))
+      await fs.writeFile(path.join(activeDir(dir), "mem-bbbbbbbb.md"), "no frontmatter here", "utf8")
+      const listing = await listActiveMemoriesForIndex(dir)
+      assert.deepEqual(listing.memories.map((m) => m.id), ["mem-aaaaaaaa"])
+      assert.deepEqual(listing.problems.map((p) => p.code), ["invalid"])
+    })
+  })
+
+  it("reports a folder that cannot be listed instead of throwing, while the strict reader still throws", async () => {
+    await withDir(async (dir) => {
+      await fs.mkdir(path.dirname(activeDir(dir)), { recursive: true })
+      await fs.writeFile(activeDir(dir), "not a directory", "utf8")
+      const listing = await listActiveMemoriesForIndex(dir)
+      assert.deepEqual(listing.memories, [])
+      assert.equal(listing.folderUnreadable, true)
+      assert.equal(listing.problems.length, 1)
+      assert.equal(listing.problems[0]!.code, "ENOTDIR")
+      // Tools, the audit and migration keep the strict reader, so a broken store
+      // still fails loudly where a partial view would be dangerous.
+      await assert.rejects(() => listActiveMemories(dir))
     })
   })
 })

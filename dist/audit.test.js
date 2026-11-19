@@ -311,6 +311,127 @@ describe("batching", () => {
         });
     });
 });
+describe("audit state that cannot be written", () => {
+    /**
+     * Make `audit-state.json` impossible to write with a deterministic fixture:
+     * a directory sits where the file belongs, so `writeFile` fails with EISDIR
+     * regardless of the user running the tests (no chmod/root dependence).
+     */
+    async function blockStateFile(dir) {
+        await fs.mkdir(path.join(dir, ".memory", "audit-state.json"), { recursive: true });
+    }
+    it("runAudit resolves 'failed' instead of rejecting, and still logs and notifies", async () => {
+        await withDir(async (dir) => {
+            await seed(dir, mem("mem-aaaa0001", "A"), mem("mem-bbbb0002", "B"));
+            await blockStateFile(dir);
+            const notices = [];
+            const logged = [];
+            const logger = {
+                async info() { },
+                async error(_scope, err) {
+                    logged.push(String(err));
+                },
+            };
+            const out = await runAudit({
+                directory: dir,
+                config: cfg(),
+                logger,
+                now: () => NOW,
+                call: async () => {
+                    throw new Error("model down");
+                },
+                notify: (m) => void notices.push(m),
+            });
+            assert.equal(out, "failed");
+            // logging happened even though recording the failure could not
+            assert.equal(logged.length, 1);
+            assert.match(logged[0], /model down/);
+            // the user is still told, even with no state file to carry the error
+            assert.equal(notices.length, 1);
+            assert.match(notices[0], /Memory audit failed/);
+        });
+    });
+    it("runAudit resolves 'failed' when a successful run cannot persist its state", async () => {
+        await withDir(async (dir) => {
+            await seed(dir, mem("mem-aaaa0001", "Old"), mem("mem-bbbb0002", "New"));
+            await blockStateFile(dir);
+            const out = await runAudit({
+                directory: dir,
+                config: cfg(),
+                logger: quietLogger,
+                now: () => NOW,
+                call: findingReply([{ relation: "duplicate", retire: "mem-aaaa0001", reason: "same" }]),
+            });
+            assert.equal(out, "failed");
+        });
+    });
+    it("a throwing logger does not turn the audit into a rejection", async () => {
+        const explosive = {
+            async info() {
+                throw new Error("log sink down");
+            },
+            async error() {
+                throw new Error("log sink down");
+            },
+        };
+        await withDir(async (dir) => {
+            await seed(dir, mem("mem-aaaa0001", "A"), mem("mem-bbbb0002", "B"));
+            const failed = await runAudit({
+                directory: dir,
+                config: cfg(),
+                logger: explosive,
+                now: () => NOW,
+                call: async () => {
+                    throw new Error("boom");
+                },
+            });
+            assert.equal(failed, "failed");
+        });
+        await withDir(async (dir) => {
+            await seed(dir, mem("mem-aaaa0001", "A"), mem("mem-bbbb0002", "B"));
+            const done = await runAudit({ directory: dir, config: cfg(), logger: explosive, call: findingReply([]), now: () => NOW });
+            assert.equal(done, "done");
+        });
+    });
+    it("the fire-and-forget scheduler drains a failing run without an unhandled rejection", async () => {
+        await withDir(async (dir) => {
+            await seed(dir, mem("mem-aaaa0001", "A"), mem("mem-bbbb0002", "B"));
+            await blockStateFile(dir);
+            const rejections = [];
+            const onRejection = (reason) => rejections.push(reason);
+            process.on("unhandledRejection", onRejection);
+            try {
+                const logger = {
+                    async info() {
+                        throw new Error("log sink down");
+                    },
+                    async error() {
+                        throw new Error("log sink down");
+                    },
+                };
+                const sch = createAuditScheduler({
+                    directory: dir,
+                    config: cfg(),
+                    logger,
+                    now: () => NOW,
+                    call: async () => {
+                        throw new Error("model down");
+                    },
+                }, new Set());
+                sch.onSessionIdle("s1");
+                await sch.settled();
+                // Turn the event loop over so a stray rejection would have surfaced.
+                await new Promise((resolve) => setTimeout(resolve, 25));
+                assert.equal(await sch.runNow(), "failed");
+                await sch.settled();
+            }
+            finally {
+                process.off("unhandledRejection", onRejection);
+            }
+            assert.deepEqual(rejections, []);
+        });
+    });
+});
 describe("audit failure visibility", () => {
     const failing = (msg) => async () => {
         throw new Error(msg);

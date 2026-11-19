@@ -14,15 +14,13 @@ This guide covers version 0.6.0.
 
 You need:
 
-- OpenCode 1.x or 2.x.
+- OpenCode 2.x. OpenCode 1.x is not supported.
 - A Git repository with an `origin` remote that you can push to.
 - The [GitHub CLI](https://cli.github.com/), authenticated with an account that can open pull requests.
 
 The GitHub requirements apply when publishing proposals. Publishing pushes branches and opens pull requests; it does **not** merge them.
 
 ## 1. Install the plugin
-
-### OpenCode 2.x
 
 To install the plugin in your global OpenCode configuration:
 
@@ -37,18 +35,6 @@ Alternatively, add it to the `plugins` array in your project or global `opencode
   "plugins": ["@chncaesar/opencode-plugin-memory"]
 }
 ```
-
-### OpenCode 1.x
-
-Add the package to the singular `plugin` array in your OpenCode configuration:
-
-```json
-{
-  "plugin": ["@chncaesar/opencode-plugin-memory"]
-}
-```
-
-Restart OpenCode after changing the configuration. The same plugin package supports both versions, but their configuration keys are different.
 
 ### Configure the plugin
 
@@ -71,24 +57,7 @@ For example, this OpenCode 2.x configuration keeps an operation log, checks memo
 }
 ```
 
-The equivalent OpenCode 1.x entry places the package and options together in a two-element array:
-
-```json
-{
-  "plugin": [
-    [
-      "@chncaesar/opencode-plugin-memory",
-      {
-        "enableLog": true,
-        "auditIntervalMinutes": 30,
-        "auditBatchChars": 100000
-      }
-    ]
-  ]
-}
-```
-
-These examples show the shape of a complete configuration file. If you already have other OpenCode settings or plugins, add the entry to your existing configuration instead of replacing it.
+If you already have other OpenCode settings or plugins, add the entry to your existing configuration instead of replacing it.
 
 | Option | Default | Purpose |
 | --- | --- | --- |
@@ -98,7 +67,7 @@ These examples show the shape of a complete configuration file. If you already h
 | `backgroundAudit` | `true` | Enable the model-assisted audit after sessions become idle. Set to `false` to disable it; proposals and manual review still work. |
 | `auditIntervalMinutes` | `1` | Minimum number of minutes between background audit attempts. Increase it to run audits less frequently. |
 | `auditBatchChars` | `400000` | Maximum characters of memory text per audit batch. Lower it when the audit model has a smaller context window. |
-| `auditModel` | Host default | OpenCode 2.x only: select the host model for audits as `providerID/modelID`. Ignored when `auditProvider` is set. |
+| `auditModel` | Host default | Select the host model for audits as `providerID/modelID`. Ignored when `auditProvider` is set. |
 | `auditProvider` | Not configured | Use a separate OpenAI-compatible endpoint and credentials for audits instead of the host's model call. See [Use a separate audit provider](#use-a-separate-audit-provider). |
 
 An audit interval is a minimum, not a promise that an audit will run on a timer: the plugin also checks conditions such as whether the active memories have changed. Batch size is measured in characters, not tokens. The default assumes a large context window; leave room for the prompt and response when choosing a smaller value. Individual memories are not split, and related entries in different batches can still be missed.
@@ -116,7 +85,7 @@ For example, to turn off automatic audits in OpenCode 2.x while keeping the rest
 }
 ```
 
-To select a configured OpenCode 2.x host model instead, set `"auditModel": "providerID/modelID"` in `options`, replacing both parts with an actual provider and model available in your OpenCode setup. On 1.x, the audit uses a restricted agent and prefers the host's `small_model`; `auditModel` is not available there.
+To select a configured host model instead, set `"auditModel": "providerID/modelID"` in `options`, replacing both parts with an actual provider and model available in your OpenCode setup.
 
 #### Use a separate audit provider
 
@@ -154,26 +123,7 @@ The `auditProvider` fields are:
 
 For example, add `"headers": { "X-Provider-Header": "value" }` inside `auditProvider` only when your provider requires it. A custom `Authorization` header replaces the bearer authorization generated from `apiKey`; it is not added alongside it. Treat authentication headers as secrets and do not commit them.
 
-For OpenCode 1.x, options use a different shape:
-
-```json
-{
-  "plugin": [
-    [
-      "@chncaesar/opencode-plugin-memory",
-      {
-        "auditProvider": {
-          "baseUrl": "https://api.example.com",
-          "apiKey": "{env:MEMORY_AUDIT_API_KEY}",
-          "model": "your-model"
-        }
-      }
-    ]
-  ]
-}
-```
-
-An explicit `auditProvider` takes precedence over `auditModel`. If the provider configuration is incomplete, the audit reports an error rather than silently switching credentials. For a model with a smaller context window, lower `auditBatchChars`; see the [configuration reference](https://github.com/chncaesar/opencode-plugin-memory#configuration) for all options.
+An explicit `auditProvider` takes precedence over `auditModel`. If the provider configuration is incomplete, the audit reports an error rather than silently switching credentials. For a model with a smaller context window, lower `auditBatchChars`.
 
 ## 2. Propose a memory
 

@@ -22,12 +22,43 @@ export declare function generateMemoryId(): string;
 export declare function serializeMemory(memory: Memory): string;
 /** Read a single memory file; `null` if missing or invalid (bad/missing frontmatter). */
 export declare function readMemoryFile(filePath: string): Promise<Memory | null>;
+/**
+ * Read a single memory file, refusing to follow a symlink at `filePath`.
+ * Only the leaf is protected: parent directories are the caller's concern.
+ * `null` when the file is missing, invalid, or a symlink (`ELOOP`).
+ *
+ * Used by the bot, which must not let a staged or committed path redirect a
+ * read outside the memory store.
+ */
+export declare function readMemoryFileNoFollow(filePath: string): Promise<Memory | null>;
 /** List merged (active) memories. */
 export declare function listActiveMemories(projectDir: string): Promise<Memory[]>;
 /** List retired memories. */
 export declare function listRetiredMemories(projectDir: string): Promise<Memory[]>;
 /** List the agent's staged proposals. */
 export declare function listStagedProposals(projectDir: string): Promise<Memory[]>;
+/** One skipped entry, described without a filesystem message. */
+export type StoreReadProblem = {
+    /** Absolute path of the folder or file that could not be read. */
+    file: string;
+    /** Short cause: an errno code ("EACCES", "EISDIR", …) or "invalid" for missing/bad frontmatter. */
+    code: string;
+};
+/** Result of a tolerant read: what was readable, plus what was skipped. */
+export type MemoryListing = {
+    memories: Memory[];
+    problems: StoreReadProblem[];
+    /** True when the folder itself could not be listed, so the listing is empty by failure, not by absence. */
+    folderUnreadable: boolean;
+};
+/**
+ * Read the memories in `dir` without throwing. An unreadable folder yields an
+ * empty listing with one problem; an unreadable or invalid entry is skipped and
+ * reported while the remaining memories are still returned.
+ */
+export declare function readMemoriesTolerant(dir: string): Promise<MemoryListing>;
+/** Tolerant read of the committed active store, for the prompt index. */
+export declare function listActiveMemoriesForIndex(projectDir: string): Promise<MemoryListing>;
 export type MemoryWithStatus = {
     memory: Memory;
     status: MemoryStatus;
@@ -42,7 +73,7 @@ export declare function readMemoryById(projectDir: string, id: string): Promise<
 export declare class StoreWriteError extends Error {
     constructor(message: string, cause?: unknown);
 }
-/** Write a memory file into `dir` (creating it). Used by migration and the bot. */
+/** Publish a complete memory file into `dir` (creating it). */
 export declare function writeMemoryFile(dir: string, memory: Memory): Promise<void>;
 /**
  * Write a proposal file to `.memory/staging/`. Unwritable/read-only paths raise

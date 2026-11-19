@@ -342,15 +342,16 @@ export async function runAudit(deps: AuditDeps): Promise<AuditOutcome> {
       try {
         reply = await call(AUDIT_SYSTEM_PROMPT, prompt)
       } catch (err) {
-        await recordFailure(deps, err instanceof Error ? err.message : String(err), now())
-        await logger.error("audit", err)
+        await recordFailure(deps, messageOf(err), now())
+        await safeLogError(logger, err)
         return "failed"
       }
 
       const parsed = parseAuditResponse(reply, batch)
       if (parsed === null) {
-        await recordFailure(deps, `The audit model's reply was not usable (batch ${i + 1} of ${batches.length}): ${clip(reply, 200)}`, now())
-        await logger.error("audit", `unparsable audit reply (batch ${i + 1}/${batches.length}): ` + clip(reply, 200))
+        const detail = `The audit model's reply was not usable (batch ${i + 1} of ${batches.length}): ${clip(reply, 200)}`
+        await recordFailure(deps, detail, now())
+        await safeLogError(logger, detail)
         return "failed"
       }
       for (const f of parsed) if (!merged.has(f.retire)) merged.set(f.retire, f)
@@ -362,7 +363,7 @@ export async function runAudit(deps: AuditDeps): Promise<AuditOutcome> {
     const fresh = await listActiveMemories(directory)
     if (activeHash(fresh) !== hash) {
       await markAttempt(directory, now(), "discarded-changed")
-      await logger.info("audit", "discarded: memories changed during audit")
+      await safeLogInfo(logger, "discarded: memories changed during audit")
       return "discarded-changed"
     }
 
@@ -390,15 +391,17 @@ export async function runAudit(deps: AuditDeps): Promise<AuditOutcome> {
 
     const doneAt = now().toISOString()
     await writeAuditState(directory, { lastHash: hash, lastAuditAt: doneAt, lastOutcome: "done", lastOutcomeAt: doneAt })
-    await logger.info(
-      "audit",
+    await safeLogInfo(
+      logger,
       `${findings.length} finding(s) → ${emitted} proposal(s) over ${active.length} entries in ${batches.length} batch(es)`,
     )
 
     return "done"
   } catch (err) {
-    await recordFailure(deps, err instanceof Error ? err.message : String(err), now())
-    await logger.error("audit", err)
+    // The run failed (possibly because the state path itself is unwritable).
+    // Everything below is best effort: runAudit must never throw.
+    await recordFailure(deps, messageOf(err), now())
+    await safeLogError(logger, err)
     return "failed"
   }
 }
@@ -448,21 +451,65 @@ export function looksLikeCredentialProblem(message: string): boolean {
   )
 }
 
-/** Persist a failed run and, when the error is new, tell the user once. */
+/** Read an error's message without letting a hostile value throw. */
+function messageOf(err: unknown): string {
+  try {
+    return err instanceof Error ? err.message : String(err)
+  } catch {
+    return "(unprintable error)"
+  }
+}
+
+/**
+ * Log an error without letting a logger failure escape. Audit logging is
+ * diagnostics; it is never a reason for the audit to fail.
+ */
+async function safeLogError(logger: Logger, err: unknown): Promise<void> {
+  try {
+    await logger.error("audit", err)
+  } catch {
+    // swallowed on purpose
+  }
+}
+
+/** Log an informational line without letting a logger failure escape. */
+async function safeLogInfo(logger: Logger, message: string): Promise<void> {
+  try {
+    await logger.info("audit", message)
+  } catch {
+    // swallowed on purpose
+  }
+}
+
+/**
+ * Persist a failed run and, when the error is new, tell the user once.
+ *
+ * Best effort by contract. This runs after something has already gone wrong, and
+ * the state path is a common casualty (a file where `.memory` should be, a
+ * directory where `audit-state.json` should be). Nothing here may throw: a
+ * failure to record a failure must still leave the caller with a plain "failed"
+ * outcome, not a rejected promise.
+ */
 async function recordFailure(deps: AuditDeps, message: string, at: Date): Promise<void> {
   const error = clip(message.replace(/\s+/g, " ").trim(), 400)
-  const state = await readAuditState(deps.directory)
-  const isNew = state.lastOutcome !== "failed" || state.lastError !== error
-  await writeAuditState(deps.directory, {
-    ...state,
-    lastAuditAt: at.toISOString(),
-    lastOutcome: "failed",
-    lastOutcomeAt: at.toISOString(),
-    lastError: error,
-  })
-  if (!isNew || !deps.notify) return
-  const hint = auditFailureHint(error, deps.config)
+  let isNew = true
   try {
+    const state = await readAuditState(deps.directory)
+    isNew = state.lastOutcome !== "failed" || state.lastError !== error
+    await writeAuditState(deps.directory, {
+      ...state,
+      lastAuditAt: at.toISOString(),
+      lastOutcome: "failed",
+      lastOutcomeAt: at.toISOString(),
+      lastError: error,
+    })
+  } catch {
+    // Could not record it. Still notify below: the user needs to know the audit
+    // is broken, and memory_review/warning may have nothing to show.
+  }
+  if (!isNew || !deps.notify) return
+  try {
+    const hint = auditFailureHint(error, deps.config)
     await deps.notify(`Memory audit failed: ${clip(error, 160)}${hint ? ` — ${hint}` : ""}`)
   } catch {
     // a notification problem must never break the audit
@@ -760,9 +807,17 @@ export function createAuditScheduler(deps: AuditDeps, auditSessions: Set<string>
 
   const start = (force: boolean): Promise<AuditOutcome> => {
     let p: Promise<AuditOutcome>
-    p = runAudit({ ...deps, force }).finally(() => {
-      if (current === p) current = null
-    })
+    p = runAudit({ ...deps, force })
+      // Final rejection sink: runAudit is written not to throw, but the idle
+      // handler calls this fire-and-forget, so nothing may escape as an
+      // unhandled rejection even if that contract is ever broken.
+      .catch(async (err: unknown) => {
+        await safeLogError(deps.logger, err)
+        return "failed" as AuditOutcome
+      })
+      .finally(() => {
+        if (current === p) current = null
+      })
     current = p
     return p
   }
