@@ -9,6 +9,9 @@ tags:
 author: Jiachuan Zhu
 source: memory_propose
 proposed_at: 2026-11-17T01:26:53.123Z
+superseded_by: mem-wFJ9WWdv
+retired_at: 2026-11-20T01:06:45.180Z
+retired_reason: superseded
 ---
 写 OpenCode 插件的安装说明时，必须按版本区分配置键，否则用户照做会静默失效（配置键被忽略，不报错，用户只会认为插件没用）。
 
