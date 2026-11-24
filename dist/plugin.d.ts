@@ -1,5 +1,5 @@
 import type { Plugin, PluginOptions } from "@opencode-ai/plugin";
-import { type AuditProvider, type PluginConfig } from "./types.js";
+import { type AuditProvider, type PluginConfig, type Scope } from "./types.js";
 import { type ModelCall } from "./audit.js";
 /**
  * Parse and validate plugin options from opencode.json.
@@ -29,8 +29,11 @@ export declare function resolveAuditCall(config: PluginConfig, hostCall: ModelCa
  * audit stages retire proposals while no model is in the loop, so without this
  * nothing would ever prompt a `memory_publish` call. Same rule as for
  * memory_propose/update/delete: the model publishes, the human merges.
+ *
+ * Each store is reported separately: a global proposal opens its PR in the
+ * memory repository, a project proposal in the current one.
  */
-export declare function pendingPublishNotice(directory: string): Promise<string | null>;
+export declare function pendingPublishNotice(directory: string, scope?: Scope): Promise<string | null>;
 /**
  * opencode-plugin-memory — PR-gated project memory.
  *

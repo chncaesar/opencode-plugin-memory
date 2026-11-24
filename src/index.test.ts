@@ -20,6 +20,16 @@ function fakeInput(directory: string) {
   return { directory, project: {}, worktree: directory, serverUrl: new URL("http://localhost"), $: {} } as never
 }
 
+/**
+ * These tests must never read or write the real global store on the machine
+ * running them, so every V1 server is created with the global store disabled.
+ */
+const PROJECT_ONLY = { globalMemoryEnabled: false }
+
+function createServer(directory: string) {
+  return server(fakeInput(directory), PROJECT_ONLY)
+}
+
 async function seedStale(dir: string): Promise<void> {
   await writeMemoryFile(activeDir(dir), {
     id: "mem-aaaa0001",
@@ -44,6 +54,23 @@ describe("resolveConfig", () => {
     assert.equal(c.backgroundAudit, false)
     assert.equal(c.enableLog, false)
     assert.equal(resolveConfig({ staleDays: -5 }).staleDays, 90)
+  })
+
+  it("defaults the global store on, and rejects out-of-range values", () => {
+    const c = resolveConfig()
+    assert.equal(c.globalMemoryEnabled, true)
+    assert.equal(c.globalMemoryPath, "~/.local/share/opencode/memory")
+    assert.equal(c.defaultScope, "global")
+    assert.equal(c.globalIndexShare, 0.7)
+
+    assert.equal(resolveConfig({ globalMemoryEnabled: false }).globalMemoryEnabled, false)
+    assert.equal(resolveConfig({ globalMemoryPath: "  " }).globalMemoryPath, "~/.local/share/opencode/memory")
+    assert.equal(resolveConfig({ globalMemoryPath: "/tmp/mem" }).globalMemoryPath, "/tmp/mem")
+    assert.equal(resolveConfig({ defaultScope: "project" }).defaultScope, "project")
+    assert.equal(resolveConfig({ defaultScope: "nonsense" }).defaultScope, "global")
+    assert.equal(resolveConfig({ globalIndexShare: 0 }).globalIndexShare, 0.7)
+    assert.equal(resolveConfig({ globalIndexShare: 1 }).globalIndexShare, 0.7)
+    assert.equal(resolveConfig({ globalIndexShare: 0.5 }).globalIndexShare, 0.5)
   })
 
   it("parses an auditProvider and its optional headers", () => {
@@ -154,7 +181,7 @@ describe("pending publish notice", () => {
   it("reaches the system prompt, and is gone once nothing is staged", async () => {
     await withDir(async (dir) => {
       await writeProposal(dir, { id: "mem-aaaa0001", title: "Retire me", body: "", proposedAt: "2026-11-12", intent: "retire", retiredReason: "stale" })
-      const hooks = await server(fakeInput(dir))
+      const hooks = await createServer(dir)
       const out = { system: [] as string[] }
       await (hooks["experimental.chat.system.transform"] as any)({ sessionID: "ses_x" }, out)
       assert.match(out.system.join("\n"), /Call memory_publish/)
@@ -170,7 +197,7 @@ describe("pending publish notice", () => {
 describe("plugin entry", () => {
   it("injecting the index in a directory without memories creates no memory/ folder", async () => {
     await withDir(async (dir) => {
-      const hooks = await server(fakeInput(dir))
+      const hooks = await createServer(dir)
       const out = { system: [] as string[] }
       await (hooks["experimental.chat.system.transform"] as any)({ sessionID: "ses_x" }, out)
       assert.match(out.system.join("\n"), /no active memories/)
@@ -180,7 +207,7 @@ describe("plugin entry", () => {
 
   it("registers six tools, the event hook and the system transform hook", async () => {
     await withDir(async (dir) => {
-      const hooks = await server(fakeInput(dir))
+      const hooks = await createServer(dir)
       assert.deepEqual(Object.keys(hooks.tool ?? {}).sort(), [
         "memory_delete",
         "memory_propose",
@@ -198,19 +225,19 @@ describe("plugin entry", () => {
   it("system transform bootstraps the summary and injects the index plus policy", async () => {
     await withDir(async (dir) => {
       await seedStale(dir)
-      const hooks = await server(fakeInput(dir))
+      const hooks = await createServer(dir)
       const out = { system: [] as string[] }
       await hooks["experimental.chat.system.transform"]!({ sessionID: "s1", model: {} as never }, out)
       const text = out.system.join("\n")
       assert.match(text, /Ancient rule/)
-      assert.match(text, /PR-gated project memory system/)
+      assert.match(text, /PR-gated memory system/)
       assert.match(text, /memory_propose/)
     })
   })
 
   it("config hook registers the restricted audit agent", async () => {
     await withDir(async (dir) => {
-      const hooks = await server(fakeInput(dir))
+      const hooks = await createServer(dir)
       const cfg = { agent: {} }
       await hooks.config!(cfg as never)
       assert.ok((cfg.agent as Record<string, unknown>)["memory-audit"])
@@ -225,7 +252,7 @@ describe("plugin entry", () => {
         "# OpenCode Memory\n<!-- nextSeq: 2 -->\n\n## Active\n\n### [MEM-001] Legacy rule\n- added: 2026-01-01\nOld body.\n\n## Archived\n",
         "utf8",
       )
-      await server(fakeInput(dir))
+      await createServer(dir)
       const migrated = await listActiveMemories(dir)
       assert.ok(migrated.some((m) => m.title === "Legacy rule"))
     })
@@ -247,10 +274,10 @@ describe("normal conversation survives memory-store read failures", () => {
     await withDir(async (dir) => {
       await fs.mkdir(path.dirname(activeDir(dir)), { recursive: true })
       await fs.writeFile(activeDir(dir), "not a directory", "utf8")
-      const hooks = await server(fakeInput(dir))
+      const hooks = await createServer(dir)
 
       const text = await transformText(hooks)
-      assert.match(text, /PR-gated project memory system/)
+      assert.match(text, /PR-gated memory system/)
       assert.match(text, /memory index unavailable/)
       assert.ok(!/ENOTDIR|EACCES|no such file/i.test(text))
       assert.match(await logText(dir), /ERROR.*\bENOTDIR\b/)
@@ -261,7 +288,7 @@ describe("normal conversation survives memory-store read failures", () => {
     await withDir(async (dir) => {
       await seedStale(dir)
       await fs.mkdir(path.join(activeDir(dir), "mem-bbbbbbbb.md"))
-      const hooks = await server(fakeInput(dir))
+      const hooks = await createServer(dir)
 
       const text = await transformText(hooks)
       assert.match(text, /Ancient rule/)
@@ -276,24 +303,25 @@ describe("normal conversation survives memory-store read failures", () => {
       await seedStale(dir)
       await fs.mkdir(path.dirname(stagingDir(dir)), { recursive: true })
       await fs.writeFile(stagingDir(dir), "not a directory", "utf8")
-      const hooks = await server(fakeInput(dir))
+      const hooks = await createServer(dir)
 
       const text = await transformText(hooks)
       assert.match(text, /Ancient rule/)
-      assert.match(text, /PR-gated project memory system/)
+      assert.match(text, /PR-gated memory system/)
       assert.ok(!/Call memory_publish/.test(text))
     })
   })
 })
 
 describe("V2 entry", () => {
-  function mockCtx(dir: string, options?: Record<string, unknown>) {
+  function mockCtx(dir: string, options: Record<string, unknown> = {}) {
     const tools: Record<string, any> = {}
     const hooks: Record<string, (e: any) => unknown> = {}
     const disposed: string[] = []
     const ctx = {
       location: { directory: dir },
-      ...(options ? { options } : {}),
+      // Never touch the machine's real global store from a test.
+      options: { globalMemoryEnabled: false, ...options },
       tool: {
         async transform(fn: (e: { add: (t: any) => void }) => void) {
           fn({ add: (t) => { tools[t.name] = t } })

@@ -1,6 +1,6 @@
 import { tool } from "@opencode-ai/plugin/tool"
 import type { ToolDefinition } from "@opencode-ai/plugin/tool"
-import type { PluginConfig, Memory, RetiredReason } from "./types.js"
+import type { PluginConfig, Memory, RetiredReason, Scope } from "./types.js"
 import type { Logger } from "./logging.js"
 import { MEMORY_WRITE_POLICY } from "./prompt.js"
 import {
@@ -9,7 +9,6 @@ import {
   listRetiredMemories,
   listStagedProposals,
   memoryAge,
-  readMemoryById,
   resolveAuthor,
   writeProposal,
   StoreWriteError,
@@ -17,11 +16,26 @@ import {
 import { detectSecrets } from "./secret.js"
 import { processStagingOnce } from "./bot.js"
 import { describeAuditStatus } from "./audit.js"
+import {
+  availableStores,
+  globalProblemToolMessage,
+  resolveStores,
+  type Store,
+  type StoreSet,
+} from "./stores.js"
 
 // Use the zod instance bundled with @opencode-ai/plugin to avoid version conflicts
 const z = tool.schema
 
 const ID_SCHEMA = z.string().regex(/^mem-[A-Za-z0-9_-]{8}$/)
+
+const SCOPE_SCHEMA = z
+  .enum(["global", "project"])
+  .optional()
+  .describe(
+    "Which store receives this entry. global (default) is injected in every repository; project is shared only with whoever has this repository. " +
+    "Use global unless the rule would be wrong — or pointless — in a different repository.",
+  )
 
 type MemoryToolSet = {
   memory_propose: ToolDefinition
@@ -67,22 +81,54 @@ function secretReject(logger: Logger, action: string, secrets: string[]): { titl
   void logger.info(action, "rejected: secret scan")
   return {
     title: "Memory not proposed",
-    output: `The content appears to contain a credential (${secrets.join(", ")}). It was not proposed. Rewrite without credentials — never store secrets or tokens in project memory.`,
+    output: `The content appears to contain a credential (${secrets.join(", ")}). It was not proposed. Rewrite without credentials — never store secrets or tokens in memory.`,
   }
 }
 
-const PROPOSE_DESCRIPTION = `Propose durable project knowledge for review. A proposal is a suggestion only: it becomes an active memory only after a human reviews and merges a pull request.
+/**
+ * Resolve the store a proposal goes to. An explicit `scope: "global"` fails with
+ * instructions when the global store is unusable; an omitted scope follows the
+ * configured default and therefore falls back to the project store instead of
+ * failing.
+ */
+function pickStore(stores: StoreSet, requested?: Scope): { store: Store } | { error: string } {
+  const wanted: Scope = requested ?? stores.defaultScope
+  if (wanted === "global") {
+    if (stores.global) return { store: stores.global }
+    return { error: globalProblemToolMessage(stores.globalProblem ?? "missing", stores.globalPath) }
+  }
+  return { store: stores.project }
+}
+
+/** The store that currently holds an active memory, searched global-first. */
+async function locateActive(stores: StoreSet, id: string): Promise<{ store: Store; memory: Memory } | null> {
+  for (const store of availableStores(stores)) {
+    const active = await listActiveMemories(store.root)
+    const memory = active.find((m) => m.id === id)
+    if (memory) return { store, memory }
+  }
+  return null
+}
+
+function scopeLabel(scope: Scope): string {
+  return scope === "global" ? "global" : "project"
+}
+
+const PROPOSE_DESCRIPTION = `Propose durable knowledge for review. A proposal is a suggestion only: it becomes an active memory only after a human reviews and merges a pull request.
+
+Store: use the \`scope\` argument. global (default) is injected in every repository; project is shared only with whoever has this repository. Most knowledge is global.
 
 ${MEMORY_WRITE_POLICY}
 
 Proposed memories are NOT yet active. Do not propose a duplicate — first check the index and, when unsure, use memory_read.
 
-To REPLACE an existing active memory, pass its ID in supersedes; the replacement retires the old one in the same PR (do not add and delete separately).`
+To REPLACE an existing active memory, pass its ID in supersedes; the replacement retires the old one in the same PR (do not add and delete separately). The id must live in the same store as the proposal.`
 
 /**
- * Create the five memory tools bound to the given plugin config and logger.
- * Each tool only ever PROPOSES: it writes a file into `.memory/staging/`. The
- * merged store under `memory/active/` is never edited by any tool.
+ * Create the six memory tools bound to the given plugin config and logger.
+ * Each write tool only ever PROPOSES: it writes a file into the chosen store's
+ * `.memory/staging/`. The merged store under `memory/active/` is never edited by
+ * any tool.
  */
 export function createMemoryTools(config: PluginConfig, logger: Logger): MemoryToolSet {
   // ── memory_propose ────────────────────────────────────────────────────────
@@ -105,34 +151,62 @@ export function createMemoryTools(config: PluginConfig, logger: Logger): MemoryT
       supersedes: z
         .array(ID_SCHEMA)
         .optional()
-        .describe("IDs of active memories this proposal replaces. All IDs must be active or nothing is proposed."),
+        .describe("IDs of active memories in the same store that this proposal replaces. All IDs must be active in that store or nothing is proposed."),
+      scope: SCOPE_SCHEMA,
     },
-    async execute({ title, content, tags, supersedes }, context) {
+    async execute({ title, content, tags, supersedes, scope }, context) {
       try {
         const secrets = detectSecrets(`${title}\n${content}`)
         if (secrets.length > 0) return secretReject(logger, "memory_propose", secrets)
 
-        const active = await listActiveMemories(context.directory)
+        const stores = await resolveStores(context.directory, config)
+        const picked = pickStore(stores, scope)
+        if ("error" in picked) {
+          await logger.info("memory_propose", `rejected: global store unavailable (${stores.globalProblem})`)
+          return { title: "Memory not proposed", output: picked.error }
+        }
+        const target = picked.store
 
         if (supersedes && supersedes.length > 0) {
-          const activeIds = new Set(active.map((m) => m.id))
-          const bad = [...new Set(supersedes)].filter((id) => !activeIds.has(id))
-          if (bad.length > 0) {
-            await logger.info("memory_propose", `rejected: unknown supersedes ${bad.join(", ")}`)
+          const targetActive = new Set((await listActiveMemories(target.root)).map((m) => m.id))
+          const unknown: string[] = []
+          const wrongStore: string[] = []
+          for (const id of new Set(supersedes)) {
+            if (targetActive.has(id)) continue
+            const elsewhere = await locateActive(stores, id)
+            if (elsewhere) wrongStore.push(`${id} (${scopeLabel(elsewhere.store.scope)} store)`)
+            else unknown.push(id)
+          }
+          if (wrongStore.length > 0) {
+            await logger.info("memory_propose", `rejected: supersedes in another store ${wrongStore.join(", ")}`)
             return {
               title: "Memory not proposed",
-              output: `Cannot supersede ${bad.join(", ")}: not an active memory. Use memory_read to list active memory IDs.`,
+              output:
+                `Cannot supersede ${wrongStore.join(", ")} from the ${scopeLabel(target.scope)} store: a replacement must stay in the store that holds the original. ` +
+                `Propose the replacement with scope "${scopeLabel(target.scope)}" only for entries in that store, and use memory_update for the others.`,
+            }
+          }
+          if (unknown.length > 0) {
+            await logger.info("memory_propose", `rejected: unknown supersedes ${unknown.join(", ")}`)
+            return {
+              title: "Memory not proposed",
+              output: `Cannot supersede ${unknown.join(", ")}: not an active memory. Use memory_read to list active memory IDs.`,
             }
           }
         }
 
-        const staged = await listStagedProposals(context.directory)
-        const duplicate = findDuplicate(title, content, [...active, ...staged])
-        if (duplicate) {
-          await logger.info("memory_propose", `skipped: duplicate of ${duplicate.id}`)
+        // Duplicates are checked against both stores: the same rule in a second
+        // store is a duplicate, not a second opinion.
+        for (const store of availableStores(stores)) {
+          const existing = [...(await listActiveMemories(store.root)), ...(await listStagedProposals(store.root))]
+          const duplicate = findDuplicate(title, content, existing)
+          if (!duplicate) continue
+          await logger.info("memory_propose", `skipped: duplicate of ${duplicate.id} (${scopeLabel(store.scope)})`)
           return {
             title: "Memory not proposed",
-            output: `A memory with the same title or content already exists (${duplicate.id}). Do not propose a duplicate — skip this one.`,
+            output:
+              `A memory with the same title or content already exists in the ${scopeLabel(store.scope)} store (${duplicate.id}). ` +
+              `Do not propose a duplicate — use memory_update to refine it, or give this one a distinct title if it is genuinely different.`,
           }
         }
 
@@ -150,11 +224,11 @@ export function createMemoryTools(config: PluginConfig, logger: Logger): MemoryT
         if (tags !== undefined && tags.length > 0) memory.tags = tags
         if (supersedes !== undefined && supersedes.length > 0) memory.supersedes = [...new Set(supersedes)]
 
-        await writeProposal(context.directory, memory)
-        await logger.info("memory_propose", `${id}: ${title}`)
+        await writeProposal(target.root, memory)
+        await logger.info("memory_propose", `${id} (${scopeLabel(target.scope)}): ${title}`)
 
         const out = [
-          `Proposed [${id}]: ${title}`,
+          `Proposed [${id}] in the ${scopeLabel(target.scope)} store: ${title}`,
           "",
           "This is a proposal only. It becomes an active memory after a human reviews and merges the pull request.",
           "Staged only: no pull request exists until memory_publish runs.",
@@ -175,7 +249,7 @@ export function createMemoryTools(config: PluginConfig, logger: Logger): MemoryT
   // ── memory_update ─────────────────────────────────────────────────────────
 
   const memory_update = tool({
-    description: `Update an existing active memory by its ID (e.g. mem-abc12345).
+    description: `Update an existing active memory by its ID (e.g. mem-abc12345). The entry is found in whichever store holds it; the replacement is proposed in that same store.
 
 memory_update does NOT edit the active memory. It PROPOSES a replacement: a new memory that carries supersedes: [id]. The old memory is retired and the new one becomes active only after a human merges the pull request.
 
@@ -196,15 +270,16 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
     },
     async execute({ id, title, content, tags }, context) {
       try {
-        const active = await listActiveMemories(context.directory)
-        const target = active.find((m) => m.id === id)
-        if (!target) {
+        const stores = await resolveStores(context.directory, config)
+        const found = await locateActive(stores, id)
+        if (!found) {
           await logger.info("memory_update", `${id} not found`)
           return {
             title: "Memory not found",
             output: `No active memory with ID ${id}. Use memory_read to list all active memories.`,
           }
         }
+        const { store, memory: target } = found
 
         const newTitle = title !== undefined ? title : target.title
         const newContent = content !== undefined ? content : target.body
@@ -227,11 +302,11 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
         }
         if (newTags !== undefined && newTags.length > 0) memory.tags = newTags
 
-        await writeProposal(context.directory, memory)
-        await logger.info("memory_update", `${newId} supersedes ${id}`)
+        await writeProposal(store.root, memory)
+        await logger.info("memory_update", `${newId} supersedes ${id} (${scopeLabel(store.scope)})`)
         return {
           title: `Memory update proposed: ${newId}`,
-          output: `Proposed [${newId}] as a replacement for [${id}]: ${newTitle}\n\nThis is a proposal only; it takes effect after a human merges the pull request.\nStaged only: no pull request exists until memory_publish runs.`,
+          output: `Proposed [${newId}] in the ${scopeLabel(store.scope)} store as a replacement for [${id}]: ${newTitle}\n\nThis is a proposal only; it takes effect after a human merges the pull request.\nStaged only: no pull request exists until memory_publish runs.`,
         }
       } catch (err) {
         if (err instanceof StoreWriteError) {
@@ -247,7 +322,7 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
   // ── memory_delete ─────────────────────────────────────────────────────────
 
   const memory_delete = tool({
-    description: `Propose retiring an active memory by its ID.
+    description: `Propose retiring an active memory by its ID. The entry is found in whichever store holds it; the retirement is proposed in that same store.
 
 memory_delete does NOT edit the active memory. It writes a retirement proposal: a staging file naming the target id and a reason. The memory moves to retired/ only after a human merges the pull request.
 
@@ -265,19 +340,20 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
     },
     async execute({ id, reason }, context) {
       try {
-        const active = await listActiveMemories(context.directory)
-        const target = active.find((m) => m.id === id)
-        if (!target) {
+        const stores = await resolveStores(context.directory, config)
+        const found = await locateActive(stores, id)
+        if (!found) {
           await logger.info("memory_delete", `${id} not found`)
           return {
             title: "Memory not found",
             output: `No active memory with ID ${id}. Use memory_read to list all active memories.`,
           }
         }
+        const { store, memory: target } = found
 
         const mapped = mapRetireReason(reason)
         const author = await resolveAuthor(context.directory)
-        await writeProposal(context.directory, {
+        await writeProposal(store.root, {
           id,
           title: target.title,
           body: "",
@@ -287,10 +363,10 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
           intent: "retire",
           retiredReason: mapped,
         })
-        await logger.info("memory_delete", `${id} (reason: ${mapped})`)
+        await logger.info("memory_delete", `${id} (${scopeLabel(store.scope)}, reason: ${mapped})`)
         return {
           title: `Memory retirement proposed: ${id}`,
-          output: `Proposed retiring [${id}]: ${target.title}\nReason: ${mapped}.\n\nThis is a proposal only; the memory is removed after a human merges the pull request.\nStaged only: no pull request exists until memory_publish runs.`,
+          output: `Proposed retiring [${id}] from the ${scopeLabel(store.scope)} store: ${target.title}\nReason: ${mapped}.\n\nThis is a proposal only; the memory is removed after a human merges the pull request.\nStaged only: no pull request exists until memory_publish runs.`,
         }
       } catch (err) {
         if (err instanceof StoreWriteError) {
@@ -306,14 +382,14 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
   // ── memory_read ───────────────────────────────────────────────────────────
 
   const memory_read = tool({
-    description: `Read memory entries, optionally filtered by a keyword.
+    description: `Read memory entries from both stores (global and project), optionally filtered by a keyword.
 
 Use this when:
 - You need the full content of a specific memory (the index only shows titles)
 - You want to find the ID of a memory before updating or retiring it
 - You want to verify what is currently stored
 
-Returns full bodies of active memories, plus your own staged proposals (marked "pending — not yet merged"), so you do not propose a duplicate. Retired memories are listed only when include_retired is true.`,
+Returns full bodies of active memories from both stores, plus your own staged proposals (marked "pending — not yet merged"), so you do not propose a duplicate. Retired memories are listed only when include_retired is true.`,
     args: {
       query: z
         .string()
@@ -325,9 +401,7 @@ Returns full bodies of active memories, plus your own staged proposals (marked "
         .describe("Also list retired memories with their retirement reason. Default false."),
     },
     async execute({ query, include_retired }, context) {
-      const active = await listActiveMemories(context.directory)
-      const retired = include_retired ? await listRetiredMemories(context.directory) : []
-      const staged = await listStagedProposals(context.directory)
+      const stores = await resolveStores(context.directory, config)
 
       const q = query?.toLowerCase()
       const matches = (m: Memory) =>
@@ -337,49 +411,71 @@ Returns full bodies of active memories, plus your own staged proposals (marked "
         m.body.toLowerCase().includes(q) ||
         (m.tags ?? []).some((t) => t.toLowerCase().includes(q))
 
-      const activeOut = active.filter(matches)
-      const retiredOut = retired.filter(matches)
-      const stagedOut = staged.filter(matches)
+      const sections: string[] = []
+      let totalActive = 0
+      let totalStaged = 0
 
-      if (activeOut.length === 0 && retiredOut.length === 0 && stagedOut.length === 0) {
+      for (const store of availableStores(stores)) {
+        const label = store.scope === "global" ? "Global" : "Project"
+        const active = (await listActiveMemories(store.root)).filter(matches)
+        const staged = (await listStagedProposals(store.root)).filter(matches)
+        const retired = include_retired ? (await listRetiredMemories(store.root)).filter(matches) : []
+        totalActive += active.length
+        totalStaged += staged.length
+
+        if (active.length === 0 && staged.length === 0 && retired.length === 0) continue
+
+        const lines: string[] = [`## ${label} store`, ""]
+        lines.push(`Active memories (${active.length}):`, "")
+        for (const m of active) lines.push(...formatMemory(m))
+        lines.push(`Pending proposals — not yet merged (${staged.length}):`, "")
+        for (const m of staged) {
+          const kind = m.intent === "retire" ? "retire" : "propose"
+          lines.push(`### [${m.id}] ${m.title} (${kind})`)
+          if (m.intent === "retire") lines.push(`Retirement proposal (reason: ${m.retiredReason ?? "stale"}) — no body.`)
+          else if (m.body) lines.push(m.body)
+          lines.push("")
+        }
+        if (include_retired) {
+          lines.push(`Retired memories (${retired.length}):`, "")
+          for (const m of retired) {
+            const meta = [m.retiredAt ? `retired ${m.retiredAt}` : "", m.retiredReason ? `reason: ${m.retiredReason}` : "", m.supersededBy ? `superseded by ${m.supersededBy}` : ""].filter(Boolean)
+            lines.push(`### [${m.id}] ${m.title}`)
+            if (meta.length) lines.push(meta.join(" | "))
+            lines.push(m.body, "")
+          }
+        }
+        sections.push(lines.join("\n"))
+      }
+
+      if (sections.length === 0) {
+        const notes: string[] = []
+        if (!stores.global && stores.globalProblem !== "disabled") {
+          notes.push(globalProblemToolMessage(stores.globalProblem ?? "missing", stores.globalPath))
+        }
         const msg = query
           ? `No memories matching "${query}".`
           : "No active memories yet. Use memory_propose to propose knowledge."
-        return { title: "Memory read", output: msg }
+        return { title: "Memory read", output: [msg, ...notes].join("\n\n") }
       }
 
-      const lines: string[] = []
-      lines.push(`Active memories (${activeOut.length}):\n`)
-      for (const m of activeOut) lines.push(...formatMemory(m))
-      lines.push(`Pending proposals — not yet merged (${stagedOut.length}):\n`)
-      for (const m of stagedOut) {
-        const kind = m.intent === "retire" ? "retire" : "propose"
-        lines.push(`### [${m.id}] ${m.title} (${kind})`)
-        if (m.intent === "retire") lines.push(`Retirement proposal (reason: ${m.retiredReason ?? "stale"}) — no body.`)
-        else if (m.body) lines.push(m.body)
-        lines.push("")
+      const header: string[] = []
+      if (!stores.global && stores.globalProblem !== "disabled") {
+        header.push(`Global store: unavailable. ${globalProblemToolMessage(stores.globalProblem ?? "missing", stores.globalPath)}`, "")
       }
-      if (include_retired) {
-        lines.push(`Retired memories (${retiredOut.length}):\n`)
-        for (const m of retiredOut) {
-          const meta = [m.retiredAt ? `retired ${m.retiredAt}` : "", m.retiredReason ? `reason: ${m.retiredReason}` : "", m.supersededBy ? `superseded by ${m.supersededBy}` : ""].filter(Boolean)
-          lines.push(`### [${m.id}] ${m.title}`)
-          if (meta.length) lines.push(meta.join(" | "))
-          lines.push(m.body, "")
-        }
+      return {
+        title: `Memory read (${totalActive}${totalStaged ? ` + ${totalStaged} pending` : ""})`,
+        output: [...header, ...sections].join("\n\n"),
       }
-
-      const total = activeOut.length + (include_retired ? retiredOut.length : 0)
-      return { title: `Memory read (${total}${stagedOut.length ? ` + ${stagedOut.length} pending` : ""})`, output: lines.join("\n") }
     },
   })
 
   // ── memory_review ─────────────────────────────────────────────────────────
 
   const memory_review = tool({
-    description: `A read-only overview of the memory store. Shows active memories (id + title), pending proposals, aging memories, and — on request — retired memories.
+    description: `A read-only overview of both memory stores. Shows active memories (id + title) per store, pending proposals, aging memories, and — on request — retired memories.
 
-Use this when the system prompt says memories need review, or when cleaning up memory. It also reports how the background audit last went (including failures). It never edits anything; use memory_propose / memory_update / memory_delete to propose changes.`,
+Use this when the system prompt says memories need review, or when cleaning up memory. It also reports how the background audit last went for each store (including failures). It never edits anything; use memory_propose / memory_update / memory_delete to propose changes.`,
     args: {
       include_retired: z
         .boolean()
@@ -387,75 +483,124 @@ Use this when the system prompt says memories need review, or when cleaning up m
         .describe("Also list retired memories. Default false."),
     },
     async execute({ include_retired }, context) {
-      const active = await listActiveMemories(context.directory)
-      const staged = await listStagedProposals(context.directory)
-      const retired = include_retired ? await listRetiredMemories(context.directory) : []
-
+      const stores = await resolveStores(context.directory, config)
       const now = new Date()
-      const aging = active
-        .map((m) => ({ memory: m, age: memoryAge(m, now) }))
-        .filter((a) => !Number.isNaN(a.age) && a.age >= config.staleDays)
-        .sort((a, b) => b.age - a.age)
-
       const lines: string[] = []
-      lines.push(`## Active memories (${active.length})`)
-      if (active.length === 0) lines.push("None.")
-      for (const m of active) lines.push(`- [${m.id}] ${m.title}`)
 
-      lines.push("", `## Pending proposals — not yet merged (${staged.length})`)
-      if (staged.length === 0) lines.push("None.")
-      for (const m of staged) {
-        const kind = m.intent === "retire" ? "retire" : "propose"
-        const note = m.intent === "retire" ? ` (retire, reason: ${m.retiredReason ?? "stale"})` : ""
-        lines.push(`- [${m.id}] ${m.title} (${kind})${note}`)
+      if (!stores.global) {
+        if (stores.globalProblem === "disabled") {
+          // Deliberate configuration: say it once, briefly, without a path.
+          lines.push("## Global store", "Disabled by configuration; project memory only.", "")
+        } else {
+          lines.push("## Global store", globalProblemToolMessage(stores.globalProblem ?? "missing", stores.globalPath), "")
+        }
       }
 
-      lines.push("", `## Aging memories (not touched for ${config.staleDays}+ days)`)
-      if (aging.length === 0) lines.push("None.")
-      for (const a of aging) lines.push(`- [${a.memory.id}] ${a.memory.title} (${a.age} days)`)
-      if (aging.length > 0) {
-        lines.push("", "For aging memories: check whether they still hold. If yes, propose a refresh with memory_update; if not, memory_delete with a reason.")
+      let totalActive = 0
+      for (const store of availableStores(stores)) {
+        const label = store.scope === "global" ? "Global" : "Project"
+        const active = await listActiveMemories(store.root)
+        const staged = await listStagedProposals(store.root)
+        const retired = include_retired ? await listRetiredMemories(store.root) : []
+        totalActive += active.length
+
+        lines.push(`## ${label} store`, "", `### Active memories (${active.length})`)
+        if (active.length === 0) lines.push("None.")
+        for (const m of active) lines.push(`- [${m.id}] ${m.title}`)
+
+        lines.push("", `### Pending proposals — not yet merged (${staged.length})`)
+        if (staged.length === 0) lines.push("None.")
+        for (const m of staged) {
+          const kind = m.intent === "retire" ? "retire" : "propose"
+          const note = m.intent === "retire" ? ` (retire, reason: ${m.retiredReason ?? "stale"})` : ""
+          lines.push(`- [${m.id}] ${m.title} (${kind})${note}`)
+        }
+
+        const aging = active
+          .map((m) => ({ memory: m, age: memoryAge(m, now) }))
+          .filter((a) => !Number.isNaN(a.age) && a.age >= config.staleDays)
+          .sort((a, b) => b.age - a.age)
+        lines.push("", `### Aging memories (not touched for ${config.staleDays}+ days)`)
+        if (aging.length === 0) lines.push("None.")
+        for (const a of aging) lines.push(`- [${a.memory.id}] ${a.memory.title} (${a.age} days)`)
+
+        lines.push("", "### Background audit")
+        lines.push(...(await describeAuditStatus(store.root, config)))
+
+        if (include_retired) {
+          lines.push("", `### Retired memories (${retired.length})`)
+          if (retired.length === 0) lines.push("None.")
+          for (const m of retired) lines.push(`- [${m.id}] ${m.title}${m.retiredReason ? ` (${m.retiredReason})` : ""}`)
+        }
+        lines.push("")
       }
 
-      lines.push("", "## Background audit")
-      lines.push(...(await describeAuditStatus(context.directory, config)))
-
-      if (include_retired) {
-        lines.push("", `## Retired memories (${retired.length})`)
-        if (retired.length === 0) lines.push("None.")
-        for (const m of retired) lines.push(`- [${m.id}] ${m.title}${m.retiredReason ? ` (${m.retiredReason})` : ""}`)
+      if (totalActive > 0) {
+        lines.push("For aging memories: check whether they still hold. If yes, propose a refresh with memory_update; if not, memory_delete with a reason.")
       }
 
-      return { title: `Memory review (${active.length} active)`, output: lines.join("\n") }
+      return { title: `Memory review (${totalActive} active)`, output: lines.join("\n") }
     },
   })
 
   // ── memory_publish ────────────────────────────────────────────────────────
 
   const memory_publish = tool({
-    description: `Publish staged memory proposals as pull requests. Call it once after you finish proposing (memory_propose / memory_update / memory_delete), or when memory_review shows pending proposals.
+    description: `Publish staged memory proposals as pull requests, in every store that has pending proposals.
 
-Safe to call without asking the user: it runs the memory bot in a throwaway git worktree, so the user's checkout, branch and uncommitted files are never touched, and it only opens PRs. The human merge is the approval gate; nothing becomes an active memory until a person merges. It takes no arguments and cannot run arbitrary git commands.
+Each store publishes into its own repository: global proposals open a pull request against the private memory repository, project proposals against the current repository.
 
-Returns the opened PR URLs. Proposals whose push or PR step failed stay staged and are retried on the next call.`,
+Safe to call without asking the user: it runs the memory bot in a throwaway git worktree per store, so the user's checkout, branch and uncommitted files are never touched, and it only opens PRs. The human merge is the approval gate; nothing becomes an active memory until a person merges. It takes no arguments and cannot run arbitrary git commands.
+
+Returns the opened PR URLs, grouped by store. Proposals whose push or PR step failed stay staged and are retried on the next call; one store failing never blocks the other.`,
     args: {},
     async execute(_args, context) {
-      try {
-        const lines: string[] = []
-        const res = await processStagingOnce(context.directory, { log: (l) => lines.push(l) })
-        await logger.info("memory_publish", `promoted=${res.promoted} recovered=${res.recovered} skipped=${res.skipped} failed=${res.failed}`)
-        if (res.busy) return { title: "Memory publish busy", output: "Another memory bot run is in progress. Try again shortly." }
-        if (res.promoted + res.recovered + res.skipped + res.failed === 0) {
-          return { title: "Memory publish", output: "No staged proposals." }
+      const stores = await resolveStores(context.directory, config)
+      const targets = availableStores(stores)
+      const sections: string[] = []
+      let promoted = 0
+      let recovered = 0
+      let skipped = 0
+      let failed = 0
+      const prs: string[] = []
+
+      for (const store of targets) {
+        const label = store.scope === "global" ? "Global" : "Project"
+        try {
+          const lines: string[] = []
+          const res = await processStagingOnce(store.root, { log: (l) => lines.push(l) })
+          const handled = res.promoted + res.recovered + res.skipped + res.failed
+          if (res.busy) {
+            sections.push(`${label} store: another bot run is in progress; nothing was processed.`)
+            continue
+          }
+          if (handled === 0) continue
+          promoted += res.promoted
+          recovered += res.recovered
+          skipped += res.skipped
+          failed += res.failed
+          prs.push(...res.prs)
+          const summary = `${label} store: opened ${res.promoted}; recovered ${res.recovered} already-pushed; skipped ${res.skipped}; failed ${res.failed}.`
+          sections.push(lines.length > 0 ? `${summary}\n${lines.map((l) => `  ${l}`).join("\n")}` : summary)
+        } catch (err) {
+          failed += 1
+          sections.push(`${label} store: could not publish — ${err instanceof Error ? err.message : String(err)}`)
         }
-        const out = [`Opened ${res.promoted} PR${res.promoted === 1 ? "" : "s"}; recovered ${res.recovered} already-pushed; skipped ${res.skipped}; failed ${res.failed}.`]
-        if (res.prs.length) out.push("", ...res.prs.map((u) => `- ${u}`))
-        if (lines.length) out.push("", "Log:", ...lines.map((l) => `  ${l}`))
-        return { title: `Memory published (${res.promoted})`, output: out.join("\n") }
-      } catch (err) {
-        await logger.error("memory_publish", err)
-        return { title: "Memory publish failed", output: `Could not publish: ${err instanceof Error ? err.message : String(err)}` }
       }
+
+      await logger.info("memory_publish", `promoted=${promoted} recovered=${recovered} skipped=${skipped} failed=${failed}`)
+
+      if (sections.length === 0) {
+        const note = stores.global
+          ? "No staged proposals."
+          : `No staged proposals. ${globalProblemToolMessage(stores.globalProblem ?? "missing", stores.globalPath)}`
+        return { title: "Memory publish", output: note }
+      }
+
+      const out = [`Opened ${promoted} PR${promoted === 1 ? "" : "s"}; recovered ${recovered} already-pushed; skipped ${skipped}; failed ${failed}.`]
+      if (prs.length) out.push("", ...prs.map((u) => `- ${u}`))
+      out.push("", ...sections)
+      return { title: `Memory published (${promoted})`, output: out.join("\n") }
     },
   })
 

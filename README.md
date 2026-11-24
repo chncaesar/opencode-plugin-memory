@@ -4,7 +4,7 @@
 
 [![npm version](https://img.shields.io/npm/v/@chncaesar/opencode-plugin-memory)](https://www.npmjs.com/package/@chncaesar/opencode-plugin-memory)
 
-PR-gated, project-scoped persistent memory for [OpenCode](https://opencode.ai). The LLM proposes durable knowledge; a human approves it by merging a pull request before it becomes shared truth. No cloud dependency, no vector database.
+PR-gated persistent memory for [OpenCode](https://opencode.ai): global knowledge that follows you into every repository, plus a per-repository store that travels with the project. The LLM proposes durable knowledge; a human approves it by merging a pull request before it becomes shared truth. No cloud dependency, no vector database.
 
 > **Full user guide: <https://chncaesar.github.io/opencode-plugin-memory/>**
 > Installation options, all configuration parameters, the bot, background audit, and troubleshooting live there. This README covers only the essentials.
@@ -44,5 +44,4 @@ Contributions are welcome through GitHub issues and pull requests. Run `npm test
 ## Links
 
 - [User guide](https://chncaesar.github.io/opencode-plugin-memory/) (English)
-- [Project repository](https://github.com/chncaesar/opencode-plugin-memory)
 - [Report an issue](https://github.com/chncaesar/opencode-plugin-memory/issues)

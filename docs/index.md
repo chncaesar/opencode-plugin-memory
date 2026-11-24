@@ -4,11 +4,11 @@ title: OpenCode Plugin Memory User Guide
 
 # OpenCode Plugin Memory User Guide
 
-Give OpenCode a way to remember useful project knowledge across sessions, without letting an agent silently turn its own conclusions into shared rules.
+Give OpenCode a way to remember useful knowledge across sessions — your own knowledge, which follows you into every repository, and knowledge that belongs to one repository — without letting an agent silently turn its own conclusions into shared rules.
 
-The plugin is project-scoped. An agent proposes a memory, a local bot opens a pull request, and a person reviews and merges it. Only merged memories are active. They live in your repository as Markdown; no vector database or hosted memory service is required.
+Memory has two stores. **Global** memory is one private repository of yours, cloned on this machine and injected into every session. **Project** memory lives in a repository's own `memory/` folder and travels with it. In both cases an agent proposes an entry, a local bot opens a pull request, and a person reviews and merges it; only merged entries are active. Everything is Markdown in Git; no vector database or hosted memory service is required.
 
-This guide covers version 0.6.0.
+This guide covers version 0.7.0.
 
 ## Before you begin
 
@@ -69,6 +69,10 @@ If you already have other OpenCode settings or plugins, add the entry to your ex
 | `auditBatchChars` | `400000` | Maximum characters of memory text per audit batch. Lower it when the audit model has a smaller context window. |
 | `auditModel` | Host default | Select the host model for audits as `providerID/modelID`. Ignored when `auditProvider` is set. |
 | `auditProvider` | Not configured | Use a separate OpenAI-compatible endpoint and credentials for audits instead of the host's model call. See [Use a separate audit provider](#use-a-separate-audit-provider). |
+| `globalMemoryEnabled` | `true` | Enable the global store. Set to `false` to keep memory inside each project, as earlier versions did. |
+| `globalMemoryPath` | `~/.local/share/opencode/memory` | Where the global store is cloned on this machine. A leading `~` is expanded. |
+| `defaultScope` | `global` | Store used when a proposal does not name one. Falls back to `project` when the global store is unavailable, so a missing clone never blocks a proposal. |
+| `globalIndexShare` | `0.7` | Share of `maxSummaryChars` the global index may use. The project index keeps at least the rest reserved, so a large global store cannot push project entries out of the prompt. Unused budget is shared back. |
 
 An audit interval is a minimum, not a promise that an audit will run on a timer: the plugin also checks conditions such as whether the active memories have changed. Batch size is measured in characters, not tokens. The default assumes a large context window; leave room for the prompt and response when choosing a smaller value. Individual memories are not split, and related entries in different batches can still be missed.
 
@@ -125,6 +129,20 @@ For example, add `"headers": { "X-Provider-Header": "value" }` inside `auditProv
 
 An explicit `auditProvider` takes precedence over `auditModel`. If the provider configuration is incomplete, the audit reports an error rather than silently switching credentials. For a model with a smaller context window, lower `auditBatchChars`.
 
+### Set up the global store
+
+Global memory is optional but recommended: without it, knowledge learned in one checkout never reaches another, and every proposal opens a pull request in whichever repository you happen to be working in.
+
+1. Create a **private** repository for your own memories.
+2. Clone it to `globalMemoryPath` (default `~/.local/share/opencode/memory`). It is a working copy of that repository, so keep it outside any project directory.
+3. Give it the same layout as a project store: `memory/active/`, `memory/retired/`, and a `.gitignore` containing `.memory/` — that folder holds local staging, the bot lock and the log, which must never be committed.
+
+If the folder is missing, nothing breaks: the plugin says so in the prompt and writes proposals to the project store instead. A clone can be added at any time; the next session picks it up without a restart.
+
+Proposals default to the global store. Use `scope: "project"` when the rule would be wrong, or pointless, in a different repository — its architecture, module names, business definitions, or a convention its contributors must follow. Everything else (tool and API behaviour, infrastructure, personal preferences, review rules) is global.
+
+The two indexes share one character budget. The global store may use up to `globalIndexShare` of it, while the project store keeps at least the remainder reserved; budget one side does not need is available to the other. A truncated section says so and points at `memory_read`.
+
 ## 2. Propose a memory
 
 Work in your project as usual. When you encounter a lesson that would help another session, you can ask:
@@ -139,7 +157,7 @@ Prefer project instructions for mandatory, explicitly maintained rules. Avoid st
 
 ## 3. Publish and review
 
-Ask the agent to publish the staged proposals. It can call `memory_publish`, which runs the local bot once. The bot uses a temporary Git worktree to create a branch and open a pull request for each proposal; it does not switch your current branch or modify your uncommitted work.
+Ask the agent to publish the staged proposals. It can call `memory_publish`, which runs the local bot once per store. The bot uses a temporary Git worktree to create a branch and open a pull request for each proposal; it does not switch your current branch or modify your uncommitted work. **Each proposal opens its pull request in the repository its store belongs to**: a global proposal in your private memory repository, a project proposal in the project repository. A failure in one store never blocks the other.
 
 You can also run the bot yourself from the project directory:
 
@@ -147,13 +165,15 @@ You can also run the bot yourself from the project directory:
 npx -p @chncaesar/opencode-plugin-memory opencode-memory-bot once
 ```
 
+To publish the global store by hand, point the bot at the clone instead: add `--dir <global clone>`.
+
 Review each pull request on GitHub. Check whether the proposed knowledge is correct, useful beyond the current task, and consistent with existing project instructions. **Merging the pull request is the approval step.** Until then, the proposal is not shared truth.
 
 If publishing fails, the proposal remains staged for a later retry. A previously pushed branch can be recovered without creating a duplicate commit. If the bot reports a skipped retirement because its target is no longer active, the staged proposal remains and requires attention.
 
 ## 4. Use a memory in a later session
 
-After the pull request is merged, update the working branch where you want to use the memory so it contains the merged change. In a new session, the plugin derives an index of active memory titles and IDs from that checkout. When a title is relevant, the agent can read the full entry.
+After the pull request is merged, update the working branch where you want to use the memory so it contains the merged change. Global memories need one pull in the global store's clone; project memories need the pull in that project. In a new session, the plugin derives an index of active memory titles and IDs from both stores. When a title is relevant, the agent can read the full entry.
 
 Only the index is injected by default, not every memory body. The index has a configurable size limit; if it is full, the agent can use `memory_review` or `memory_read` to inspect entries beyond the injected subset.
 
@@ -187,13 +207,12 @@ The audit uses the host's model by default. To send audits to a separate OpenAI-
 
 ## Where the information lives
 
-| Location | Purpose |
-| --- | --- |
-| `.memory/staging/` | Local, Git-ignored proposals awaiting publication |
-| `memory/active/` | Merged memories available to sessions in this checkout |
-| `memory/retired/` | Retired memories and their history |
+| Store | Location | Purpose |
+| --- | --- | --- |
+| Global | Your private repository, cloned at `globalMemoryPath` | `.memory/staging/` holds local, Git-ignored proposals; `memory/active/` holds merged entries injected into every session; `memory/retired/` keeps history |
+| Project | The current repository | The same three folders, scoped to this repository and shared with whoever has it |
 
-The prompt index is derived from active memories; there is no generated index file to commit or CI job to wait for. Your checkout still needs the merged changes before it can see them.
+The prompt index is derived from active memories in both stores; there is no generated index file to commit or CI job to wait for. Your checkout still needs the merged changes before it can see them.
 
 ## Troubleshooting
 
@@ -202,6 +221,8 @@ The prompt index is derived from active memories; there is no generated index fi
 **A proposal did not produce a pull request.** Confirm the repository has an `origin` remote, your account can push to it, and GitHub CLI is installed and authenticated. The bot reports failures and retains failed proposals for retry.
 
 **The audit reports a missing API key.** Check the configured provider, environment variable or key file, and restart OpenCode after updating configuration. A partially configured provider does not fall back silently.
+
+**A later session sees only some of my memories, or says global memory is not configured.** A missing global clone degrades to project-only memory instead of failing. Check that `globalMemoryPath` exists and is a clone of your private memory repository; proposals already staged in the global store stay there. If both stores have entries but one section is truncated, raise `maxSummaryChars` — the two sections share it.
 
 **The audit fails on a large memory collection.** Check that the audit model works and supports the request size. Reduce `auditBatchChars` if its context window is smaller than the default assumes. Batching limits the size of individual requests but may miss cross-batch relationships.
 

@@ -4,7 +4,7 @@
 
 [![npm version](https://img.shields.io/npm/v/@chncaesar/opencode-plugin-memory)](https://www.npmjs.com/package/@chncaesar/opencode-plugin-memory)
 
-给 [OpenCode](https://opencode.ai) 用的项目级持久记忆，以合并 PR 作为生效条件。LLM 只负责提出值得记住的知识，由人合并 pull request 之后，它才成为共享事实。不依赖云服务，不需要向量数据库。
+给 [OpenCode](https://opencode.ai) 用的持久记忆，以合并 PR 作为生效条件：一份跟着你走进所有仓库的全局记忆，加上一份随仓库同行的项目记忆。LLM 只负责提出值得记住的知识，由人合并 pull request 之后，它才成为共享事实。不依赖云服务，不需要向量数据库。
 
 > **完整使用手册（英文）：<https://chncaesar.github.io/opencode-plugin-memory/>**
 > 安装方式、全部配置参数、机器人的用法、后台审计和故障排查都在手册里。该手册目前只有英文版。本 README 只讲最要紧的部分。
@@ -44,5 +44,4 @@ npm test            # 编译并运行单元测试（Node 内置测试运行器�
 ## 链接
 
 - [使用手册](https://chncaesar.github.io/opencode-plugin-memory/)（英文）
-- [项目仓库](https://github.com/chncaesar/opencode-plugin-memory)
 - [问题反馈](https://github.com/chncaesar/opencode-plugin-memory/issues)

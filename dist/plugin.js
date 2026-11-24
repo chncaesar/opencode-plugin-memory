@@ -1,7 +1,8 @@
 import { DEFAULT_CONFIG } from "./types.js";
 import { createMemoryTools } from "./tools.js";
-import { buildSystemPrompt, loadMemoryBlock } from "./summary.js";
+import { buildSystemPrompt, loadPromptBlock } from "./summary.js";
 import { listStagedProposals } from "./storage.js";
+import { availableStores, resolveStores } from "./stores.js";
 import { createLogger } from "./logging.js";
 import { migrateLegacyStores } from "./migrate.js";
 import { auditWarning, createAuditScheduler, createHttpModelCall, createSdkModelCall, } from "./audit.js";
@@ -37,6 +38,18 @@ export function resolveConfig(options) {
         auditBatchChars: typeof raw["auditBatchChars"] === "number" && raw["auditBatchChars"] > 0
             ? raw["auditBatchChars"]
             : DEFAULT_CONFIG.auditBatchChars,
+        globalMemoryEnabled: typeof raw["globalMemoryEnabled"] === "boolean"
+            ? raw["globalMemoryEnabled"]
+            : DEFAULT_CONFIG.globalMemoryEnabled,
+        globalMemoryPath: typeof raw["globalMemoryPath"] === "string" && raw["globalMemoryPath"].trim().length > 0
+            ? raw["globalMemoryPath"].trim()
+            : DEFAULT_CONFIG.globalMemoryPath,
+        defaultScope: raw["defaultScope"] === "project" || raw["defaultScope"] === "global"
+            ? raw["defaultScope"]
+            : DEFAULT_CONFIG.defaultScope,
+        globalIndexShare: typeof raw["globalIndexShare"] === "number" && raw["globalIndexShare"] > 0 && raw["globalIndexShare"] < 1
+            ? raw["globalIndexShare"]
+            : DEFAULT_CONFIG.globalIndexShare,
     };
     const audit = parseAuditProvider(raw["auditProvider"]);
     if (audit.provider)
@@ -102,22 +115,28 @@ export function resolveAuditCall(config, hostCall) {
  */
 async function injectMemoryBlock(directory, config, logger) {
     try {
-        const block = await loadMemoryBlock(directory, config.maxSummaryChars, async (problems) => {
+        const stores = await resolveStores(directory, config);
+        const block = await loadPromptBlock(stores, config.maxSummaryChars, config.globalIndexShare, async (problems) => {
             for (const problem of problems)
                 await logger.error("index", `${problem.code} ${problem.file}`);
         });
         const notices = [block];
-        const warning = await auditWarning(directory, config).catch(() => null);
-        if (warning)
-            notices.push(warning);
-        const pending = await pendingPublishNotice(directory).catch(() => null);
-        if (pending)
-            notices.push(pending);
+        for (const store of availableStores(stores)) {
+            const warning = await auditWarning(store.root, config).catch(() => null);
+            if (warning)
+                notices.push(warning);
+            const pending = await pendingPublishNotice(store.root, store.scope).catch(() => null);
+            if (pending)
+                notices.push(pending);
+        }
         return notices.join("\n\n");
     }
     catch (err) {
         await logger.error("system-prompt", err);
-        return buildSystemPrompt([], config.maxSummaryChars, { indexUnavailable: true });
+        return buildSystemPrompt({
+            project: { scope: "project", memories: [], omitted: 0, unavailable: true },
+            globalNotice: "Global memory is unavailable this session.",
+        }, config.maxSummaryChars, config.globalIndexShare);
     }
 }
 /**
@@ -125,15 +144,19 @@ async function injectMemoryBlock(directory, config, logger) {
  * audit stages retire proposals while no model is in the loop, so without this
  * nothing would ever prompt a `memory_publish` call. Same rule as for
  * memory_propose/update/delete: the model publishes, the human merges.
+ *
+ * Each store is reported separately: a global proposal opens its PR in the
+ * memory repository, a project proposal in the current one.
  */
-export async function pendingPublishNotice(directory) {
+export async function pendingPublishNotice(directory, scope = "project") {
     const staged = await listStagedProposals(directory);
     if (staged.length === 0)
         return null;
     const lines = staged.slice(0, 10).map((m) => `- [${m.id}] ${m.title} (${m.intent === "retire" ? "retire" : "propose"})`);
     const more = staged.length > lines.length ? `\n… and ${staged.length - lines.length} more` : "";
+    const where = scope === "global" ? "the global store" : "the project store";
     return [
-        `[memory plugin] ${staged.length} staged memory proposal${staged.length === 1 ? " has" : "s have"} no pull request yet:`,
+        `[memory plugin] ${staged.length} staged memory proposal${staged.length === 1 ? " has" : "s have"} no pull request yet in ${where}:`,
         lines.join("\n") + more,
         "Call memory_publish to open the pull requests (the human merge is the approval gate; no confirmation is needed).",
     ].join("\n");
@@ -173,13 +196,19 @@ export const server = async (input, options) => {
         const tui = input.client.tui;
         await tui?.showToast?.({ body: { message, variant: "warning" } });
     };
-    const scheduler = createAuditScheduler({
-        directory,
-        config,
-        notify,
-        logger,
-        call: resolveAuditCall(config, createSdkModelCall(input.client, directory, auditSessions)),
-    }, auditSessions);
+    // One scheduler per store root, created lazily: a global store cloned after
+    // the session started is picked up without a restart. The audit itself reads
+    // only its own store, so the two never see each other's context.
+    const sdkCall = resolveAuditCall(config, createSdkModelCall(input.client, directory, auditSessions));
+    const schedulers = new Map();
+    const schedulerFor = (root) => {
+        let scheduler = schedulers.get(root);
+        if (!scheduler) {
+            scheduler = createAuditScheduler({ directory: root, config, notify, logger, call: sdkCall }, auditSessions);
+            schedulers.set(root, scheduler);
+        }
+        return scheduler;
+    };
     const memoryTools = createMemoryTools(config, logger);
     const hooks = {
         // ── Register the restricted audit agent ───────────────────────────────
@@ -198,10 +227,14 @@ export const server = async (input, options) => {
             memory_review: memoryTools.memory_review,
             memory_publish: memoryTools.memory_publish,
         },
-        // ── Background audit: run after a session goes idle ───────────────────
+        // ── Background audit: run after a session goes idle, once per store ────
         event: async ({ event }) => {
-            if (event.type === "session.idle")
-                scheduler.onSessionIdle(event.properties.sessionID);
+            if (event.type !== "session.idle")
+                return;
+            const stores = await resolveStores(directory, config);
+            for (const store of availableStores(stores)) {
+                schedulerFor(store.root).onSessionIdle(event.properties.sessionID);
+            }
         },
         // ── Inject the committed memory index into every system prompt ─────────
         "experimental.chat.system.transform": async (hookInput, output) => {
@@ -289,7 +322,18 @@ export async function setup(ctx) {
     // Read ctx.experimental lazily: a host without it must not stop the plugin from loading.
     const hostCall = createV2ModelCall((input, opts) => ctx.experimental.generate.text(input, opts), auditModel);
     const call = resolveAuditCall(config, hostCall);
-    const scheduler = createAuditScheduler({ directory, config, logger, call }, new Set());
+    // One scheduler per store root, created lazily so a global store cloned later
+    // is audited without a restart.
+    const auditSessions = new Set();
+    const schedulers = new Map();
+    const schedulerFor = (root) => {
+        let scheduler = schedulers.get(root);
+        if (!scheduler) {
+            scheduler = createAuditScheduler({ directory: root, config, logger, call }, auditSessions);
+            schedulers.set(root, scheduler);
+        }
+        return scheduler;
+    };
     const memoryTools = createMemoryTools(config, logger);
     const registrations = [];
     registrations.push(await ctx.tool.transform((editor) => {
@@ -313,8 +357,11 @@ export async function setup(ctx) {
         event.system.push({ type: "text", text: await injectMemoryBlock(directory, config, logger) });
     }));
     if (config.backgroundAudit) {
-        registrations.push(await ctx.session.hook("experimental.idle", (event) => {
-            scheduler.onSessionIdle(event.sessionID);
+        registrations.push(await ctx.session.hook("experimental.idle", async (event) => {
+            const stores = await resolveStores(directory, config);
+            for (const store of availableStores(stores)) {
+                schedulerFor(store.root).onSessionIdle(event.sessionID);
+            }
         }));
     }
     return async () => {

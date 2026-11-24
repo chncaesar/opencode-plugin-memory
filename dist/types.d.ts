@@ -57,6 +57,16 @@ export type Memory = {
  */
 export type MemoryStatus = "active" | "retired" | "staging";
 /**
+ * Which store a memory belongs to.
+ * - `global` — the personal store, read by every session in every repository.
+ * - `project` — the store that lives with one repository and is shared with
+ *   whoever has that repository.
+ *
+ * Scope is a property of the store, not of the file: the same layout is used
+ * for both, so a memory moved between stores keeps its identity and history.
+ */
+export type Scope = "global" | "project";
+/**
  * An endpoint the audit can call itself, with its own credential.
  *
  * The host-mediated audit asks the host to generate text, so it inherits
@@ -133,6 +143,35 @@ export type PluginConfig = {
      * back to the host's credential.
      */
     auditProviderError?: string;
+    /**
+     * Enable the global (personal) memory store, shared by every repository.
+     * Disabling it leaves only the project store, which is the behaviour of
+     * earlier versions.
+     * @default true
+     */
+    globalMemoryEnabled: boolean;
+    /**
+     * Where the global store is cloned on this machine. A leading `~` is
+     * expanded. The folder must exist and be a git clone of the private memory
+     * repository; when it is missing the plugin degrades to project-only memory
+     * instead of failing.
+     * @default "~/.local/share/opencode/memory"
+     */
+    globalMemoryPath: string;
+    /**
+     * Scope used when a proposal does not name one. Falls back to `project` when
+     * the global store is unavailable.
+     * @default "global"
+     */
+    defaultScope: Scope;
+    /**
+     * Share of `maxSummaryChars` the global index may occupy. At least the
+     * remainder stays reserved for the project index, so a large global store can
+     * never push project entries out of the prompt entirely. Unused budget is
+     * available to the other store.
+     * @default 0.7
+     */
+    globalIndexShare: number;
 };
 export declare const DEFAULT_CONFIG: PluginConfig;
 //# sourceMappingURL=types.d.ts.map

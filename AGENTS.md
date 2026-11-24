@@ -1,15 +1,24 @@
 # opencode-plugin-memory
 
-OpenCode plugin that gives the LLM PR-gated, project-scoped persistent memory. The LLM proposes durable knowledge; a human approves it by merging a pull request before it becomes shared truth.
+OpenCode plugin that gives the LLM PR-gated persistent memory in two stores: a global one (a private repository cloned on the machine, read by every session) and a project one (a repository's own `memory/` folder). The LLM proposes durable knowledge; a human approves it by merging a pull request before it becomes shared truth.
 
 ## What This Is
 
 An OpenCode plugin (`server` / `setup` hook) that:
-- Registers five tools (`memory_propose`, `memory_update`, `memory_delete`, `memory_read`, `memory_review`) the LLM calls during every session
-- Injects a compact index of active-memory titles into every system prompt (never full bodies)
+- Registers six tools (`memory_propose`, `memory_update`, `memory_delete`, `memory_read`, `memory_review`, `memory_publish`) the LLM calls during every session
+- Injects a compact index of active-memory titles from both stores into every system prompt (never full bodies)
 - Runs an optional, model-judged semantic audit after sessions go idle (duplicate / refinement / contradiction detection via a restricted `memory-audit` subagent)
 
 The LLM never writes shared truth directly. It only writes a proposal file into a machine-local, git-ignored `.memory/staging/` folder. A local **bot** (`src/bot.ts`) watches staging, branches, commits each proposal into `memory/active/`, and opens a pull request. A human merges it — merge is the only approval. The next session derives its prompt index from `memory/active/`.
+
+## Two stores
+
+- **Global** — one private repository of the user, cloned at `globalMemoryPath` (default `~/.local/share/opencode/memory`), read by every session in every repository. Proposals default here.
+- **Project** — the current repository's own `memory/` folder, shared with whoever has the repository. Used only for knowledge that is true because of that repository.
+
+Both stores use the same layout and the same code; a store is just a root directory. Each has its own staging folder, bot lock, audit state and pull-request flow, so one store failing never blocks the other. A missing or unreadable global store degrades to project-only memory — it must never break a session. A supersede stays inside one store, because the replacement must retire its target in the same PR.
+
+The two prompt indexes share `maxSummaryChars`; the project store keeps at least `1 - globalIndexShare` of it reserved so a large global store cannot hide project entries, and unused budget goes to the other side. See `src/stores.ts`.
 
 ## File Layout
 
@@ -17,8 +26,9 @@ The LLM never writes shared truth directly. It only writes a proposal file into 
 src/
   index.ts        Plugin entry point — default export { id, server, setup }
   plugin.ts       server (V1) + setup (V2) hooks, config resolution, wiring
-  tools.ts        Five memory tools (the LLM calls these; propose-only)
+  tools.ts        Six memory tools (the LLM calls these; propose-only)
   storage.ts      Paths, frontmatter↔Memory mapping, read/write, id generation
+  stores.ts       Global/project store resolution, scope defaults, degradation
   frontmatter.ts  Hand-rolled YAML frontmatter parse/serialize (zero-dependency)
   summary.ts      Prompt-index builder and the injected system-prompt block
   migrate.ts      Legacy MEMORY.md → per-file migration (idempotent)
@@ -52,30 +62,33 @@ Frontmatter fields (see `types.ts` `Memory`):
 - `tags`, `author`, `source` — grouping and provenance
 - `proposed_at`, `approved_at`, `approved_by` — lifecycle timestamps/actors
 - `supersedes` / `superseded_by` — forward and back links between replaced memories
-- `retired_at`, `retired_reason` — retirement time + fixed-vocabulary reason (`wrong`, `stale`, `useless`, `superseded`, `duplicate`)
+- `retired_at`, `retired_reason` — retirement time + fixed-vocabulary reason (`wrong`, `stale`, `useless`, `superseded`, `duplicate`, `implemented`); `implemented` records that the rule graduated into code/tests/docs and the memory would only duplicate it
 - `related_pr` — optional link to a motivating code change (provenance only)
 - `intent` — staging-only directive for the bot: `propose` (default) or `retire`
 
-Only `memory/active/` is ever injected into context; `retired/` and staging are never read by the runtime.
+Only `memory/active/` in each store is ever injected into context; `retired/` and staging are never read by the runtime.
 
-## The Five Tools
+## The Tools
 
-All tools are **propose-only**. They write to `.memory/staging/`; none edits `active/` or `retired/`.
+All tools are **propose-only**. They write to the chosen store's `.memory/staging/`; none edits `active/` or `retired/`.
 
 ### `memory_propose`
-Writes `mem-<id>.md` to staging with `intent: propose`, after a duplicate check (against active + staging), a secret scan, and granularity/title-coherence validation. `supersedes: [old-id]` marks the proposal as a replacement for active memories.
+Writes `mem-<id>.md` to the target store's staging (`scope`: `global` by default, else `project`) with `intent: propose`, after a duplicate check against both stores, a secret scan, and granularity/title-coherence validation. `supersedes: [old-id]` marks the proposal as a replacement for active memories **in the same store**; cross-store ids are rejected so the bot can retire the target in the same PR.
 
 ### `memory_update`
-Does not edit the active memory. Proposes a new memory carrying `supersedes: [id]`. Omitted fields are copied from the existing memory.
+Does not edit the active memory. Finds the entry in whichever store holds it, then proposes a new memory carrying `supersedes: [id]` into that same store. Omitted fields are copied from the existing memory.
 
 ### `memory_delete`
-Does not edit the active memory. Proposes a retirement: a staging file with `intent: retire` naming the target `id` and a `retired_reason`.
+Does not edit the active memory. Proposes a retirement: a staging file with `intent: retire` naming the target `id` and a `retired_reason`, in the store that holds the target.
 
 ### `memory_read`
-Returns full bodies of active memories (filterable by keyword) plus the author's own staged proposals (marked "pending — not yet merged"). Retired memories only when `include_retired` is true.
+Returns full bodies of active memories from both stores (filterable by keyword) plus the author's own staged proposals (marked "pending — not yet merged"). Retired memories only when `include_retired` is true. Output is grouped by store, so the origin of every entry is explicit.
 
 ### `memory_review`
-Read-only overview: active memories (id + title), pending proposals, aging entries, and retired (on request). Never edits anything.
+Read-only overview per store: active memories (id + title), pending proposals, aging entries, audit status, and retired (on request). Never edits anything.
+
+### `memory_publish`
+Runs the bot once per store with pending proposals and returns the PR URLs grouped by store. A store whose publish fails stays staged and never blocks the other.
 
 ## The Bot
 
@@ -91,11 +104,12 @@ It is idempotent by recovery, not by skipping: a branch already on the remote me
 
 ## System Prompt Injection
 
-The `experimental.chat.system.transform` (V1) / `context` (V2) hook runs before every request. It builds the index from `memory/active/` and injects:
+The `experimental.chat.system.transform` (V1) / `context` (V2) hook runs before every request. It builds one index per available store and injects:
 
-- a memory-system introduction ("PR-gated project memory system");
-- the index — one `[mem-XXXX] Title` line per active memory (titles and IDs only, never bodies), truncated to `maxSummaryChars` with a "showing a subset" notice when long;
-- the complete writing policy (see `prompt.ts`), including granularity/title-coherence rules and few-shot examples.
+- an introduction naming both stores and the default ("global unless this repository is what makes it true");
+- the global index, then the project index — one `[mem-XXXX] Title` line per active memory (titles and IDs only, never bodies) — sharing `maxSummaryChars`, with the project section's `1 - globalIndexShare` reserved and per-section truncation notices;
+- a one-line, path-free notice when the global store is unusable (the path appears only in tool output);
+- the complete writing policy (see `prompt.ts`), including the store-choice rule, granularity/title-coherence rules and few-shot examples.
 
 Full bodies load only on demand via `memory_read`. Nothing is written: the index is recomputed every time, so it always matches merged truth.
 
@@ -111,7 +125,11 @@ The supported loader uses `setup`. The legacy `server` entry is not a support gu
 
 Options (all optional; see `types.ts` `PluginConfig` / `resolveConfig`):
 
-- `maxSummaryChars` (number, default 10000): max characters for the injected index. The policy is injected separately.
+- `maxSummaryChars` (number, default 10000): shared character budget for both injected indexes. The policy is injected separately.
+- `globalMemoryEnabled` (boolean, default true): enable the global store. `false` reproduces the old project-only behaviour.
+- `globalMemoryPath` (string, default `~/.local/share/opencode/memory`): where the global store is cloned. Missing → project-only, with a notice; never an error.
+- `defaultScope` (`global` | `project`, default `global`): scope for a proposal that does not name one. Falls back to `project` when the global store is unusable, so an omitted scope never fails.
+- `globalIndexShare` (number in (0,1), default 0.7): maximum share of the budget the global index may use; the project index keeps at least the rest reserved.
 - `enableLog` (boolean, default true): write an operation log to `.memory/plugin.log`.
 - `staleDays` (number, default 90): active memories older than this are "aging" in `memory_review`. Informational only — nothing is retired on an age threshold.
 - `backgroundAudit` (boolean, default true): run the model-judged semantic audit after sessions go idle.
@@ -180,9 +198,28 @@ Tests live next to modules as `*.test.ts`. `dist/` is committed for local plugin
 - The English user guide is maintained in [`docs/index.md`](docs/index.md) and published at https://chncaesar.github.io/opencode-plugin-memory/.
 - After each release, review and update the user guide to reflect the released version, including affected features, configuration options, defaults, and examples. Publish the updated guide with the release documentation.
 
+### Release notes are written for readers
+
+Release notes are the input to promotion: automated fact extraction reads them and
+quotes them. A note listing test names produces facts about test names. One
+measured run extracted 39 claims from the v0.6.0 note; 38 described internal
+implementation and only one could be used in an article.
+
+Use these three sections, in this order:
+
+```markdown
+## What you can do now      <!-- one user-visible capability per line, verb-first -->
+## Upgrading               <!-- required steps, or "no action needed" -->
+## Known limitations       <!-- what does not work, stated without hedging -->
+```
+
+Do not write test names, internal file paths, module or function names, or
+"updated tests" / "refactored X" — unless the change is something a user
+perceives. Describe what a reader can now do, not how it was implemented.
+
 ## What This Is Not
 
-- Not a global memory store — scoped to the project directory OpenCode runs in
+- Not project-only, and not one store: a global private store is read in every repository, a project store travels with its repository, and each publishes to its own pull request
 - Not direct-write — the LLM only proposes; merge (not the model) makes a memory valid
 - Not a vector store / keyword scoring — duplicate detection is title/content matching at propose-time plus a model verdict in the background audit
 - Not auto-expiring — nothing is retired on a timer; retirement always goes through a PR

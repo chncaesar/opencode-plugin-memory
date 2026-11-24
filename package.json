@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@chncaesar/opencode-plugin-memory",
-  "version": "0.6.0",
-  "description": "PR-gated, project-scoped persistent memory plugin for OpenCode — the LLM proposes, a bot opens a PR, a human merges, the index is derived from active memories",
+  "version": "0.7.0",
+  "description": "PR-gated persistent memory plugin for OpenCode — a global store shared by every repository plus a per-repository store; the LLM proposes, a bot opens a PR, a human merges, the index is derived from active memories",
   "keywords": [
     "opencode",
     "opencode-plugin",

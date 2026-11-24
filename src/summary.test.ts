@@ -3,9 +3,10 @@ import assert from "node:assert/strict"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
-import { buildIndexLines, buildSystemPrompt, loadMemoryBlock } from "./summary.js"
+import { buildIndexLines, buildSystemPrompt, loadPromptBlock } from "./summary.js"
 import { MEMORY_POLICY_EXAMPLES, MEMORY_WRITE_POLICY } from "./prompt.js"
 import { activeDir, writeMemoryFile } from "./storage.js"
+import type { StoreSet } from "./stores.js"
 import type { Memory } from "./types.js"
 
 function mem(id: string, title: string): Memory {
@@ -21,6 +22,40 @@ async function withDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   }
 }
 
+/** Project-only stores: the global store is absent, as on a machine without a clone. */
+function projectOnly(projectDir: string): StoreSet {
+  return {
+    project: { scope: "project", root: projectDir },
+    defaultScope: "project",
+    globalPath: path.join(projectDir, "no-global-here"),
+    globalProblem: "missing",
+  }
+}
+
+function both(projectDir: string, globalDir: string): StoreSet {
+  return {
+    global: { scope: "global", root: globalDir },
+    project: { scope: "project", root: projectDir },
+    defaultScope: "global",
+    globalPath: globalDir,
+  }
+}
+
+const GLOBAL_HEADING = "Global memory index:"
+const PROJECT_HEADING = "Project memory index (this repository):"
+
+/** The text of one index section, up to the next heading or the policy. */
+function section(block: string, heading: string, next?: string): string {
+  const start = block.indexOf(heading)
+  assert.ok(start >= 0, `missing heading ${heading}`)
+  const rest = block.slice(start + heading.length)
+  const stops = [rest.indexOf("\n\n## When to propose"), next !== undefined ? rest.indexOf(next) : -1].filter((i) => i >= 0)
+  const end = stops.length > 0 ? Math.min(...stops) : -1
+  return end >= 0 ? rest.slice(0, end) : rest
+}
+
+const longTitle = (label: string) => `${label}: ${"细节".repeat(30)}`
+
 describe("buildIndexLines", () => {
   it("emits one line per memory, sorted by id", () => {
     const lines = buildIndexLines([mem("mem-bbbbbbbb", "B"), mem("mem-aaaaaaaa", "A")])
@@ -33,11 +68,11 @@ describe("buildIndexLines", () => {
   })
 })
 
-describe("loadMemoryBlock", () => {
-  it("derives the index from memory/active and writes nothing", async () => {
+describe("loadPromptBlock", () => {
+  it("derives the project index from memory/active and writes nothing", async () => {
     await withDir(async (dir) => {
       await writeMemoryFile(activeDir(dir), mem("mem-aaaaaaaa", "First rule"))
-      const block = await loadMemoryBlock(dir, 2000)
+      const block = await loadPromptBlock(projectOnly(dir), 2000, 0.7)
       assert.match(block, /\[mem-aaaaaaaa\] First rule/)
       // No index file is created or expected.
       await assert.rejects(fs.access(path.join(dir, "memory", "_summary.md")))
@@ -46,18 +81,43 @@ describe("loadMemoryBlock", () => {
 
   it("renders an empty store without creating the memory folder", async () => {
     await withDir(async (dir) => {
-      const block = await loadMemoryBlock(dir, 2000)
+      const block = await loadPromptBlock(projectOnly(dir), 2000, 0.7)
       assert.match(block, /no active memories/)
       await assert.rejects(fs.access(path.join(dir, "memory")))
     })
   })
 
-  it("does not throw when the active store cannot be read, and keeps the policy", async () => {
+  it("explains that global memory is unavailable instead of inventing an index", async () => {
+    await withDir(async (dir) => {
+      const block = await loadPromptBlock(projectOnly(dir), 2000, 0.7)
+      assert.match(block, /Global memory is not configured this session/)
+      // The concrete path belongs in tool output, never in the prompt.
+      assert.ok(!block.includes("no-global-here"))
+    })
+  })
+
+  it("injects both stores with separate headings and no cross-contamination", async () => {
+    await withDir(async (projectDir) => {
+      await withDir(async (globalDir) => {
+        await writeMemoryFile(activeDir(projectDir), mem("mem-aaaaaaaa", "Project rule"))
+        await writeMemoryFile(activeDir(globalDir), mem("mem-bbbbbbbb", "Global rule"))
+        const block = await loadPromptBlock(both(projectDir, globalDir), 4000, 0.7)
+        const globalPart = section(block, GLOBAL_HEADING, PROJECT_HEADING)
+        const projectPart = section(block, PROJECT_HEADING)
+        assert.match(globalPart, /\[mem-bbbbbbbb\] Global rule/)
+        assert.ok(!globalPart.includes("Project rule"))
+        assert.match(projectPart, /\[mem-aaaaaaaa\] Project rule/)
+        assert.ok(!projectPart.includes("Global rule"))
+      })
+    })
+  })
+
+  it("does not throw when a store cannot be read, and keeps the policy", async () => {
     await withDir(async (dir) => {
       await fs.mkdir(path.dirname(activeDir(dir)), { recursive: true })
       await fs.writeFile(activeDir(dir), "not a directory", "utf8")
       const reported: string[][] = []
-      const block = await loadMemoryBlock(dir, 2000, (problems) => {
+      const block = await loadPromptBlock(projectOnly(dir), 2000, 0.7, (problems) => {
         reported.push(problems.map((p) => p.code))
       })
       assert.match(block, /memory index unavailable/)
@@ -74,13 +134,13 @@ describe("loadMemoryBlock", () => {
       await writeMemoryFile(activeDir(dir), mem("mem-aaaaaaaa", "Readable rule"))
       await fs.mkdir(path.join(activeDir(dir), "mem-bbbbbbbb.md"))
       const reported: string[][] = []
-      const block = await loadMemoryBlock(dir, 2000, (problems) => {
+      const block = await loadPromptBlock(projectOnly(dir), 2000, 0.7, (problems) => {
         reported.push(problems.map((p) => p.code))
       })
       assert.match(block, /\[mem-aaaaaaaa\] Readable rule/)
       assert.match(block, /1 memory file could not be read/)
       assert.deepEqual(reported, [["EISDIR"]])
-      const indexPart = block.split("Project memory index:")[1]!.split("## When to propose")[0]!
+      const indexPart = block.split(PROJECT_HEADING)[1]!.split("## When to propose")[0]!
       assert.ok(!/EISDIR|EACCES|cannot read/i.test(indexPart))
     })
   })
@@ -88,7 +148,7 @@ describe("loadMemoryBlock", () => {
   it("still renders the prompt when the diagnostics reporter throws", async () => {
     await withDir(async (dir) => {
       await fs.mkdir(path.join(activeDir(dir), "mem-bbbbbbbb.md"), { recursive: true })
-      const block = await loadMemoryBlock(dir, 2000, () => {
+      const block = await loadPromptBlock(projectOnly(dir), 2000, 0.7, () => {
         throw new Error("reporter exploded")
       })
       assert.ok(block.includes(MEMORY_WRITE_POLICY))
@@ -96,29 +156,90 @@ describe("loadMemoryBlock", () => {
   })
 })
 
+describe("index budget", () => {
+  it("keeps every project entry visible when the global store overflows", async () => {
+    await withDir(async (projectDir) => {
+      await withDir(async (globalDir) => {
+        for (let i = 0; i < 3; i++) {
+          await writeMemoryFile(activeDir(projectDir), mem(`mem-p${String(i).padStart(7, "0")}`, longTitle(`project ${i}`)))
+        }
+        for (let i = 0; i < 20; i++) {
+          await writeMemoryFile(activeDir(globalDir), mem(`mem-g${String(i).padStart(7, "0")}`, longTitle(`global ${i}`)))
+        }
+        const block = await loadPromptBlock(both(projectDir, globalDir), 1000, 0.7)
+        const projectPart = section(block, PROJECT_HEADING)
+        for (let i = 0; i < 3; i++) assert.ok(projectPart.includes(`project ${i}`), `project ${i} was crowded out`)
+        assert.match(section(block, GLOBAL_HEADING, PROJECT_HEADING), /showing \d+ — use memory_read/)
+      })
+    })
+  })
+
+  it("lets the global store use budget the project store does not need", async () => {
+    await withDir(async (projectDir) => {
+      await withDir(async (globalDir) => {
+        await writeMemoryFile(activeDir(projectDir), mem("mem-aaaaaaaa", "Only project rule"))
+        for (let i = 0; i < 20; i++) {
+          await writeMemoryFile(activeDir(globalDir), mem(`mem-g${String(i).padStart(7, "0")}`, longTitle(`global ${i}`)))
+        }
+        const block = await loadPromptBlock(both(projectDir, globalDir), 1000, 0.7)
+        const shown = (section(block, GLOBAL_HEADING, PROJECT_HEADING).match(/\[mem-/g) ?? []).length
+        // With a hard 70% cap this store could show about 8 of these 85-char
+        // lines; borrowing the project's unused share must show more.
+        assert.ok(shown >= 10, `global index only showed ${shown} lines`)
+      })
+    })
+  })
+
+  it("keeps the project reservation when both stores are large", async () => {
+    const globalMemories = Array.from({ length: 40 }, (_, i) => mem(`mem-g${String(i).padStart(7, "0")}`, longTitle(`global ${i}`)))
+    const projectMemories = Array.from({ length: 10 }, (_, i) => mem(`mem-p${String(i).padStart(7, "0")}`, longTitle(`project ${i}`)))
+    const out = buildSystemPrompt(
+      {
+        global: { scope: "global", memories: globalMemories, omitted: 0, unavailable: false },
+        project: { scope: "project", memories: projectMemories, omitted: 0, unavailable: false },
+      },
+      1000,
+      0.7,
+    )
+    const projectShown = (section(out, PROJECT_HEADING).match(/\[mem-/g) ?? []).length
+    // The project store is guaranteed 30% of 1000 characters, which is a few
+    // entries here — never zero.
+    assert.ok(projectShown >= 2, `project index showed only ${projectShown} lines`)
+    assert.match(section(out, GLOBAL_HEADING, PROJECT_HEADING), /showing \d+ — use memory_read/)
+  })
+})
+
 describe("buildSystemPrompt", () => {
-  it("injects the intro and policy, and no index lines when empty", () => {
-    const out = buildSystemPrompt([], 2000)
-    assert.match(out, /PR-gated project memory system/)
-    assert.match(out, /no active memories/)
-    assert.ok(out.includes(MEMORY_WRITE_POLICY))
-  })
-
-  it("injects the index lines and never full bodies", () => {
-    const out = buildSystemPrompt([{ ...mem("mem-aaaaaaaa", "First rule"), body: "very long body" }], 2000)
-    assert.match(out, /\[mem-aaaaaaaa\] First rule/)
-    assert.ok(out.includes(MEMORY_WRITE_POLICY))
+  it("names both stores and the default, and never dumps bodies", () => {
+    const out = buildSystemPrompt(
+      {
+        global: { scope: "global", memories: [{ ...mem("mem-gggggggg", "Global rule"), body: "very long body" }], omitted: 0, unavailable: false },
+        project: { scope: "project", memories: [], omitted: 0, unavailable: false },
+      },
+      4000,
+      0.7,
+    )
+    assert.match(out, /GLOBAL/)
+    assert.match(out, /PROJECT/)
+    assert.match(out, /\[mem-gggggggg\] Global rule/)
     assert.ok(!out.includes("very long body"))
+    assert.ok(out.includes(MEMORY_WRITE_POLICY))
   })
 
-  it("truncates a long index to maxChars with a notice", () => {
-    const many = Array.from({ length: 40 }, (_, i) => mem(`mem-${String(i).padStart(8, "0")}`, `Title ${i} with some words`))
-    const out = buildSystemPrompt(many, 200)
-    const indexPart = out.split("Project memory index:")[1]!.split("## When to propose")[0]!
-    assert.ok(indexPart.includes("showing a subset"))
-    // The index section (titles only) is capped near maxChars; the policy is
-    // injected separately and is not part of the truncation budget.
-    assert.ok(indexPart.length <= 210)
+  it("fits all 56 realistic titles under the 10000-char default cap", () => {
+    const memories = Array.from({ length: 56 }, (_, i) =>
+      mem(`mem-${String(i).padStart(8, "0")}`, `${"标题".repeat(40)} ${i}`),
+    )
+    const out = buildSystemPrompt(
+      {
+        global: { scope: "global", memories: memories.slice(0, 40), omitted: 0, unavailable: false },
+        project: { scope: "project", memories: memories.slice(40), omitted: 0, unavailable: false },
+      },
+      10000,
+      0.7,
+    )
+    for (const m of memories) assert.ok(out.includes(`[${m.id}] ${m.title}`))
+    assert.ok(!out.includes("showing"))
   })
 })
 
@@ -129,12 +250,18 @@ describe("memory-writing policy", () => {
     }
   })
 
-  it("teaches the PR gate and the new tool names", () => {
+  it("teaches the PR gate and the tool names", () => {
     assert.match(MEMORY_WRITE_POLICY, /PROPOSE/i)
     assert.match(MEMORY_WRITE_POLICY, /memory_propose/)
     assert.match(MEMORY_WRITE_POLICY, /memory_update/)
     assert.match(MEMORY_WRITE_POLICY, /memory_delete/)
     assert.match(MEMORY_WRITE_POLICY, /merge/i)
+  })
+
+  it("teaches which store to choose", () => {
+    assert.match(MEMORY_WRITE_POLICY, /## Which store: global or project/)
+    assert.match(MEMORY_WRITE_POLICY, /would this still be right in a different repository\?/)
+    assert.match(MEMORY_WRITE_POLICY, /A supersede stays inside one store/)
   })
 
   it("preserves the granularity and title-coherence rules", () => {
@@ -154,8 +281,6 @@ describe("memory-writing policy", () => {
   it("tests the candidate against the artifact a future session will read", () => {
     assert.match(MEMORY_WRITE_POLICY, /Memory is not a task list, and not a copy of the artifact/)
     assert.match(MEMORY_WRITE_POLICY, /once this rule is done, will the artifact state it\?/)
-    // The test must be forward-looking: a "is it visible right now?" phrasing
-    // wrongly stores unfinished requirements and wrongly duplicates finished ones.
     assert.ok(
       MEMORY_POLICY_EXAMPLES.some((e) => e.signal === "already-encoded" && e.decision === "skip"),
       "missing skip example for a rule already implemented this turn",
@@ -164,14 +289,10 @@ describe("memory-writing policy", () => {
       MEMORY_POLICY_EXAMPLES.some((e) => e.signal === "pending" && e.decision === "skip"),
       "missing skip example for a requirement that is not built yet",
     )
-    // A negative boundary is the case the artifact can never state, so the
-    // policy must keep at least one save example of that shape.
     assert.ok(
       MEMORY_POLICY_EXAMPLES.some((e) => e.decision === "save" && /never /i.test(e.cue)),
       "missing save example for a boundary the artifact cannot state",
     )
-    // The deployment example is the anchor: it stays a save because the hazard,
-    // not the visible procedure, is what memory adds.
     assert.ok(
       MEMORY_POLICY_EXAMPLES.some((e) => e.decision === "save" && /hazard, not the procedure/i.test(e.guidance)),
       "deployment anchor example no longer explains why it survives the artifact test",
@@ -187,16 +308,5 @@ describe("memory-writing policy", () => {
       MEMORY_POLICY_EXAMPLES.some((e) => e.signal === "llm-discovery" && /bug/i.test(e.cue) && /rule/i.test(e.guidance)),
       "missing bug-lesson example",
     )
-  })
-})
-
-describe("buildSystemPrompt default cap", () => {
-  it("fits all 56 realistic titles under the 10000-char default cap", () => {
-    const memories = Array.from({ length: 56 }, (_, i) =>
-      mem(`mem-${String(i).padStart(8, "0")}`, `${"标题".repeat(40)} ${i}`),
-    )
-    const out = buildSystemPrompt(memories, 10000)
-    for (const m of memories) assert.ok(out.includes(`[${m.id}] ${m.title}`))
-    assert.ok(!out.includes("showing a subset"))
   })
 })

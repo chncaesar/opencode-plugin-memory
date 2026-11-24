@@ -1,4 +1,4 @@
-# DESIGN — PR-gated project memory
+# DESIGN — PR-gated memory (global + project)
 
 Design intent for the next version of `opencode-plugin-memory`. This file describes
 specification and structure only; it contains no code.
@@ -30,10 +30,44 @@ valid until a human merges it.
 
 ## Scope
 
-Memory is project-scoped only for now. There is no personal store and no team/org
-namespace.
+Memory has two stores, and the same review gate covers both:
+
+- **Global** — one private repository of the user, cloned on the machine and read
+  by every session in every repository. It carries knowledge that is true
+  anywhere: tool and API behaviour, platform quirks, infrastructure, deployment
+  procedure, personal preferences, review rules.
+- **Project** — the repository's own `memory/` folder. It carries knowledge that
+  is true only because of that repository: architecture, module boundaries,
+  business definitions, migration order, conventions every contributor must
+  follow. It travels with the repository and is shared with whoever has it.
+
+The scope of a proposal is a property of the store it goes to, not a field on the
+file: both stores use the same layout, so an entry keeps its identity and history
+wherever it lives. A proposal defaults to global; `scope: "project"` is an
+explicit choice. A replacement must stay inside one store, because a supersede
+record must be able to retire its target in the same pull request.
+
+The stores are independent wherever a failure would otherwise spread: each has
+its own staging folder, lock, audit state, audit run and pull-request flow. One
+store failing to publish never blocks the other, and an unconfigured or
+unreadable global store degrades the session to project-only memory instead of
+failing it.
+
+There is still no team or organization namespace: a third tier would need a
+different sharing model, not another folder.
+
+### Prompt budget
+
+Both indexes are injected on every request and share one character budget. The
+project store keeps at least the remainder of `globalIndexShare` reserved, so a
+large global store cannot push project entries out of the prompt entirely;
+budget one store does not need is available to the other. A truncated section
+says so and points at `memory_read`, because an entry that silently disappears
+from the index is never read at all.
 
 ## Physical layout
+
+Each store is a directory with the same three folders:
 
 ```
 .memory/staging/mem-*.md    machine-local drop folder, git-ignored, agent writes here
@@ -41,8 +75,14 @@ memory/active/mem-*.md      merged truth; the only memories injected into contex
 memory/retired/mem-*.md     removed memories, with reason and provenance
 ```
 
-The prompt index is derived from `active/` at session start. No derived file is committed,
-so the index cannot drift from merged truth and no CI job is required.
+The project store's root is the repository; the global store's root is the clone
+of the private memory repository (default `~/.local/share/opencode/memory`). A
+store is identified by its root, so every component — storage, publication,
+audit state, log — receives a root rather than the session directory.
+
+The prompt index is derived from `active/` in both stores at session start. No
+derived file is committed, so the index cannot drift from merged truth and no CI
+job is required.
 
 State is positional: the folder a file lives in is its status. Provenance and identity
 live in YAML frontmatter on each file, so a file is self-describing even when moved

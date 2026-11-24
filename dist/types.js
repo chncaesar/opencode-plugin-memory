@@ -20,5 +20,9 @@ export const DEFAULT_CONFIG = {
     backgroundAudit: true,
     auditIntervalMinutes: 1,
     auditBatchChars: 400_000,
+    globalMemoryEnabled: true,
+    globalMemoryPath: "~/.local/share/opencode/memory",
+    defaultScope: "global",
+    globalIndexShare: 0.7,
 };
 //# sourceMappingURL=types.js.map

@@ -12,7 +12,12 @@ const logger = {
     async info(a, d = "") { lines.push(`${a} ${d}`); },
     async error(a, e) { lines.push(`ERR ${a} ${String(e)}`); },
 };
-const tools = createMemoryTools(DEFAULT_CONFIG, logger);
+/**
+ * Project-only tools: these tests must never read or write the machine's real
+ * global store, so the global store is disabled unless a test opts in.
+ */
+const PROJECT_ONLY = { ...DEFAULT_CONFIG, globalMemoryEnabled: false };
+const tools = createMemoryTools(PROJECT_ONLY, logger);
 async function run(tool, args, dir) {
     const t = tool;
     const r = await t.execute(args, { directory: dir });
@@ -239,6 +244,107 @@ describe("memory_review shows the background audit", () => {
         await withDir(async (dir) => {
             const r = await run(tools.memory_review, {}, dir);
             assert.match(r.output, /## Background audit\nNot run yet/);
+        });
+    });
+});
+// ─── Global + project stores ─────────────────────────────────────────────────
+//
+// Every test here builds its own tools bound to a temporary global store, so
+// the machine's real one is never read or written.
+function globalTools(globalDir) {
+    return createMemoryTools({ ...DEFAULT_CONFIG, globalMemoryPath: globalDir, defaultScope: "global" }, logger);
+}
+/** A configured global path that deliberately does not exist. */
+const MISSING_GLOBAL = path.join(os.tmpdir(), "mem-tools-no-global-store");
+describe("scope routing", () => {
+    it("defaults to the global store when it is available", async () => {
+        await withDir(async (projectDir) => {
+            await withDir(async (globalDir) => {
+                const t = globalTools(globalDir);
+                const r = await run(t.memory_propose, { title: "Portable rule", content: "body" }, projectDir);
+                assert.match(r.output, /global store/);
+                assert.equal((await listStagedProposals(globalDir)).length, 1);
+                assert.equal((await listStagedProposals(projectDir)).length, 0);
+            });
+        });
+    });
+    it("writes to the project store when asked explicitly", async () => {
+        await withDir(async (projectDir) => {
+            await withDir(async (globalDir) => {
+                const t = globalTools(globalDir);
+                const r = await run(t.memory_propose, { title: "Repo rule", content: "body", scope: "project" }, projectDir);
+                assert.match(r.output, /project store/);
+                assert.equal((await listStagedProposals(globalDir)).length, 0);
+                assert.equal((await listStagedProposals(projectDir)).length, 1);
+            });
+        });
+    });
+    it("refuses scope=global with a path and a next step when the store is missing", async () => {
+        await withDir(async (dir) => {
+            const t = createMemoryTools({ ...DEFAULT_CONFIG, globalMemoryPath: MISSING_GLOBAL, defaultScope: "global" }, logger);
+            // An omitted scope falls back to project rather than failing.
+            const fallback = await run(t.memory_propose, { title: "Falls back", content: "body" }, dir);
+            assert.match(fallback.output, /project store/);
+            const r = await run(t.memory_propose, { title: "Global attempt", content: "body", scope: "global" }, dir);
+            assert.equal(r.title, "Memory not proposed");
+            assert.match(r.output, /not configured/);
+            assert.ok(r.output.includes(MISSING_GLOBAL));
+            assert.match(r.output, /scope "project"/);
+        });
+    });
+    it("finds an entry in the global store for update and delete", async () => {
+        await withDir(async (projectDir) => {
+            await withDir(async (globalDir) => {
+                await seed(globalDir, activeMemory("mem-gggg0001", "Global old", "old body"));
+                const t = globalTools(globalDir);
+                const updated = await run(t.memory_update, { id: "mem-gggg0001", content: "new body" }, projectDir);
+                assert.match(updated.title, /Memory update proposed/);
+                const stagedGlobal = await listStagedProposals(globalDir);
+                assert.equal(stagedGlobal.length, 1);
+                assert.deepEqual(stagedGlobal[0].supersedes, ["mem-gggg0001"]);
+                assert.equal((await listStagedProposals(projectDir)).length, 0);
+                const deleted = await run(t.memory_delete, { id: "mem-gggg0001", reason: "stale" }, projectDir);
+                assert.match(deleted.title, /retirement proposed/);
+                assert.equal((await listStagedProposals(globalDir)).length, 2);
+            });
+        });
+    });
+    it("refuses a duplicate that already exists in the other store", async () => {
+        await withDir(async (projectDir) => {
+            await withDir(async (globalDir) => {
+                await seed(globalDir, activeMemory("mem-gggg0001", "Use int for money", "cents"));
+                const t = globalTools(globalDir);
+                const r = await run(t.memory_propose, { title: "Use int for money", content: "different", scope: "project" }, projectDir);
+                assert.equal(r.title, "Memory not proposed");
+                assert.match(r.output, /global store \(mem-gggg0001\)/);
+                assert.equal((await listStagedProposals(projectDir)).length, 0);
+            });
+        });
+    });
+    it("refuses a replacement whose target lives in another store", async () => {
+        await withDir(async (projectDir) => {
+            await withDir(async (globalDir) => {
+                await seed(globalDir, activeMemory("mem-gggg0001", "Global rule", "body"));
+                const t = globalTools(globalDir);
+                const r = await run(t.memory_propose, { title: "Project replacement", content: "body", scope: "project", supersedes: ["mem-gggg0001"] }, projectDir);
+                assert.equal(r.title, "Memory not proposed");
+                assert.match(r.output, /another store|global store/);
+                assert.equal((await listStagedProposals(projectDir)).length, 0);
+            });
+        });
+    });
+    it("shows both stores in memory_read and names where each entry lives", async () => {
+        await withDir(async (projectDir) => {
+            await withDir(async (globalDir) => {
+                await seed(projectDir, activeMemory("mem-pppp0001", "Project fact", "p"));
+                await seed(globalDir, activeMemory("mem-gggg0001", "Global fact", "g"));
+                const t = globalTools(globalDir);
+                const out = await run(t.memory_read, {}, projectDir);
+                assert.match(out.output, /## Global store/);
+                assert.match(out.output, /Global fact/);
+                assert.match(out.output, /## Project store/);
+                assert.match(out.output, /Project fact/);
+            });
         });
     });
 });
