@@ -18,6 +18,11 @@ export function mapRetireReason(reason) {
         return "duplicate";
     if (/useless|pointless|无用|没用/.test(r))
         return "useless";
+    // Graduation: the rule is now enforced by the artifact. Checked before
+    // "superseded" because "superseded by the code" describes graduation, not a
+    // replacement by another memory.
+    if (/implement|shipped|landed|now enforced|already built|in the code|by the code|into the code|落地|已实现|已经实现|已上线|写进代码|做进代码/.test(r))
+        return "implemented";
     if (/supersed|replac|取代|替代|替换/.test(r))
         return "superseded";
     if (/stale|outdated|obsolete|过期|过时|陈旧/.test(r))
@@ -211,9 +216,10 @@ memory_delete does NOT edit the active memory. It writes a retirement proposal: 
 Use this when:
 - The user says "forget this", "remove this memory", "this is no longer relevant"
 - A memory is clearly obsolete (old API, old architecture, old workflow)
+- The rule graduated: it is now enforced by the code, tests or design doc, so the artifact states it and the memory only duplicates it. Retire it with reason "implemented" instead of leaving two sources of truth
 - A memory is a leftover test or placeholder
 
-Give a short reason; it is mapped to a fixed vocabulary (wrong, stale, useless, superseded, duplicate; default stale).
+Give a short reason; it is mapped to a fixed vocabulary (wrong, stale, useless, superseded, duplicate, implemented; default stale). "implemented" means the artifact now states the rule — use it when a rule lands, not when it merely goes quiet.
 If you are unsure of the exact ID, call memory_read first to find it.`,
         args: {
             id: ID_SCHEMA.describe("The memory ID to retire, e.g. mem-abc12345"),

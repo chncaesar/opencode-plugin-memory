@@ -1,8 +1,12 @@
 /**
  * The fixed vocabulary of retirement reasons. A retired memory carries one of
  * these in its frontmatter so the reason is machine-checkable.
+ *
+ * `implemented` is the graduation exit: the rule is now enforced by the code,
+ * the tests or a design doc, so the artifact states it and the memory would only
+ * duplicate it. Use it when a rule lands, not when it merely goes quiet.
  */
-export declare const RETIRED_REASONS: readonly ["wrong", "stale", "useless", "superseded", "duplicate"];
+export declare const RETIRED_REASONS: readonly ["wrong", "stale", "useless", "superseded", "duplicate", "implemented"];
 export type RetiredReason = (typeof RETIRED_REASONS)[number];
 /**
  * The intent carried by a staged proposal file, telling the bot what to do.

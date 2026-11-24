@@ -119,6 +119,17 @@ describe("PR template", () => {
         assert.match(body, /retire \(reason: stale\)/);
         assert.match(body, /memory checklist/);
         assert.match(body, /Not a duplicate/);
+        // The merge gate must ask whether the artifact already states the rule.
+        assert.match(body, /Not already stated/);
+        // A retire PR must not claim it makes the memory active.
+        assert.match(body, /Merging this PR retires the memory/);
+        assert.doesNotMatch(body, /makes the memory active/);
+    });
+    it("marks a graduated rule as implemented by the artifact", () => {
+        const body = buildPrBody({ id: "mem-aaaa0001", title: "X", body: "", intent: "retire", retiredReason: "implemented" });
+        assert.match(body, /retire \(reason: implemented\)/);
+        assert.match(body, /\*\*Graduated\*\*/);
+        assert.match(body, /a second copy would drift/);
     });
 });
 describe("defaultBranch", () => {

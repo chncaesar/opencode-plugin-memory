@@ -153,6 +153,19 @@ describe("active and retired reads", () => {
             assert.equal((await readMemoryById(dir, "mem-cccccccc")).status, "retired");
         });
     });
+    it("round-trips the implemented retirement reason", async () => {
+        await withDir(async (dir) => {
+            await writeMemoryFile(retiredDir(dir), {
+                id: "mem-dddddddd",
+                title: "Graduated",
+                body: "now enforced by the code",
+                retiredAt: "2026-02-02",
+                retiredReason: "implemented",
+            });
+            const list = await listRetiredMemories(dir);
+            assert.equal(list[0].retiredReason, "implemented");
+        });
+    });
     it("skips files with malformed frontmatter", async () => {
         await withDir(async (dir) => {
             await writeMemoryFile(activeDir(dir), activeMemory("mem-aaaaaaaa", "Good"));

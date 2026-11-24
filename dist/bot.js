@@ -429,6 +429,7 @@ const CHECKLIST = [
     "Scoped — one entry, one rule",
     "Clean — no secrets, no customer data, no credentials",
     "Not a duplicate — checked against active and proposed memories",
+    "Not already stated — the code, tests and design doc do not already enforce this rule; if they do, close this PR instead of merging",
 ];
 export function buildPrTitle(memory) {
     if (memory.intent === "retire")
@@ -443,7 +444,11 @@ export function buildPrBody(memory) {
     if (memory.author)
         lines.push(`- **Author**: ${memory.author}`);
     if (memory.intent === "retire") {
-        lines.push(`- **Intent**: retire (reason: ${memory.retiredReason ?? "stale"})`);
+        const reason = memory.retiredReason ?? "stale";
+        lines.push(`- **Intent**: retire (reason: ${reason})`);
+        if (reason === "implemented") {
+            lines.push("- **Graduated**: the artifact (code, tests or design doc) now states this rule; merging retires the memory because a second copy would drift");
+        }
         if (memory.supersededBy)
             lines.push(`- **Superseded by**: \`${memory.supersededBy}\``);
     }
@@ -455,7 +460,9 @@ export function buildPrBody(memory) {
             lines.push(`- **Tags**: ${memory.tags.join(", ")}`);
     }
     lines.push("");
-    lines.push("Merging this PR makes the memory active. Review against the memory checklist:");
+    lines.push(memory.intent === "retire"
+        ? "Merging this PR retires the memory. Review against the memory checklist:"
+        : "Merging this PR makes the memory active. Review against the memory checklist:");
     lines.push("");
     for (const item of CHECKLIST)
         lines.push(`- ${item}`);

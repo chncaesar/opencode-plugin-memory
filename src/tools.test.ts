@@ -51,6 +51,14 @@ describe("mapRetireReason", () => {
     assert.equal(mapRetireReason(undefined), "stale")
     assert.equal(mapRetireReason("random words"), "stale")
   })
+
+  it("treats a landed rule as graduated, not as superseded by another memory", () => {
+    assert.equal(mapRetireReason("implemented in the UI"), "implemented")
+    assert.equal(mapRetireReason("superseded by the code"), "implemented")
+    assert.equal(mapRetireReason("shipped last week"), "implemented")
+    assert.equal(mapRetireReason("已实现，界面里就是这个行为"), "implemented")
+    assert.equal(mapRetireReason("landed"), "implemented")
+  })
 })
 
 describe("memory_propose", () => {

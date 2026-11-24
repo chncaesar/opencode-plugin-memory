@@ -1,12 +1,16 @@
 export type MemoryPolicyExample = {
     /**
-     * "correction"     — user corrects LLM behavior (no explicit "remember" needed)
-     * "confirmation"   — user confirms a non-obvious approach worked
-     * "llm-discovery"  — LLM itself discovers something worth persisting (no user cue)
-     * "temporary"      — explicitly scoped to current task/answer, must NOT save
-     * "task-local"     — implementation detail that only applies to one task
+     * "correction"       — user corrects LLM behavior (no explicit "remember" needed)
+     * "confirmation"     — user confirms a non-obvious approach worked
+     * "llm-discovery"    — LLM itself discovers something worth persisting (no user cue)
+     * "already-encoded"  — the rule is already implemented or written into a design doc,
+     *                      so the artifact states it; must NOT save
+     * "pending"          — a requirement not built yet; the artifact will state it once it
+     *                      lands, so it belongs to the task list; must NOT save
+     * "temporary"        — explicitly scoped to current task/answer, must NOT save
+     * "task-local"       — implementation detail that only applies to one task
      */
-    signal: "correction" | "confirmation" | "llm-discovery" | "temporary" | "task-local";
+    signal: "correction" | "confirmation" | "llm-discovery" | "already-encoded" | "pending" | "temporary" | "task-local";
     /** What the user said, or what the LLM encountered/discovered (for llm-discovery). */
     cue: string;
     decision: "save" | "skip";

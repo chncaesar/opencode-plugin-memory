@@ -151,6 +151,33 @@ describe("memory-writing policy", () => {
     )
   })
 
+  it("tests the candidate against the artifact a future session will read", () => {
+    assert.match(MEMORY_WRITE_POLICY, /Memory is not a task list, and not a copy of the artifact/)
+    assert.match(MEMORY_WRITE_POLICY, /once this rule is done, will the artifact state it\?/)
+    // The test must be forward-looking: a "is it visible right now?" phrasing
+    // wrongly stores unfinished requirements and wrongly duplicates finished ones.
+    assert.ok(
+      MEMORY_POLICY_EXAMPLES.some((e) => e.signal === "already-encoded" && e.decision === "skip"),
+      "missing skip example for a rule already implemented this turn",
+    )
+    assert.ok(
+      MEMORY_POLICY_EXAMPLES.some((e) => e.signal === "pending" && e.decision === "skip"),
+      "missing skip example for a requirement that is not built yet",
+    )
+    // A negative boundary is the case the artifact can never state, so the
+    // policy must keep at least one save example of that shape.
+    assert.ok(
+      MEMORY_POLICY_EXAMPLES.some((e) => e.decision === "save" && /never /i.test(e.cue)),
+      "missing save example for a boundary the artifact cannot state",
+    )
+    // The deployment example is the anchor: it stays a save because the hazard,
+    // not the visible procedure, is what memory adds.
+    assert.ok(
+      MEMORY_POLICY_EXAMPLES.some((e) => e.decision === "save" && /hazard, not the procedure/i.test(e.guidance)),
+      "deployment anchor example no longer explains why it survives the artifact test",
+    )
+  })
+
   it("teaches the model to record the lesson behind a bug fix, not the incident", () => {
     assert.match(MEMORY_WRITE_POLICY, /Bug fixes: record the lesson, not the incident/)
     assert.match(MEMORY_WRITE_POLICY, /Root cause/)
