@@ -2,7 +2,7 @@
 title: Background audit
 layout: default
 parent: Maintenance
-nav_order: 3
+nav_order: 2
 ---
 
 By default, the plugin can audit active memories after a session becomes idle. It looks for possible duplicates, refinements, and contradictions. Audit findings become retirement proposals, not automatic changes; a person still reviews and merges the resulting pull requests.

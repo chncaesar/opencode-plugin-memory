@@ -1,16 +1,32 @@
 ---
-title: When a rule becomes a feature
+title: What should become a memory?
 layout: default
-parent: Maintenance
-nav_order: 2
+parent: Daily use
+nav_order: 1
 ---
 
-A memory is for what the artifact cannot say. Before accepting a proposal, ask one forward-looking question: once this rule is done, will the code, the tests or the design doc state it?
+Use memory for knowledge that will still be useful later but will not be obvious from the product, code or documentation.
 
-- If it already does — the screen behaves that way, the schema enforces it, the design doc says it — close the proposal. Two copies of one rule drift apart at the next redesign.
-- If it will, but it is not built yet, the rule belongs to the task list or the design doc, not to memory. Writing it down now guarantees a duplicate once it lands.
-- If no artifact will ever state it — what a field really means, why an obvious approach is dangerous, a boundary that forbids something — that is exactly what memory is for.
+## Good memories
 
-When the agent builds a remembered rule — or notices during the session that it has already been built — it automatically proposes retiring that memory with the reason `implemented` and opens the pull request. You do not need to request retirement or publishing as a separate step; you only review and merge the pull request.
+- A business term whose real meaning is not obvious, such as a field labelled “Version” that actually stores the product model.
+- A trap and why the obvious approach is dangerous, such as a deployment method that can include uncommitted work.
+- A personal preference or review rule that should follow you into future sessions.
+- A boundary that says what must never happen, even though no screen or test can show it.
 
-The pull request marks the memory as graduated, so a reviewer sees that the code took over rather than assuming the rule stopped being true. The agent cannot notice work that happens outside its sessions, so mention the completed feature the next time you work with it if no retirement pull request appeared.
+## Do not save
+
+- Behaviour the screen, code, tests or user guide already makes clear.
+- A feature request or task that has not been built yet. Keep it in the task or design document instead.
+- Current facts that are cheap to look up again, such as a deployed version, a row count or a configuration value.
+- Secrets, credentials or one-off details from the current task.
+
+If the agent skips a memory because the finished feature will state the rule itself, that is intentional: keeping the same rule in two places lets them disagree after the next redesign.
+
+## When code takes over
+
+When the agent builds a remembered rule — or notices during the session that it has already been built — it automatically proposes retiring that memory and opens the pull request. You do not need to request retirement or publishing as a separate step.
+
+Check one thing in the pull request: **does the product, code, test or documentation now guarantee the rule?** If yes, merge it. If not, close it and keep the memory.
+
+The agent cannot notice work completed outside its sessions. If no retirement pull request appears, mention the completed feature the next time you work with it.

@@ -2,7 +2,7 @@
 title: Use a memory in a later session
 layout: default
 parent: Daily use
-nav_order: 3
+nav_order: 4
 ---
 
 After the pull request is merged, pull the change before starting the session that should use it. The plugin does not pull from GitHub automatically: pull global memories in the global store's clone, and project memories in that project. The next session derives an index of active memory titles and IDs from both local copies. When a title is relevant, the agent can read the full entry.

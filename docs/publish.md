@@ -2,7 +2,7 @@
 title: Review and merge
 layout: default
 parent: Daily use
-nav_order: 2
+nav_order: 3
 ---
 
 The agent proposes a memory and opens its pull request automatically. You do not need to ask it to publish or approve a separate publishing step. **Your only approval is merging the pull request.**
