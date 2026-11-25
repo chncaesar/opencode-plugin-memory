@@ -11,4 +11,6 @@ A memory is for what the artifact cannot say. Before accepting a proposal, ask o
 - If it will, but it is not built yet, the rule belongs to the task list or the design doc, not to memory. Writing it down now guarantees a duplicate once it lands.
 - If no artifact will ever state it — what a field really means, why an obvious approach is dangerous, a boundary that forbids something — that is exactly what memory is for.
 
-When a remembered rule does get built, retire the memory and say why. The retirement reason `implemented` records that the rule graduated into the artifact; the pull request shows it as graduated so a reviewer sees the memory is leaving because the code took over, not because the rule stopped being true.
+When the agent builds a remembered rule — or notices during the session that it has already been built — it automatically proposes retiring that memory with the reason `implemented` and opens the pull request. You do not need to request retirement or publishing as a separate step; you only review and merge the pull request.
+
+The pull request marks the memory as graduated, so a reviewer sees that the code took over rather than assuming the rule stopped being true. The agent cannot notice work that happens outside its sessions, so mention the completed feature the next time you work with it if no retirement pull request appeared.
