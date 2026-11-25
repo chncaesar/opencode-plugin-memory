@@ -13,4 +13,4 @@ The agent may also propose durable knowledge without an explicit request, for ex
 
 The proposal is written to a local staging area. **It is not active yet**, and other checkouts do not receive it. Ask the agent to show you the proposal if you want to inspect it before publishing.
 
-Prefer project instructions for mandatory, explicitly maintained rules. Avoid storing secrets, one-off task details, or facts that are already documented and easy to look up. [When a rule becomes a feature]({% link rule-becomes-feature.md %}) explains the boundary in detail.
+Prefer project instructions for mandatory, explicitly maintained rules. Avoid storing secrets, one-off task details, or facts that are already documented and easy to look up. [When a rule becomes a feature]({{ site.baseurl }}{% link rule-becomes-feature.md %}) explains the boundary in detail.
