@@ -1,13 +1,15 @@
 ---
-title: Publish and review
+title: Review and merge
 layout: default
 parent: Daily use
 nav_order: 2
 ---
 
-Ask the agent to publish the staged proposals. It can call `memory_publish`, which runs the local bot once per store. The bot uses a temporary Git worktree to create a branch and open a pull request for each proposal; it does not switch your current branch or modify your uncommitted work. **Each proposal opens its pull request in the repository its store belongs to**: a global proposal in your private memory repository, a project proposal in the project repository. A failure in one store never blocks the other.
+The agent proposes a memory and opens its pull request automatically. You do not need to ask it to publish or approve a separate publishing step. **Your only approval is merging the pull request.**
 
-You can also run the bot yourself from the project directory:
+Each pull request opens in the repository its memory belongs to: a global memory in your private memory repository, a project memory in the project repository. Publishing one store never blocks the other, and it does not switch your current branch or modify your uncommitted work.
+
+If automatic publishing fails, you can retry from the project directory:
 
 ```bash
 npx -p @chncaesar/opencode-plugin-memory opencode-memory-bot once

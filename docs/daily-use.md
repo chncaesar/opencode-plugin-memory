@@ -5,4 +5,4 @@ nav_order: 3
 has_children: true
 ---
 
-Ask the agent to remember something, publish the proposals as pull requests, and rely on the merged entries in later sessions.
+Tell the agent what is worth remembering. It proposes the memory and opens the pull request automatically; you review and merge it, then rely on the merged entry in later sessions.
