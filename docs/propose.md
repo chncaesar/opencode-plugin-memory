@@ -13,4 +13,4 @@ The agent may also propose durable knowledge without an explicit request, for ex
 
 The agent proposes the memory and opens its pull request automatically in the same workflow. You do not need to ask it to publish or confirm a separate publishing step. **The memory is not active yet**: inspect it in the pull request, then merge it if it is correct.
 
-Prefer project instructions for mandatory, explicitly maintained rules. Avoid storing secrets, one-off task details, or facts that are already documented and easy to look up. [What should become a memory?]({{ site.baseurl }}{% link rule-becomes-feature.md %}) gives practical examples.
+Prefer project instructions for mandatory, explicitly maintained rules. Avoid storing secrets, one-off task details, or facts that are already documented and easy to look up. [What should become a memory?]({% link rule-becomes-feature.md %}) gives practical examples.

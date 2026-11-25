@@ -14,8 +14,8 @@ The agent never writes shared truth. It can only drop a proposal file into a mac
 
 ## Where to start
 
-- [Install the plugin]({{ site.baseurl }}{% link install.md %}), then [configure it]({{ site.baseurl }}{% link configure.md %}) if the defaults do not suit you.
-- [Set up a global store]({{ site.baseurl }}{% link global-store.md %}) if you want knowledge to follow you across repositories. It is optional.
-- [Tell the agent what is worth remembering]({{ site.baseurl }}{% link propose.md %}). It proposes the memory and opens the pull request automatically; you only [review and merge it]({{ site.baseurl }}{% link publish.md %}).
+- [Install the plugin]({% link install.md %}), then [configure it]({% link configure.md %}) if the defaults do not suit you.
+- [Set up a global store]({% link global-store.md %}) if you want knowledge to follow you across repositories. It is optional.
+- [Tell the agent what is worth remembering]({% link propose.md %}). It proposes the memory and opens the pull request automatically; you only [review and merge it]({% link publish.md %}).
 
 This guide covers version 0.7.0.

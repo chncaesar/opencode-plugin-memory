@@ -19,4 +19,4 @@ Alternatively, add it to the `plugins` array in your project or global `opencode
 }
 ```
 
-Every option has a default, so the entry above is enough to start. [Configure the plugin]({{ site.baseurl }}{% link configure.md %}) when you want to change how it behaves.
+Every option has a default, so the entry above is enough to start. [Configure the plugin]({% link configure.md %}) when you want to change how it behaves.
