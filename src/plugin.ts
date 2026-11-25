@@ -3,9 +3,9 @@ import { DEFAULT_CONFIG, type AuditProvider, type PluginConfig, type Scope } fro
 import { createMemoryTools } from "./tools.js"
 import { buildSystemPrompt, loadPromptBlock } from "./summary.js"
 import { listStagedProposals } from "./storage.js"
-import { availableStores, resolveStores } from "./stores.js"
+import { availableStores, resolveStores, withStoreAccess, type Store } from "./stores.js"
 import { createLogger, type Logger } from "./logging.js"
-import { migrateLegacyStores } from "./migrate.js"
+import { hasLegacyMemorySource, migrateProjectMemory } from "./migrate.js"
 import {
   auditWarning,
   createAuditScheduler,
@@ -139,6 +139,12 @@ export function resolveAuditCall(config: PluginConfig, hostCall: ModelCall): Mod
 async function injectMemoryBlock(directory: string, config: PluginConfig, logger: Logger): Promise<string> {
   try {
     const stores = await resolveStores(directory, config)
+    // Managed Git stores never auto-import a legacy MEMORY.md (it would become
+    // false active truth); tell the model it was seen and left untouched.
+    const legacyDeferred =
+      stores.projectManaged && !stores.projectProblem
+        ? await hasLegacyMemorySource(stores.projectInputRoot ?? directory).catch(() => false)
+        : false
     const block = await loadPromptBlock(
       stores,
       config.maxSummaryChars,
@@ -146,6 +152,7 @@ async function injectMemoryBlock(directory: string, config: PluginConfig, logger
       async (problems) => {
         for (const problem of problems) await logger.error("index", `${problem.code} ${problem.file}`)
       },
+      legacyDeferred ? { legacyImportDeferred: true } : {},
     )
     const notices: string[] = [block]
     for (const store of availableStores(stores)) {
@@ -210,11 +217,20 @@ export async function pendingPublishNotice(directory: string, scope: Scope = "pr
 export const server: Plugin = async (input: PluginInput, options?: PluginOptions): Promise<Hooks> => {
   const config = resolveConfig(options)
   const directory = input.directory
-  const logger = createLogger(directory, config.enableLog)
 
-  // One-time migration of the legacy single-file store into the per-file model.
+  // Resolve the managed project store first: every runtime path (log, audit
+  // state, staging, bot lock) must use that root, and the developer checkout is
+  // input only. All hooks resolve through the same function, so they converge on
+  // the same root.
+  const stores = await resolveStores(directory, config)
+  // Never create runtime files inside a store root that could not be proven:
+  // that would turn an uninitialized path into a half-populated one.
+  const logger = createLogger(stores.project.root, config.enableLog && !stores.projectProblem)
+
+  // Legacy MEMORY.md conversion is only coherent where the project directory is
+  // the store (non-Git). A managed Git store defers it and warns in the prompt.
   try {
-    await migrateLegacyStores(directory, logger)
+    await migrateProjectMemory(stores, logger)
   } catch (err) {
     await logger.error("migration", err)
   }
@@ -234,11 +250,21 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
     createSdkModelCall(input.client as unknown as AuditClient, directory, auditSessions),
   )
   const schedulers = new Map<string, ReturnType<typeof createAuditScheduler>>()
-  const schedulerFor = (root: string): ReturnType<typeof createAuditScheduler> => {
-    let scheduler = schedulers.get(root)
+  const schedulerFor = (store: Store): ReturnType<typeof createAuditScheduler> => {
+    let scheduler = schedulers.get(store.root)
     if (!scheduler) {
-      scheduler = createAuditScheduler({ directory: root, config, notify, logger, call: sdkCall }, auditSessions)
-      schedulers.set(root, scheduler)
+      scheduler = createAuditScheduler(
+        {
+          directory: store.root,
+          config,
+          notify,
+          logger,
+          call: sdkCall,
+          withAccess: (fn) => withStoreAccess(store, fn),
+        },
+        auditSessions,
+      )
+      schedulers.set(store.root, scheduler)
     }
     return scheduler
   }
@@ -267,7 +293,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
       if (event.type !== "session.idle") return
       const stores = await resolveStores(directory, config)
       for (const store of availableStores(stores)) {
-        schedulerFor(store.root).onSessionIdle(event.properties.sessionID)
+        schedulerFor(store).onSessionIdle(event.properties.sessionID)
       }
     },
 
@@ -377,10 +403,16 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
   const config = resolveConfig(ctx.options)
   const auditModel = parseAuditModel(ctx.options?.["auditModel"])
   const directory = ctx.location.directory
-  const logger = createLogger(directory, config.enableLog)
+
+  // See `server`: resolve the managed project store before anything writes to a
+  // runtime path; legacy conversion is deferred for managed Git stores.
+  const stores = await resolveStores(directory, config)
+  // Never create runtime files inside a store root that could not be proven:
+  // that would turn an uninitialized path into a half-populated one.
+  const logger = createLogger(stores.project.root, config.enableLog && !stores.projectProblem)
 
   try {
-    await migrateLegacyStores(directory, logger)
+    await migrateProjectMemory(stores, logger)
   } catch (err) {
     await logger.error("migration", err)
   }
@@ -393,11 +425,14 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
   // is audited without a restart.
   const auditSessions = new Set<string>()
   const schedulers = new Map<string, ReturnType<typeof createAuditScheduler>>()
-  const schedulerFor = (root: string): ReturnType<typeof createAuditScheduler> => {
-    let scheduler = schedulers.get(root)
+  const schedulerFor = (store: Store): ReturnType<typeof createAuditScheduler> => {
+    let scheduler = schedulers.get(store.root)
     if (!scheduler) {
-      scheduler = createAuditScheduler({ directory: root, config, logger, call }, auditSessions)
-      schedulers.set(root, scheduler)
+      scheduler = createAuditScheduler(
+        { directory: store.root, config, logger, call, withAccess: (fn) => withStoreAccess(store, fn) },
+        auditSessions,
+      )
+      schedulers.set(store.root, scheduler)
     }
     return scheduler
   }
@@ -434,7 +469,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
       await ctx.session.hook("experimental.idle", async (event: { sessionID: string }) => {
         const stores = await resolveStores(directory, config)
         for (const store of availableStores(stores)) {
-          schedulerFor(store.root).onSessionIdle(event.sessionID)
+          schedulerFor(store).onSessionIdle(event.sessionID)
         }
       }),
     )

@@ -75,10 +75,12 @@ memory/active/mem-*.md      merged truth; the only memories injected into contex
 memory/retired/mem-*.md     removed memories, with reason and provenance
 ```
 
-The project store's root is the repository; the global store's root is the clone
-of the private memory repository (default `~/.local/share/opencode/memory`). A
-store is identified by its root, so every component — storage, publication,
-audit state, log — receives a root rather than the session directory.
+The project store's runtime root is a persistent plugin-managed sparse checkout of
+the repository (default `~/.local/share/opencode/project-memory/<repo>-<hash>/worktree`);
+the global store's root is the clone of the private memory repository (default
+`~/.local/share/opencode/memory`). A store is identified by its root, so every
+component — storage, publication, audit state, log — receives that single root
+rather than the developer's active checkout.
 
 The prompt index is derived from `active/` in both stores at session start. No
 derived file is committed, so the index cannot drift from merged truth and no CI
@@ -133,7 +135,7 @@ detect → propose → bot opens PR → human approves (merge) → live
 
 ## Read path
 
-Reads come from the working tree, and only `active/` is valid. `retired/` and staging are
+Reads come from each store's root, and only `active/` is valid. `retired/` and staging are
 never injected.
 
 - **Context injection.** Each session builds the index from `active/` (one line per
@@ -143,10 +145,11 @@ never injected.
   bodies are loaded only when requested.
 - **`memory_review`.** Read-only view over the active store: aging entries, audit-flagged
   entries, and open memory PRs listed as "pending decisions". It never edits anything.
-- **Staleness is accepted.** The index is built from the working tree's `active/`, so a
-  session sees the active set as of the branch's last rebase or merge. Memories merged
-  after the branch diverged are invisible until rebase or merge. The runtime never reads
-  the default branch.
+- **Managed project refresh.** The plugin-managed project checkout tracks the repository's
+  remote default branch and refreshes before memory operations without modifying the
+  developer's active checkout, branch, index, or uncommitted files. If a refresh cannot be
+  completed, the plugin keeps the last verified managed checkout or fails project memory
+  closed rather than falling back to the developer's working copy.
 - **Staged proposals are visible to their own author only.** The proposing agent may read
   its own staging folder back to avoid proposing a duplicate within the session. Staging
   is machine-local and invisible to everyone else.

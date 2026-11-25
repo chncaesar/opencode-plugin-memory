@@ -19,7 +19,11 @@ import { describeAuditStatus } from "./audit.js"
 import {
   availableStores,
   globalProblemToolMessage,
+  projectProblemToolMessage,
   resolveStores,
+  StoreAccessError,
+  usableProjectStore,
+  withStoreAccess,
   type Store,
   type StoreSet,
 } from "./stores.js"
@@ -89,7 +93,8 @@ function secretReject(logger: Logger, action: string, secrets: string[]): { titl
  * Resolve the store a proposal goes to. An explicit `scope: "global"` fails with
  * instructions when the global store is unusable; an omitted scope follows the
  * configured default and therefore falls back to the project store instead of
- * failing.
+ * failing. A project store that could not be initialized is never returned: a
+ * write into it would claim success against a store that does not exist yet.
  */
 function pickStore(stores: StoreSet, requested?: Scope): { store: Store } | { error: string } {
   const wanted: Scope = requested ?? stores.defaultScope
@@ -97,7 +102,37 @@ function pickStore(stores: StoreSet, requested?: Scope): { store: Store } | { er
     if (stores.global) return { store: stores.global }
     return { error: globalProblemToolMessage(stores.globalProblem ?? "missing", stores.globalPath) }
   }
-  return { store: stores.project }
+  const project = usableProjectStore(stores)
+  if (project) return { store: project }
+  return { error: projectProblemToolMessage(stores.projectProblem ?? "unavailable", stores.project.root) }
+}
+
+/** The actionable message for an unavailable project store. */
+function projectUnavailable(stores: StoreSet): string {
+  return projectProblemToolMessage(stores.projectProblem ?? "unavailable", stores.project.root)
+}
+
+type ToolResult = { title: string; output: string }
+
+/**
+ * Hold the managed project store's cross-process lease across a complete
+ * read/check/write phase. Global and plain-directory stores have no lease.
+ * A busy/recovering store is reported instead of being read or written.
+ */
+async function withProjectLease<T extends ToolResult>(
+  stores: StoreSet,
+  fn: () => Promise<T>,
+): Promise<T | ToolResult> {
+  const project = usableProjectStore(stores)
+  if (!project) return fn()
+  try {
+    return await withStoreAccess(project, fn)
+  } catch (err) {
+    if (err instanceof StoreAccessError) {
+      return { title: "Project memory busy", output: err.message }
+    }
+    throw err
+  }
 }
 
 /** The store that currently holds an active memory, searched global-first. */
@@ -124,13 +159,21 @@ Proposed memories are NOT yet active. Do not propose a duplicate — first check
 
 To REPLACE an existing active memory, pass its ID in supersedes; the replacement retires the old one in the same PR (do not add and delete separately). The id must live in the same store as the proposal.`
 
+/** How the tools resolve the stores for a session directory. Injectable for tests. */
+export type StoreResolver = (directory: string) => Promise<StoreSet>
+
 /**
  * Create the six memory tools bound to the given plugin config and logger.
  * Each write tool only ever PROPOSES: it writes a file into the chosen store's
  * `.memory/staging/`. The merged store under `memory/active/` is never edited by
- * any tool.
+ * any tool. An unavailable project store is never used as a write or read
+ * target; project-scoped calls return an actionable message instead.
  */
-export function createMemoryTools(config: PluginConfig, logger: Logger): MemoryToolSet {
+export function createMemoryTools(
+  config: PluginConfig,
+  logger: Logger,
+  resolve: StoreResolver = (directory) => resolveStores(directory, config),
+): MemoryToolSet {
   // ── memory_propose ────────────────────────────────────────────────────────
 
   const memory_propose = tool({
@@ -155,11 +198,12 @@ export function createMemoryTools(config: PluginConfig, logger: Logger): MemoryT
       scope: SCOPE_SCHEMA,
     },
     async execute({ title, content, tags, supersedes, scope }, context) {
+      const stores = await resolve(context.directory)
+      return withProjectLease(stores, async () => {
       try {
         const secrets = detectSecrets(`${title}\n${content}`)
         if (secrets.length > 0) return secretReject(logger, "memory_propose", secrets)
 
-        const stores = await resolveStores(context.directory, config)
         const picked = pickStore(stores, scope)
         if ("error" in picked) {
           await logger.info("memory_propose", `rejected: global store unavailable (${stores.globalProblem})`)
@@ -188,9 +232,12 @@ export function createMemoryTools(config: PluginConfig, logger: Logger): MemoryT
           }
           if (unknown.length > 0) {
             await logger.info("memory_propose", `rejected: unknown supersedes ${unknown.join(", ")}`)
+            const projectNote = stores.projectProblem
+              ? ` The project store is unavailable, so its active memories could not be checked: ${projectUnavailable(stores)}`
+              : ""
             return {
               title: "Memory not proposed",
-              output: `Cannot supersede ${unknown.join(", ")}: not an active memory. Use memory_read to list active memory IDs.`,
+              output: `Cannot supersede ${unknown.join(", ")}: not an active memory in an available store. Use memory_read to list active memory IDs.${projectNote}`,
             }
           }
         }
@@ -234,6 +281,9 @@ export function createMemoryTools(config: PluginConfig, logger: Logger): MemoryT
           "Staged only: no pull request exists until memory_publish runs.",
         ]
         if (memory.supersedes?.length) out.push("", `Supersedes: ${memory.supersedes.join(", ")}`)
+        if (stores.projectProblem && target.scope === "global") {
+          out.push("", "Note: the project store is unavailable, so this proposal was not checked against project memories.")
+        }
         return { title: `Memory proposed: ${id}`, output: out.join("\n") }
       } catch (err) {
         if (err instanceof StoreWriteError) {
@@ -243,6 +293,7 @@ export function createMemoryTools(config: PluginConfig, logger: Logger): MemoryT
         await logger.error("memory_propose", err)
         throw err
       }
+      })
     },
   })
 
@@ -269,11 +320,15 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
       tags: z.array(z.string()).optional().describe("New tags (leave empty to keep existing)"),
     },
     async execute({ id, title, content, tags }, context) {
+      const stores = await resolve(context.directory)
+      return withProjectLease(stores, async () => {
       try {
-        const stores = await resolveStores(context.directory, config)
         const found = await locateActive(stores, id)
         if (!found) {
-          await logger.info("memory_update", `${id} not found`)
+          await logger.info("memory_update", `${id} not found in available stores`)
+          if (stores.projectProblem) {
+            return { title: "Project memory unavailable", output: projectUnavailable(stores) }
+          }
           return {
             title: "Memory not found",
             output: `No active memory with ID ${id}. Use memory_read to list all active memories.`,
@@ -316,6 +371,7 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
         await logger.error("memory_update", err)
         throw err
       }
+      })
     },
   })
 
@@ -339,11 +395,15 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
       reason: z.string().optional().describe("Short reason for retiring (mapped to a fixed vocabulary)"),
     },
     async execute({ id, reason }, context) {
+      const stores = await resolve(context.directory)
+      return withProjectLease(stores, async () => {
       try {
-        const stores = await resolveStores(context.directory, config)
         const found = await locateActive(stores, id)
         if (!found) {
-          await logger.info("memory_delete", `${id} not found`)
+          await logger.info("memory_delete", `${id} not found in available stores`)
+          if (stores.projectProblem) {
+            return { title: "Project memory unavailable", output: projectUnavailable(stores) }
+          }
           return {
             title: "Memory not found",
             output: `No active memory with ID ${id}. Use memory_read to list all active memories.`,
@@ -376,6 +436,7 @@ If you are unsure of the exact ID, call memory_read first to find it.`,
         await logger.error("memory_delete", err)
         throw err
       }
+      })
     },
   })
 
@@ -401,7 +462,8 @@ Returns full bodies of active memories from both stores, plus your own staged pr
         .describe("Also list retired memories with their retirement reason. Default false."),
     },
     async execute({ query, include_retired }, context) {
-      const stores = await resolveStores(context.directory, config)
+      const stores = await resolve(context.directory)
+      return withProjectLease(stores, async () => {
 
       const q = query?.toLowerCase()
       const matches = (m: Memory) =>
@@ -448,25 +510,28 @@ Returns full bodies of active memories from both stores, plus your own staged pr
         sections.push(lines.join("\n"))
       }
 
+      const availabilityNotes: string[] = []
+      if (!stores.global && stores.globalProblem !== "disabled") {
+        availabilityNotes.push(`Global store: unavailable. ${globalProblemToolMessage(stores.globalProblem ?? "missing", stores.globalPath)}`)
+      }
+      if (stores.projectProblem) {
+        availabilityNotes.push(`Project store: unavailable. ${projectUnavailable(stores)}`)
+      }
+
       if (sections.length === 0) {
-        const notes: string[] = []
-        if (!stores.global && stores.globalProblem !== "disabled") {
-          notes.push(globalProblemToolMessage(stores.globalProblem ?? "missing", stores.globalPath))
-        }
         const msg = query
-          ? `No memories matching "${query}".`
-          : "No active memories yet. Use memory_propose to propose knowledge."
-        return { title: "Memory read", output: [msg, ...notes].join("\n\n") }
+          ? `No memories matching "${query}" in the available stores.`
+          : "No active memories in the available stores. Use memory_propose to propose knowledge."
+        return { title: "Memory read", output: [msg, ...availabilityNotes].join("\n\n") }
       }
 
       const header: string[] = []
-      if (!stores.global && stores.globalProblem !== "disabled") {
-        header.push(`Global store: unavailable. ${globalProblemToolMessage(stores.globalProblem ?? "missing", stores.globalPath)}`, "")
-      }
+      for (const note of availabilityNotes) header.push(note, "")
       return {
         title: `Memory read (${totalActive}${totalStaged ? ` + ${totalStaged} pending` : ""})`,
         output: [...header, ...sections].join("\n\n"),
       }
+      })
     },
   })
 
@@ -483,17 +548,29 @@ Use this when the system prompt says memories need review, or when cleaning up m
         .describe("Also list retired memories. Default false."),
     },
     async execute({ include_retired }, context) {
-      const stores = await resolveStores(context.directory, config)
+      const stores = await resolve(context.directory)
+      return withProjectLease(stores, async () => {
       const now = new Date()
       const lines: string[] = []
 
       if (!stores.global) {
         if (stores.globalProblem === "disabled") {
           // Deliberate configuration: say it once, briefly, without a path.
-          lines.push("## Global store", "Disabled by configuration; project memory only.", "")
+          lines.push(
+            "## Global store",
+            stores.projectProblem
+              ? "Disabled by configuration; project memory is also unavailable this session."
+              : "Disabled by configuration; project memory only.",
+            "",
+          )
         } else {
           lines.push("## Global store", globalProblemToolMessage(stores.globalProblem ?? "missing", stores.globalPath), "")
         }
+      }
+
+      // An unavailable project store is reported, not iterated as an empty store.
+      if (stores.projectProblem) {
+        lines.push("## Project store", projectUnavailable(stores), "")
       }
 
       let totalActive = 0
@@ -540,6 +617,7 @@ Use this when the system prompt says memories need review, or when cleaning up m
       }
 
       return { title: `Memory review (${totalActive} active)`, output: lines.join("\n") }
+      })
     },
   })
 
@@ -555,7 +633,8 @@ Safe to call without asking the user: it runs the memory bot in a throwaway git 
 Returns the opened PR URLs, grouped by store. Proposals whose push or PR step failed stay staged and are retried on the next call; one store failing never blocks the other.`,
     args: {},
     async execute(_args, context) {
-      const stores = await resolveStores(context.directory, config)
+      const stores = await resolve(context.directory)
+      return withProjectLease(stores, async () => {
       const targets = availableStores(stores)
       const sections: string[] = []
       let promoted = 0
@@ -588,6 +667,12 @@ Returns the opened PR URLs, grouped by store. Proposals whose push or PR step fa
         }
       }
 
+      // Project proposals cannot be published while its managed store is
+      // unavailable; say so instead of implying there were none.
+      if (stores.projectProblem) {
+        sections.push(`Project store: unavailable — no project proposals were published. ${projectUnavailable(stores)}`)
+      }
+
       await logger.info("memory_publish", `promoted=${promoted} recovered=${recovered} skipped=${skipped} failed=${failed}`)
 
       if (sections.length === 0) {
@@ -601,6 +686,7 @@ Returns the opened PR URLs, grouped by store. Proposals whose push or PR step fa
       if (prs.length) out.push("", ...prs.map((u) => `- ${u}`))
       out.push("", ...sections)
       return { title: `Memory published (${promoted})`, output: out.join("\n") }
+      })
     },
   })
 

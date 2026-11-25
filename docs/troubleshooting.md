@@ -5,7 +5,7 @@ parent: Reference
 nav_order: 2
 ---
 
-**The agent proposed a memory, but a later session cannot see it.** Check that its pull request was merged, then update the later session's working branch and start a new session. A staged proposal or an open pull request is not an active memory.
+**The agent proposed a memory, but a later session cannot see it.** Check that its pull request was merged into the repository's default branch. A staged proposal or an open pull request is not an active memory. Project memories refresh automatically from the remote default branch into the plugin-managed project store; global memories require pulling your global store clone at `globalMemoryPath`.
 
 **A proposal did not produce a pull request.** Confirm the repository has an `origin` remote, your account can push to it, and GitHub CLI is installed and authenticated. The bot reports failures and retains failed proposals for retry.
 
@@ -15,4 +15,4 @@ nav_order: 2
 
 **The audit fails on a large memory collection.** Check that the audit model works and supports the request size. Reduce `auditBatchChars` if its context window is smaller than the default assumes. Batching limits the size of individual requests but may miss cross-batch relationships.
 
-**I want to inspect or change memories directly.** Ask the agent to read or review them, or inspect the repository's Markdown files. For changes that should become shared knowledge, use the proposal and pull-request workflow so the review boundary remains clear.
+**I want to inspect or change memories directly.** Ask the agent to read or review them, or inspect the Markdown files in the store. Because project memories are read from the plugin-managed checkout rather than your working branch, your project checkout will show new files only after you pull normally. For changes that should become shared knowledge, use the proposal and pull-request workflow so the review boundary remains clear.

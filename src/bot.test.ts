@@ -5,7 +5,7 @@ import os from "os"
 import path from "path"
 import { execFileSync, spawnSync } from "child_process"
 import { fileURLToPath } from "url"
-import { acquireLock, applyPropose, applyRetire, branchFor, buildPrBody, buildPrCreateArgs, buildPrListArgs, buildPrTitle, defaultBranch, parseRemoteUrl, processStagingOnce } from "./bot.js"
+import { acquireLock, applyPropose, applyRetire, branchFor, buildPrBody, buildPrCreateArgs, buildPrListArgs, buildPrTitle, defaultBranch, parseRemoteUrl, processStagingOnce, resolveCliStoreDir } from "./bot.js"
 import { activeDir, listActiveMemories, listRetiredMemories, retiredDir, stagingDir, writeMemoryFile, writeProposal } from "./storage.js"
 import type { Memory } from "./types.js"
 
@@ -26,6 +26,32 @@ it("prints CLI help when launched through an npm-style bin symlink", { skip: pro
     assert.ifError(run.error)
     assert.equal(run.status, 0, run.stderr)
     assert.match(run.stderr, /Usage:/)
+  })
+})
+
+describe("resolveCliStoreDir", () => {
+  it("resolves a developer checkout to its managed project store when --dir is omitted", async () => {
+    await withDir(async (root) => {
+      const remote = path.join(root, "remote.git")
+      const dev = path.join(root, "dev")
+      const home = path.join(root, "home")
+      execFileSync("git", ["init", "-q", "--bare", remote], { cwd: root })
+      execFileSync("git", ["clone", "-q", remote, dev], { cwd: root })
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: dev })
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: dev })
+      await fs.writeFile(path.join(dev, "README.md"), "readme\n", "utf8")
+      execFileSync("git", ["add", "-A"], { cwd: dev })
+      execFileSync("git", ["commit", "-qm", "init"], { cwd: dev })
+      execFileSync("git", ["branch", "-M", "main"], { cwd: dev })
+      execFileSync("git", ["push", "-q", "-u", "origin", "main"], { cwd: dev })
+
+      const resolved = await resolveCliStoreDir(dev, undefined, { home, forceRefresh: true })
+      assert.notEqual(resolved, dev)
+      assert.ok(resolved.startsWith(home + path.sep))
+
+      const explicit = await resolveCliStoreDir(dev, "/explicit/global-store", { home })
+      assert.equal(explicit, path.resolve("/explicit/global-store"))
+    })
   })
 })
 

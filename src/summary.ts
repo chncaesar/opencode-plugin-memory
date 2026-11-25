@@ -1,7 +1,15 @@
 import { activeDir, listActiveMemoriesForIndex, type StoreReadProblem } from "./storage.js"
 import type { Memory, Scope } from "./types.js"
 import { MEMORY_WRITE_POLICY } from "./prompt.js"
-import { globalProblemPrompt, type Store, type StoreSet } from "./stores.js"
+import {
+  globalProblemPrompt,
+  projectProblemPrompt,
+  StoreAccessError,
+  usableProjectStore,
+  withStoreAccess,
+  type Store,
+  type StoreSet,
+} from "./stores.js"
 
 const MEMORY_SYSTEM_INTRO = [
   "<!-- opencode-plugin-memory: PR-gated memory system (global + project) -->",
@@ -32,7 +40,14 @@ export type PromptInput = {
   project: ScopeListing
   /** Path-free notice shown in place of the global index when that store is unusable. */
   globalNotice?: string
+  /** Path-free notice shown in place of the project index when that store is unusable. */
+  projectNotice?: string
+  /** Path-free warning that a legacy MEMORY.md was found and automatic import is deferred. */
+  legacyNotice?: string
 }
+
+const LEGACY_IMPORT_DEFERRED =
+  "Legacy memory file detected for this repository. Automatic import is deferred for the managed project store, and the legacy file is left untouched. Entries in it are not active memories."
 
 /**
  * One `[mem-XXXX] Title` line per memory, ordered by id so the prompt is stable
@@ -120,7 +135,10 @@ export function buildSystemPrompt(input: PromptInput, maxChars: number, share: n
     projectBudget = Math.max(0, maxChars - globalPart.used)
   }
 
-  const projectPart = renderBody(input.project, projectLines, projectBudget)
+  const projectPart =
+    input.project.unavailable && input.projectNotice
+      ? { text: input.projectNotice, used: 0 }
+      : renderBody(input.project, projectLines, projectBudget)
 
   return [
     MEMORY_SYSTEM_INTRO,
@@ -130,6 +148,7 @@ export function buildSystemPrompt(input: PromptInput, maxChars: number, share: n
     "",
     "Project memory index (this repository):",
     projectPart.text,
+    ...(input.legacyNotice ? [input.legacyNotice] : []),
     MEMORY_WRITE_POLICY,
     "",
   ].join("\n\n")
@@ -189,13 +208,36 @@ export async function loadPromptBlock(
   maxChars: number,
   share: number,
   onProblems?: IndexProblemReporter,
+  opts: { legacyImportDeferred?: boolean } = {},
 ): Promise<string> {
-  const project = await readListing(stores.project, onProblems)
+  // An unavailable project store is shown as unavailable, never as an empty
+  // store: "(no active memories)" would be a false claim of truth.
+  const projectStore = usableProjectStore(stores)
+  let project: ScopeListing = { scope: "project", memories: [], omitted: 0, unavailable: true }
+  let projectBusy = false
+  if (projectStore) {
+    try {
+      // Prompt-index reads take the same lease as refresh and tools: a refresh
+      // can never be observed halfway through.
+      project = await withStoreAccess(projectStore, () => readListing(projectStore, onProblems))
+    } catch (err) {
+      // A prompt must never fail because the managed store is busy or
+      // recovering: degrade to "unavailable" (plus a notice when it is busy).
+      if (err instanceof StoreAccessError) projectBusy = true
+    }
+  }
   const global = stores.global ? await readListing(stores.global, onProblems) : undefined
+  const notice = stores.projectProblem
+    ? projectProblemPrompt(stores.projectProblem)
+    : projectBusy
+      ? "Project memory is being refreshed right now, so the project index is unavailable this turn; continue without it."
+      : undefined
   const input: PromptInput = {
     project,
     ...(global ? { global } : {}),
     ...(stores.globalProblem ? { globalNotice: globalProblemPrompt(stores.globalProblem) } : {}),
+    ...(notice ? { projectNotice: notice } : {}),
+    ...(opts.legacyImportDeferred ? { legacyNotice: LEGACY_IMPORT_DEFERRED } : {}),
   }
   return buildSystemPrompt(input, maxChars, share)
 }

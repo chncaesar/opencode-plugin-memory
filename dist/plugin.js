@@ -2,9 +2,9 @@ import { DEFAULT_CONFIG } from "./types.js";
 import { createMemoryTools } from "./tools.js";
 import { buildSystemPrompt, loadPromptBlock } from "./summary.js";
 import { listStagedProposals } from "./storage.js";
-import { availableStores, resolveStores } from "./stores.js";
+import { availableStores, resolveStores, withStoreAccess } from "./stores.js";
 import { createLogger } from "./logging.js";
-import { migrateLegacyStores } from "./migrate.js";
+import { hasLegacyMemorySource, migrateProjectMemory } from "./migrate.js";
 import { auditWarning, createAuditScheduler, createHttpModelCall, createSdkModelCall, } from "./audit.js";
 import { registerAuditAgent } from "./auditAgent.js";
 import { tool } from "@opencode-ai/plugin/tool";
@@ -116,10 +116,15 @@ export function resolveAuditCall(config, hostCall) {
 async function injectMemoryBlock(directory, config, logger) {
     try {
         const stores = await resolveStores(directory, config);
+        // Managed Git stores never auto-import a legacy MEMORY.md (it would become
+        // false active truth); tell the model it was seen and left untouched.
+        const legacyDeferred = stores.projectManaged && !stores.projectProblem
+            ? await hasLegacyMemorySource(stores.projectInputRoot ?? directory).catch(() => false)
+            : false;
         const block = await loadPromptBlock(stores, config.maxSummaryChars, config.globalIndexShare, async (problems) => {
             for (const problem of problems)
                 await logger.error("index", `${problem.code} ${problem.file}`);
-        });
+        }, legacyDeferred ? { legacyImportDeferred: true } : {});
         const notices = [block];
         for (const store of availableStores(stores)) {
             const warning = await auditWarning(store.root, config).catch(() => null);
@@ -181,10 +186,18 @@ export async function pendingPublishNotice(directory, scope = "project") {
 export const server = async (input, options) => {
     const config = resolveConfig(options);
     const directory = input.directory;
-    const logger = createLogger(directory, config.enableLog);
-    // One-time migration of the legacy single-file store into the per-file model.
+    // Resolve the managed project store first: every runtime path (log, audit
+    // state, staging, bot lock) must use that root, and the developer checkout is
+    // input only. All hooks resolve through the same function, so they converge on
+    // the same root.
+    const stores = await resolveStores(directory, config);
+    // Never create runtime files inside a store root that could not be proven:
+    // that would turn an uninitialized path into a half-populated one.
+    const logger = createLogger(stores.project.root, config.enableLog && !stores.projectProblem);
+    // Legacy MEMORY.md conversion is only coherent where the project directory is
+    // the store (non-Git). A managed Git store defers it and warns in the prompt.
     try {
-        await migrateLegacyStores(directory, logger);
+        await migrateProjectMemory(stores, logger);
     }
     catch (err) {
         await logger.error("migration", err);
@@ -201,11 +214,18 @@ export const server = async (input, options) => {
     // only its own store, so the two never see each other's context.
     const sdkCall = resolveAuditCall(config, createSdkModelCall(input.client, directory, auditSessions));
     const schedulers = new Map();
-    const schedulerFor = (root) => {
-        let scheduler = schedulers.get(root);
+    const schedulerFor = (store) => {
+        let scheduler = schedulers.get(store.root);
         if (!scheduler) {
-            scheduler = createAuditScheduler({ directory: root, config, notify, logger, call: sdkCall }, auditSessions);
-            schedulers.set(root, scheduler);
+            scheduler = createAuditScheduler({
+                directory: store.root,
+                config,
+                notify,
+                logger,
+                call: sdkCall,
+                withAccess: (fn) => withStoreAccess(store, fn),
+            }, auditSessions);
+            schedulers.set(store.root, scheduler);
         }
         return scheduler;
     };
@@ -233,7 +253,7 @@ export const server = async (input, options) => {
                 return;
             const stores = await resolveStores(directory, config);
             for (const store of availableStores(stores)) {
-                schedulerFor(store.root).onSessionIdle(event.properties.sessionID);
+                schedulerFor(store).onSessionIdle(event.properties.sessionID);
             }
         },
         // ── Inject the committed memory index into every system prompt ─────────
@@ -312,9 +332,14 @@ export async function setup(ctx) {
     const config = resolveConfig(ctx.options);
     const auditModel = parseAuditModel(ctx.options?.["auditModel"]);
     const directory = ctx.location.directory;
-    const logger = createLogger(directory, config.enableLog);
+    // See `server`: resolve the managed project store before anything writes to a
+    // runtime path; legacy conversion is deferred for managed Git stores.
+    const stores = await resolveStores(directory, config);
+    // Never create runtime files inside a store root that could not be proven:
+    // that would turn an uninitialized path into a half-populated one.
+    const logger = createLogger(stores.project.root, config.enableLog && !stores.projectProblem);
     try {
-        await migrateLegacyStores(directory, logger);
+        await migrateProjectMemory(stores, logger);
     }
     catch (err) {
         await logger.error("migration", err);
@@ -326,11 +351,11 @@ export async function setup(ctx) {
     // is audited without a restart.
     const auditSessions = new Set();
     const schedulers = new Map();
-    const schedulerFor = (root) => {
-        let scheduler = schedulers.get(root);
+    const schedulerFor = (store) => {
+        let scheduler = schedulers.get(store.root);
         if (!scheduler) {
-            scheduler = createAuditScheduler({ directory: root, config, logger, call }, auditSessions);
-            schedulers.set(root, scheduler);
+            scheduler = createAuditScheduler({ directory: store.root, config, logger, call, withAccess: (fn) => withStoreAccess(store, fn) }, auditSessions);
+            schedulers.set(store.root, scheduler);
         }
         return scheduler;
     };
@@ -360,7 +385,7 @@ export async function setup(ctx) {
         registrations.push(await ctx.session.hook("experimental.idle", async (event) => {
             const stores = await resolveStores(directory, config);
             for (const store of availableStores(stores)) {
-                schedulerFor(store.root).onSessionIdle(event.sessionID);
+                schedulerFor(store).onSessionIdle(event.sessionID);
             }
         }));
     }

@@ -25,6 +25,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { execFile } from "child_process";
 import { activeDir, isMemoryId, machineDir, memoryRootDir, readMemoryFileNoFollow, retiredDir, stagingDir, writeMemoryFile, } from "./storage.js";
+import { resolveProjectStore } from "./projectStore.js";
 // ─── Child processes ─────────────────────────────────────────────────────────
 function run(cmd, args, cwd) {
     return new Promise((resolve, reject) => {
@@ -734,6 +735,24 @@ function commitMessage(memory) {
     return `memory: add ${memory.id} — ${title}`;
 }
 // ─── Watch / regenerate / CLI ───────────────────────────────────────────────
+/**
+ * Resolve the store directory the CLI should process.
+ *
+ * - An explicit `--dir <path>` is treated as a store root directly (for
+ *   example, the global memory clone).
+ * - An omitted `--dir` resolves the current directory through the managed
+ *   project-store manager, so running `opencode-memory-bot once` from a
+ *   developer checkout processes that project's managed staging folder.
+ */
+export async function resolveCliStoreDir(cwd, dirArg, opts = {}) {
+    if (dirArg !== undefined)
+        return path.resolve(dirArg);
+    const resolved = await resolveProjectStore(path.resolve(cwd), opts);
+    if (resolved.status === "unavailable") {
+        throw new Error(`project memory store is unavailable at ${resolved.root}${resolved.detail ? ` (${resolved.detail})` : ""}`);
+    }
+    return resolved.root;
+}
 /** Poll staging forever, processing new proposals as they appear. */
 export async function startWatch(projectDir, intervalMs, opts = {}) {
     const log = opts.log ?? ((line) => console.error(line));
@@ -763,11 +782,11 @@ async function main() {
     const argv = process.argv.slice(2);
     const command = argv[0] ?? "once";
     const dirArg = argv.includes("--dir") ? argv[argv.indexOf("--dir") + 1] : undefined;
-    const projectDir = path.resolve(dirArg ?? process.cwd());
     const intervalArg = argv.includes("--interval") ? argv[argv.indexOf("--interval") + 1] : undefined;
     const intervalMs = intervalArg ? Number(intervalArg) || 2000 : 2000;
     switch (command) {
         case "once": {
+            const projectDir = await resolveCliStoreDir(process.cwd(), dirArg);
             const result = await processStagingOnce(projectDir);
             if (result.recovered > 0)
                 console.log(`recovered ${result.recovered} proposal${result.recovered === 1 ? "" : "s"} (branch already pushed)`);
@@ -784,6 +803,7 @@ async function main() {
             return;
         }
         case "watch": {
+            const projectDir = await resolveCliStoreDir(process.cwd(), dirArg);
             console.error(`watching ${path.join(projectDir, ".memory", "staging")} every ${intervalMs}ms`);
             await startWatch(projectDir, intervalMs);
             return;

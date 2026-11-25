@@ -1,6 +1,7 @@
 import fs from "fs/promises"
 import path from "path"
 import type { Logger } from "./logging.js"
+import type { StoreSet } from "./stores.js"
 import type { Memory, RetiredReason } from "./types.js"
 import {
   activeDir,
@@ -24,6 +25,34 @@ import {
  */
 
 const LEGACY_PATHS = [".opencode/memory/MEMORY.md", ".agents/memory/MEMORY.md"]
+
+/** True when the developer checkout still has a legacy single-file store. */
+export async function hasLegacyMemorySource(projectRoot: string): Promise<boolean> {
+  for (const relative of LEGACY_PATHS) {
+    try {
+      await fs.access(path.join(projectRoot, relative))
+      return true
+    } catch {
+      // try the next legacy location
+    }
+  }
+  return false
+}
+
+/**
+ * Where legacy `MEMORY.md` may be converted automatically.
+ *
+ * - A managed Git project store defers it: converted files would be unmerged
+ *   files inside the managed checkout — false "active" truth that could never be
+ *   published or retired. The legacy file is left untouched and the prompt
+ *   warns about it.
+ * - A non-Git / plain-directory store keeps the historical direct conversion,
+ *   where the project directory *is* the store and the user commits the result.
+ */
+export async function migrateProjectMemory(stores: StoreSet, logger?: Logger): Promise<number> {
+  if (stores.projectProblem || stores.projectManaged) return 0
+  return migrateLegacyStores(stores.projectInputRoot ?? stores.project.root, logger, stores.project.root)
+}
 
 type LegacyEntry = {
   id: string
@@ -142,11 +171,20 @@ async function readMigrationMap(projectDir: string): Promise<MigrationMap> {
 }
 
 /**
- * Migrate any unmigrated legacy entries, regenerate the summary, and return the
- * number of entries converted (0 when there was nothing to do).
+ * Migrate any unmigrated legacy entries and return the number of entries
+ * converted (0 when there was nothing to do).
+ *
+ * Legacy source files are always read from `projectDir`, the developer checkout
+ * (they are inputs that predate the managed store). Converted memories and the
+ * idempotency map are written to `storeRoot`, which is the plugin-managed
+ * project store when one is in use and the project directory otherwise.
  */
-export async function migrateLegacyStores(projectDir: string, logger?: Logger): Promise<number> {
-  const existing = await readMigrationMap(projectDir)
+export async function migrateLegacyStores(
+  projectDir: string,
+  logger?: Logger,
+  storeRoot: string = projectDir,
+): Promise<number> {
+  const existing = await readMigrationMap(storeRoot)
   const newAssignments: MigrationMap = {}
   const toWrite: Array<{ entry: LegacyEntry; newId: string }> = []
 
@@ -190,7 +228,7 @@ export async function migrateLegacyStores(projectDir: string, logger?: Logger): 
         const replacement = combined[entry.supersededBy]
         if (replacement) memory.supersededBy = replacement
       }
-      await writeMemoryFile(retiredDir(projectDir), memory)
+      await writeMemoryFile(retiredDir(storeRoot), memory)
     } else {
       const memory: Memory = {
         id: newId,
@@ -202,14 +240,14 @@ export async function migrateLegacyStores(projectDir: string, logger?: Logger): 
         approvedAt: entry.updated ?? entry.added,
       }
       if (entry.tags !== undefined && entry.tags.length > 0) memory.tags = entry.tags
-      await writeMemoryFile(activeDir(projectDir), memory)
+      await writeMemoryFile(activeDir(storeRoot), memory)
     }
   }
 
   const finalMap: MigrationMap = { ...existing, ...newAssignments }
-  await fs.mkdir(memoryRootDir(projectDir), { recursive: true })
+  await fs.mkdir(memoryRootDir(storeRoot), { recursive: true })
   await fs.writeFile(
-    migrationFilePath(projectDir),
+    migrationFilePath(storeRoot),
     JSON.stringify({ version: 1, mapped: finalMap }, null, 2) + "\n",
     "utf8",
   )

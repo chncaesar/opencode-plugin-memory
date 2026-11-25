@@ -1,6 +1,6 @@
 import { activeDir, listActiveMemoriesForIndex } from "./storage.js";
 import { MEMORY_WRITE_POLICY } from "./prompt.js";
-import { globalProblemPrompt } from "./stores.js";
+import { globalProblemPrompt, projectProblemPrompt, StoreAccessError, usableProjectStore, withStoreAccess, } from "./stores.js";
 const MEMORY_SYSTEM_INTRO = [
     "<!-- opencode-plugin-memory: PR-gated memory system (global + project) -->",
     "",
@@ -13,6 +13,7 @@ const MEMORY_SYSTEM_INTRO = [
  * the system prompt is noise to the model and can leak machine paths.
  */
 const INDEX_UNAVAILABLE = "(memory index unavailable this turn — the store could not be read; continue without it)";
+const LEGACY_IMPORT_DEFERRED = "Legacy memory file detected for this repository. Automatic import is deferred for the managed project store, and the legacy file is left untouched. Entries in it are not active memories.";
 /**
  * One `[mem-XXXX] Title` line per memory, ordered by id so the prompt is stable
  * across runs. Titles and ids only: full bodies stay on disk and load lazily
@@ -97,7 +98,9 @@ export function buildSystemPrompt(input, maxChars, share) {
         globalPart = renderBody(input.global, globalLines, globalBudget);
         projectBudget = Math.max(0, maxChars - globalPart.used);
     }
-    const projectPart = renderBody(input.project, projectLines, projectBudget);
+    const projectPart = input.project.unavailable && input.projectNotice
+        ? { text: input.projectNotice, used: 0 }
+        : renderBody(input.project, projectLines, projectBudget);
     return [
         MEMORY_SYSTEM_INTRO,
         "",
@@ -106,6 +109,7 @@ export function buildSystemPrompt(input, maxChars, share) {
         "",
         "Project memory index (this repository):",
         projectPart.text,
+        ...(input.legacyNotice ? [input.legacyNotice] : []),
         MEMORY_WRITE_POLICY,
         "",
     ].join("\n\n");
@@ -152,13 +156,37 @@ async function readListing(store, onProblems) {
  * that cannot be listed falls back to an unavailable notice. Raw filesystem
  * errors never reach the prompt.
  */
-export async function loadPromptBlock(stores, maxChars, share, onProblems) {
-    const project = await readListing(stores.project, onProblems);
+export async function loadPromptBlock(stores, maxChars, share, onProblems, opts = {}) {
+    // An unavailable project store is shown as unavailable, never as an empty
+    // store: "(no active memories)" would be a false claim of truth.
+    const projectStore = usableProjectStore(stores);
+    let project = { scope: "project", memories: [], omitted: 0, unavailable: true };
+    let projectBusy = false;
+    if (projectStore) {
+        try {
+            // Prompt-index reads take the same lease as refresh and tools: a refresh
+            // can never be observed halfway through.
+            project = await withStoreAccess(projectStore, () => readListing(projectStore, onProblems));
+        }
+        catch (err) {
+            // A prompt must never fail because the managed store is busy or
+            // recovering: degrade to "unavailable" (plus a notice when it is busy).
+            if (err instanceof StoreAccessError)
+                projectBusy = true;
+        }
+    }
     const global = stores.global ? await readListing(stores.global, onProblems) : undefined;
+    const notice = stores.projectProblem
+        ? projectProblemPrompt(stores.projectProblem)
+        : projectBusy
+            ? "Project memory is being refreshed right now, so the project index is unavailable this turn; continue without it."
+            : undefined;
     const input = {
         project,
         ...(global ? { global } : {}),
         ...(stores.globalProblem ? { globalNotice: globalProblemPrompt(stores.globalProblem) } : {}),
+        ...(notice ? { projectNotice: notice } : {}),
+        ...(opts.legacyImportDeferred ? { legacyNotice: LEGACY_IMPORT_DEFERRED } : {}),
     };
     return buildSystemPrompt(input, maxChars, share);
 }

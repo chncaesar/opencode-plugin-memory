@@ -43,6 +43,12 @@ export type AuditDeps = {
     config: PluginConfig;
     logger: Logger;
     call: ModelCall;
+    /**
+     * Cross-process access wrapper for this store's filesystem phases. Snapshot
+     * and proposal writes run inside it; the model call runs outside it. Defaults
+     * to running directly (global / plain-directory stores).
+     */
+    withAccess?: <T>(fn: () => Promise<T>) => Promise<T>;
     /** Show a short message to the user (e.g. a TUI toast). Called when a failure is new, never repeated for the same error. */
     notify?: (message: string) => Promise<void> | void;
     now?: () => Date;

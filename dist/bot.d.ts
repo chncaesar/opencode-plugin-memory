@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { type ProjectStoreOptions } from "./projectStore.js";
 import type { Memory } from "./types.js";
 /**
  * `owner/repo` (or `host/owner/repo` for non-github.com hosts) of a git remote
@@ -107,6 +108,16 @@ export declare function acquireLock(projectDir: string): Promise<(() => Promise<
  *   3. on failure leave the staged file for the next run.
  */
 export declare function processStagingOnce(projectDir: string, opts?: BotOptions): Promise<BotResult>;
+/**
+ * Resolve the store directory the CLI should process.
+ *
+ * - An explicit `--dir <path>` is treated as a store root directly (for
+ *   example, the global memory clone).
+ * - An omitted `--dir` resolves the current directory through the managed
+ *   project-store manager, so running `opencode-memory-bot once` from a
+ *   developer checkout processes that project's managed staging folder.
+ */
+export declare function resolveCliStoreDir(cwd: string, dirArg?: string, opts?: ProjectStoreOptions): Promise<string>;
 /** Poll staging forever, processing new proposals as they appear. */
 export declare function startWatch(projectDir: string, intervalMs: number, opts?: BotOptions): Promise<void>;
 //# sourceMappingURL=bot.d.ts.map

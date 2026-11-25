@@ -29,7 +29,7 @@ If you already have other OpenCode settings or plugins, add the entry to your ex
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `maxSummaryChars` | `10000` | Maximum characters in the injected index of memory titles. The separate memory-writing policy is not included in this limit. |
-| `enableLog` | `true` | Write an operation log to `.memory/plugin.log`. Set to `false` to disable it. |
+| `enableLog` | `true` | Write an operation log to `.memory/plugin.log` inside the active project store root (the plugin-managed project checkout for Git repositories). Set to `false` to disable it. |
 | `staleDays` | `90` | Age in days after which `memory_review` lists an active memory as aging. This is informational; it does not retire memories. |
 | `backgroundAudit` | `true` | Enable the model-assisted audit after sessions become idle. Set to `false` to disable it; proposals and manual review still work. |
 | `auditIntervalMinutes` | `1` | Minimum number of minutes between background audit attempts. Increase it to run audits less frequently. |

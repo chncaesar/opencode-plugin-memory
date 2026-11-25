@@ -128,5 +128,26 @@ describe("migrateLegacyStores", () => {
             assert.deepEqual(active.map((m) => m.title).sort(), ["A", "B"]);
         });
     });
+    it("reads the legacy file from the checkout but writes converted memories into the store root", async () => {
+        await withDir(async (checkout) => {
+            await withDir(async (store) => {
+                await fs.mkdir(path.join(checkout, ".opencode/memory"), { recursive: true });
+                await fs.writeFile(path.join(checkout, ".opencode/memory/MEMORY.md"), LEGACY, "utf8");
+                assert.equal(await migrateLegacyStores(checkout, undefined, store), 3);
+                const active = await listActiveMemories(store);
+                const retired = await listRetiredMemories(store);
+                assert.equal(active.length, 2);
+                assert.equal(retired.length, 1);
+                // The developer checkout only supplied the legacy input: no converted
+                // memory tree or id map appears there.
+                assert.equal((await listActiveMemories(checkout)).length, 0);
+                await assert.rejects(fs.access(migrationFilePath(checkout)));
+                await assert.rejects(fs.access(path.join(checkout, "memory")));
+                // The managed map makes a later run idempotent.
+                await fs.access(migrationFilePath(store));
+                assert.equal(await migrateLegacyStores(checkout, undefined, store), 0);
+            });
+        });
+    });
 });
 //# sourceMappingURL=migrate.test.js.map

@@ -87,6 +87,39 @@ describe("runAudit", () => {
             assert.equal(out, "skipped-too-few");
         });
     });
+    it("holds the access wrapper for snapshot and writes, never during the model call", async () => {
+        await withDir(async (dir) => {
+            await seed(dir, mem("mem-aaaa0001", "A"), mem("mem-bbbb0002", "B"));
+            let depth = 0;
+            let acquisitions = 0;
+            let depthDuringModelCall = -1;
+            const withAccess = async (fn) => {
+                acquisitions++;
+                depth++;
+                try {
+                    return await fn();
+                }
+                finally {
+                    depth--;
+                }
+            };
+            const call = async () => {
+                depthDuringModelCall = depth;
+                return JSON.stringify({ findings: [] });
+            };
+            const out = await runAudit({
+                directory: dir,
+                config: cfg(),
+                logger: quietLogger,
+                call,
+                now: () => NOW,
+                withAccess,
+            });
+            assert.equal(out, "done");
+            assert.equal(depthDuringModelCall, 0);
+            assert.ok(acquisitions >= 2);
+        });
+    });
     it("asks the model and emits a retire proposal per finding", async () => {
         await withDir(async (dir) => {
             await seed(dir, mem("mem-aaaa0001", "Old"), mem("mem-bbbb0002", "New"));

@@ -264,23 +264,36 @@ export async function runAudit(deps) {
     const now = deps.now ?? (() => new Date());
     if (!config.backgroundAudit)
         return "disabled";
+    const withAccess = deps.withAccess ?? (async (fn) => fn());
     try {
-        const active = await listActiveMemories(directory);
-        const state = await readAuditState(directory);
-        const hash = activeHash(active);
-        if (active.length < 2) {
-            if (state.lastHash !== hash)
-                await writeAuditState(directory, { ...state, lastHash: hash });
-            return "skipped-too-few";
-        }
-        if (hash === state.lastHash)
-            return "skipped-unchanged";
-        if (!deps.force) {
-            const last = Date.parse(state.lastAuditAt);
-            if (!Number.isNaN(last) && now().getTime() - last < config.auditIntervalMinutes * 60_000) {
-                return "skipped-interval";
+        // Snapshot under the store lease: the entries and the guard state must be
+        // one consistent view, never a worktree mid-refresh.
+        let active = [];
+        let hash = "";
+        let guarded = null;
+        await withAccess(async () => {
+            active = await listActiveMemories(directory);
+            const state = await readAuditState(directory);
+            hash = activeHash(active);
+            if (active.length < 2) {
+                if (state.lastHash !== hash)
+                    await writeAuditState(directory, { ...state, lastHash: hash });
+                guarded = "skipped-too-few";
+                return;
             }
-        }
+            if (hash === state.lastHash) {
+                guarded = "skipped-unchanged";
+                return;
+            }
+            if (!deps.force) {
+                const last = Date.parse(state.lastAuditAt);
+                if (!Number.isNaN(last) && now().getTime() - last < config.auditIntervalMinutes * 60_000) {
+                    guarded = "skipped-interval";
+                }
+            }
+        });
+        if (guarded !== null)
+            return guarded;
         // One model call per batch. A failed or unparsable batch fails the whole run
         // before anything is written, so a retry never sees a half-applied audit.
         const batches = splitIntoBatches(active, config.auditBatchChars);
@@ -311,40 +324,49 @@ export async function runAudit(deps) {
                     merged.set(f.retire, f);
         }
         const findings = [...merged.values()];
-        // If memories changed while the model was working, the verdict may describe
-        // text that no longer exists. Leave lastHash as is so the next idle re-audits.
-        const fresh = await listActiveMemories(directory);
-        if (activeHash(fresh) !== hash) {
-            await markAttempt(directory, now(), "discarded-changed");
-            await safeLogInfo(logger, "discarded: memories changed during audit");
+        // Reacquire the lease for the fresh-hash check and the proposal writes, so
+        // the entries cannot change between the check and the writes.
+        let discarded = false;
+        await withAccess(async () => {
+            // If memories changed while the model was working, the verdict may
+            // describe text that no longer exists. Leave lastHash as is so the next
+            // idle re-audits.
+            const fresh = await listActiveMemories(directory);
+            if (activeHash(fresh) !== hash) {
+                await markAttempt(directory, now(), "discarded-changed");
+                await safeLogInfo(logger, "discarded: memories changed during audit");
+                discarded = true;
+                return;
+            }
+            // Emit a retire proposal per finding, skipping any already proposed.
+            const staged = await listStagedProposals(directory);
+            const alreadyProposed = new Set(staged.filter((p) => p.intent === "retire").map((p) => p.id));
+            const titleById = new Map(active.map((m) => [m.id, m.title]));
+            let emitted = 0;
+            for (const f of findings) {
+                if (alreadyProposed.has(f.retire))
+                    continue;
+                const memory = {
+                    id: f.retire,
+                    title: titleById.get(f.retire) ?? f.retire,
+                    body: "",
+                    author: "unknown",
+                    source: `background audit — ${f.relation}: ${f.reason || "(no reason given)"}`,
+                    proposedAt: now().toISOString(),
+                    intent: "retire",
+                    retiredReason: relationToReason(f.relation),
+                };
+                if (f.supersededBy)
+                    memory.supersededBy = f.supersededBy;
+                await writeProposal(directory, memory);
+                emitted++;
+            }
+            const doneAt = now().toISOString();
+            await writeAuditState(directory, { lastHash: hash, lastAuditAt: doneAt, lastOutcome: "done", lastOutcomeAt: doneAt });
+            await safeLogInfo(logger, `${findings.length} finding(s) → ${emitted} proposal(s) over ${active.length} entries in ${batches.length} batch(es)`);
+        });
+        if (discarded)
             return "discarded-changed";
-        }
-        // Emit a retire proposal per finding, skipping any already proposed.
-        const staged = await listStagedProposals(directory);
-        const alreadyProposed = new Set(staged.filter((p) => p.intent === "retire").map((p) => p.id));
-        const titleById = new Map(active.map((m) => [m.id, m.title]));
-        let emitted = 0;
-        for (const f of findings) {
-            if (alreadyProposed.has(f.retire))
-                continue;
-            const memory = {
-                id: f.retire,
-                title: titleById.get(f.retire) ?? f.retire,
-                body: "",
-                author: "unknown",
-                source: `background audit — ${f.relation}: ${f.reason || "(no reason given)"}`,
-                proposedAt: now().toISOString(),
-                intent: "retire",
-                retiredReason: relationToReason(f.relation),
-            };
-            if (f.supersededBy)
-                memory.supersededBy = f.supersededBy;
-            await writeProposal(directory, memory);
-            emitted++;
-        }
-        const doneAt = now().toISOString();
-        await writeAuditState(directory, { lastHash: hash, lastAuditAt: doneAt, lastOutcome: "done", lastOutcomeAt: doneAt });
-        await safeLogInfo(logger, `${findings.length} finding(s) → ${emitted} proposal(s) over ${active.length} entries in ${batches.length} batch(es)`);
         return "done";
     }
     catch (err) {

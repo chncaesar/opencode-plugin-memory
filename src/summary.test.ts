@@ -68,6 +68,27 @@ describe("buildIndexLines", () => {
   })
 })
 
+describe("loadPromptBlock: unavailable project store", () => {
+  it("shows the project index as unavailable, never as empty, and still indexes global", async () => {
+    await withDir(async (dir) => {
+      const globalDir = path.join(dir, "global")
+      await writeMemoryFile(activeDir(globalDir), mem("mem-aaaaaaaa", "Global rule"))
+      const stores: StoreSet = {
+        global: { scope: "global", root: globalDir },
+        project: { scope: "project", root: path.join(dir, "uninitialized-managed-store") },
+        projectProblem: "unavailable",
+        defaultScope: "global",
+        globalPath: globalDir,
+      }
+      const block = await loadPromptBlock(stores, 4000, 0.7)
+      const projectSection = section(block, PROJECT_HEADING)
+      assert.match(projectSection, /unavailable/i)
+      assert.doesNotMatch(projectSection, /no active memories/)
+      assert.match(section(block, GLOBAL_HEADING, PROJECT_HEADING), /\[mem-aaaaaaaa\] Global rule/)
+    })
+  })
+})
+
 describe("loadPromptBlock", () => {
   it("derives the project index from memory/active and writes nothing", async () => {
     await withDir(async (dir) => {

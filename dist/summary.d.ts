@@ -15,6 +15,10 @@ export type PromptInput = {
     project: ScopeListing;
     /** Path-free notice shown in place of the global index when that store is unusable. */
     globalNotice?: string;
+    /** Path-free notice shown in place of the project index when that store is unusable. */
+    projectNotice?: string;
+    /** Path-free warning that a legacy MEMORY.md was found and automatic import is deferred. */
+    legacyNotice?: string;
 };
 /**
  * One `[mem-XXXX] Title` line per memory, ordered by id so the prompt is stable
@@ -48,5 +52,7 @@ export type IndexProblemReporter = (problems: StoreReadProblem[]) => void | Prom
  * that cannot be listed falls back to an unavailable notice. Raw filesystem
  * errors never reach the prompt.
  */
-export declare function loadPromptBlock(stores: StoreSet, maxChars: number, share: number, onProblems?: IndexProblemReporter): Promise<string>;
+export declare function loadPromptBlock(stores: StoreSet, maxChars: number, share: number, onProblems?: IndexProblemReporter, opts?: {
+    legacyImportDeferred?: boolean;
+}): Promise<string>;
 //# sourceMappingURL=summary.d.ts.map
