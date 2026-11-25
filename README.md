@@ -13,12 +13,23 @@ PR-gated persistent memory for [OpenCode](https://opencode.ai): global knowledge
 
 The LLM never writes shared truth. It can only drop a proposal file into a machine-local, git-ignored staging folder. A memory is not valid until a human merges the pull request, so proposed, wrong, or harmful content never silently becomes shared truth.
 
+## Two stores
+
+- **Global** — one private repository of your own, cloned on this machine and injected into every session. Most knowledge belongs here: how a tool or API behaves, infrastructure, personal preferences, review rules.
+- **Project** — the current repository's own `memory/` folder, shared with whoever has the repository. Use it for rules that only make sense here: its architecture, its module names, its business definitions.
+
+A proposal names its store and defaults to the global one once that clone exists; without a clone, everything stays in the project store, as it did before. Each store stages, publishes and audits independently, so one store failing never blocks the other. The two prompt sections share one size limit, and the project section keeps a guaranteed share so a large global store cannot crowd it out.
+
+## What belongs in memory
+
+Only what no artifact can state: what a field really means, why the obvious approach is dangerous, a boundary that forbids something. If the code, the tests or the design doc will state a rule once it is built, that is where the rule belongs — a second copy drifts at the next redesign. When a remembered rule does get built, it is retired as `implemented` and its pull request says so, leaving the code as the only source of truth.
+
 ## How it works
 
-1. The LLM proposes a memory by writing one file to `.memory/staging/`.
-2. A local bot commits each proposal into `memory/active/` on its own branch and opens a pull request. All git work happens in a throwaway worktree, and the agent itself never holds repository credentials.
+1. The LLM proposes a memory by writing one file to its store's `.memory/staging/` — machine-local and git-ignored.
+2. A local bot commits each proposal into `memory/active/` on its own branch and opens a pull request in the repository that store belongs to: your private memory repository for global knowledge, the project repository for its own. All git work happens in a throwaway worktree, and the agent itself never holds repository credentials.
 3. A human reviews the PR and merges it. Merge is the gate.
-4. Every session derives an index of titles and IDs from `memory/active/` and injects it into the system prompt; full bodies load lazily on demand.
+4. Every session derives an index of titles and IDs from `memory/active/` in both stores and injects one section per store; full bodies load lazily on demand.
 
 State is positional: `memory/active/` is shared truth, `memory/retired/` holds removed memories with a reason.
 
@@ -29,6 +40,8 @@ opencode plugin add @chncaesar/opencode-plugin-memory@latest
 ```
 
 This plugin supports OpenCode 2.x only. See the [user guide](https://chncaesar.github.io/opencode-plugin-memory/) for manual config entries, local-clone installs, and all plugin options.
+
+Global memory is optional. Create a private repository, clone it where the plugin expects it, and the next session finds it without a restart. The user guide above covers the folder layout.
 
 ## Development
 
