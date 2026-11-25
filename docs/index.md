@@ -139,7 +139,7 @@ Global memory is optional but recommended: without it, knowledge learned in one 
 
 If the folder is missing, nothing breaks: the plugin says so in the prompt and writes proposals to the project store instead. A clone can be added at any time; the next session picks it up without a restart.
 
-Proposals default to the global store. Use `scope: "project"` when the rule would be wrong, or pointless, in a different repository — its architecture, module names, business definitions, or a convention its contributors must follow. Everything else (tool and API behaviour, infrastructure, personal preferences, review rules) is global.
+Proposals default to the global store once that clone exists. Use `scope: "project"` when the rule would be wrong, or pointless, in a different repository — its architecture, module names, business definitions, or a convention its contributors must follow. Everything else (tool and API behaviour, infrastructure, personal preferences, review rules) is global.
 
 The two indexes share one character budget. The global store may use up to `globalIndexShare` of it, while the project store keeps at least the remainder reserved; budget one side does not need is available to the other. A truncated section says so and points at `memory_read`.
 
@@ -165,6 +165,8 @@ You can also run the bot yourself from the project directory:
 npx -p @chncaesar/opencode-plugin-memory opencode-memory-bot once
 ```
 
+`once` processes whatever is staged and exits; `watch` keeps polling instead, every two seconds unless you pass `--interval <ms>`.
+
 To publish the global store by hand, point the bot at the clone instead: add `--dir <global clone>`.
 
 Review each pull request on GitHub. Check whether the proposed knowledge is correct, useful beyond the current task, and consistent with existing project instructions. **Merging the pull request is the approval step.** Until then, the proposal is not shared truth.
@@ -181,7 +183,7 @@ For example, after the inventory lesson is merged and pulled into a checkout, a 
 
 ## 5. Update or retire a memory
 
-When a project convention changes, tell the agent what changed and ask it to update the old memory. An update stages a replacement that supersedes the old entry; it does not modify active memory immediately.
+When a project convention changes, tell the agent what changed and ask it to update the old memory. An update stages a replacement that supersedes the old entry; it does not modify active memory immediately. The replacement stays in the store that holds the original — a proposal that targets an entry in the other store is refused with instructions — so updating never moves knowledge between stores.
 
 When a memory is wrong or no longer useful, ask the agent to retire it. That, too, is a proposal. Review and merge its pull request to make the change active. Retired entries are kept in the repository for history rather than silently erased.
 
@@ -200,6 +202,8 @@ When a remembered rule does get built, retire the memory and say why. The retire
 ## Background audit
 
 By default, the plugin can audit active memories after a session becomes idle. It looks for possible duplicates, refinements, and contradictions. Audit findings become retirement proposals, not automatic changes; a person still reviews and merges the resulting pull requests.
+
+Each store is audited on its own, with its own schedule and its own history, so a failed audit in one store never affects the other.
 
 The audit can split a large collection into overlapping batches. This keeps individual model calls bounded, but it can miss a relationship between entries placed in different batches. Treat the findings as review suggestions, not a complete or infallible analysis.
 
