@@ -123,6 +123,8 @@ export function managedPaths(repository, base) {
 }
 const cache = new Map();
 const inflight = new Map();
+const globalCache = new Map();
+const globalInflight = new Map();
 /**
  * Resolve the project store for `projectDir`.
  *
@@ -206,6 +208,123 @@ export async function resolveProjectStore(projectDir, opts = {}) {
 export function resetProjectStoreCache() {
     cache.clear();
     inflight.clear();
+    globalCache.clear();
+    globalInflight.clear();
+}
+/**
+ * Refresh the global store clone in place with a fast-forward merge from the
+ * remote default branch, serialized by the same cross-process lease family.
+ *
+ * The global store is a dedicated memory repository, not an application code
+ * checkout. Still, the refresh is strictly non-destructive:
+ * - If the directory is not a Git working tree, it is left as a plain folder.
+ * - If tracked files have local changes, the current branch differs from the
+ *   remote default branch, or the branch cannot be fast-forwarded, the refresh
+ *   is skipped and the existing local clone stays usable.
+ * - Untracked `.memory/` staging, audit state, and logs are untouched.
+ */
+export async function refreshGlobalStore(globalRoot, opts = {}) {
+    const git = opts.git ?? defaultGitRun;
+    const home = opts.home ?? os.homedir();
+    const base = opts.base ? path.resolve(opts.base) : projectStoreBase(home);
+    if ((await lstatKind(globalRoot)) !== "dir")
+        return { root: globalRoot };
+    const canonicalRoot = await realpathOr(globalRoot);
+    if (!canonicalRoot)
+        return { root: globalRoot };
+    let toplevel = "";
+    try {
+        toplevel = (await git(["rev-parse", "--show-toplevel"], canonicalRoot)).trim();
+    }
+    catch {
+        return { root: globalRoot };
+    }
+    if (!toplevel || !(await samePath(toplevel, canonicalRoot))) {
+        return { root: globalRoot };
+    }
+    const commonDir = (await gitCommonDir(canonicalRoot, git)) ?? canonicalRoot;
+    const access = {
+        base,
+        name: `global-${managedName(commonDir)}`,
+        directRoot: canonicalRoot,
+    };
+    const interval = opts.refreshIntervalMs ?? DEFAULT_REFRESH_INTERVAL_MS;
+    const key = `${access.base}:${access.name}`;
+    const cached = globalCache.get(key);
+    if (!opts.forceRefresh && cached && interval > 0 && Date.now() - cached.at < interval) {
+        return { ...cached.result, root: globalRoot };
+    }
+    const running = globalInflight.get(key);
+    if (running) {
+        const settled = await running;
+        return { ...settled, root: globalRoot };
+    }
+    const job = (async () => {
+        await fs.mkdir(base, { recursive: true });
+        let detail;
+        try {
+            detail = await withProjectStoreAccess(access, () => fastForwardGlobalClone(canonicalRoot, git));
+        }
+        catch (err) {
+            detail = message(err);
+        }
+        const result = {
+            root: globalRoot,
+            access,
+            ...(detail ? { detail } : {}),
+        };
+        globalCache.set(key, { at: Date.now(), result });
+        return result;
+    })();
+    globalInflight.set(key, job);
+    try {
+        const settled = await job;
+        return { ...settled, root: globalRoot };
+    }
+    finally {
+        if (globalInflight.get(key) === job)
+            globalInflight.delete(key);
+    }
+}
+async function fastForwardGlobalClone(root, git) {
+    if ((await lstatKind(root)) !== "dir")
+        return "global store is not a real directory";
+    let hasOrigin = false;
+    try {
+        hasOrigin = (await git(["remote", "get-url", "origin"], root)).trim().length > 0;
+    }
+    catch {
+        return undefined;
+    }
+    if (!hasOrigin)
+        return undefined;
+    let ref;
+    try {
+        ref = await resolveDefaultRef(root, git);
+    }
+    catch (err) {
+        return `global refresh skipped: ${message(err)}`;
+    }
+    // Never fast-forward over tracked modifications or while detached on a custom commit.
+    const dirty = (await git(["status", "--porcelain", "-uno"], root).catch(() => "dirty")).trim();
+    if (dirty !== "")
+        return "global refresh skipped: tracked files have local changes";
+    const branch = (await git(["symbolic-ref", "--quiet", "--short", "HEAD"], root).catch(() => "")).trim();
+    const expectedBranch = ref.startsWith("origin/") ? ref.slice("origin/".length) : "";
+    if (!branch || (expectedBranch && branch !== expectedBranch)) {
+        return "global refresh skipped: global clone is not on its default branch";
+    }
+    const current = await headSha(root, git);
+    const target = await commitSha(root, git, ref);
+    if (!target || current === target)
+        return undefined;
+    try {
+        await git(["merge", "--ff-only", "--quiet", target], root);
+        return undefined;
+    }
+    catch (err) {
+        return `global refresh skipped: ${message(err)}`;
+    }
 }
 // ─── Initialization / refresh (inside the cross-process lease) ──────────────
 async function initializeOrRefresh(input) {
@@ -1050,6 +1169,16 @@ export async function pendingRefreshForAccess(access) {
  * reads or writes into the developer checkout.
  */
 export async function assertAccessBoundary(access) {
+    if (access.directRoot) {
+        const kind = await lstatKind(access.directRoot);
+        if (kind !== "dir")
+            return { ok: false, detail: "global store is not a real directory" };
+        const real = await realpathOr(access.directRoot);
+        if (!real || real !== access.directRoot) {
+            return { ok: false, detail: "global store resolves outside its canonical location" };
+        }
+        return { ok: true };
+    }
     const ownerDir = path.join(access.base, access.name);
     const worktree = path.join(ownerDir, WORKTREE_DIR);
     const realBase = (await realpathOr(access.base)) ?? path.resolve(access.base);

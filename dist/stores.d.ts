@@ -1,5 +1,5 @@
 import type { PluginConfig, Scope } from "./types.js";
-import { StoreAccessError, type ProjectStoreAccess, type ProjectStoreOptions, type ProjectStoreProblem } from "./projectStore.js";
+import { StoreAccessError, type GlobalStoreOptions, type ProjectStoreAccess, type ProjectStoreOptions, type ProjectStoreProblem } from "./projectStore.js";
 export { StoreAccessError };
 /**
  * A memory store: a directory laid out exactly like a project's `memory/`
@@ -72,6 +72,8 @@ export declare function resolveStores(projectDir: string, config: PluginConfig, 
     probe?: DirProbe;
     /** Internal test injection for the managed project store. */
     project?: ProjectStoreOptions;
+    /** Internal test injection for the global store refresh. */
+    global?: GlobalStoreOptions;
 }): Promise<StoreSet>;
 /**
  * The project store, or `null` when the managed store could not be created or

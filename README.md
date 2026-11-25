@@ -29,7 +29,7 @@ Only what no artifact can state: what a field really means, why the obvious appr
 1. The LLM proposes a memory by writing one file to its store's `.memory/staging/` — machine-local and git-ignored (inside the global clone or the plugin-managed sparse worktree for the project store).
 2. A local bot commits each proposal into `memory/active/` on its own branch and opens a pull request in the repository that store belongs to: your private memory repository for global knowledge, the project repository for its own. Publishing runs in a throwaway worktree, and the agent itself never holds repository credentials.
 3. A human reviews the PR and merges it. Merge is the gate.
-4. Every session refreshes the plugin-managed sparse worktree from the remote default branch and derives an index of titles and IDs from `memory/active/` in both stores, injecting one section per store; full bodies load lazily on demand.
+4. Every session refreshes the global clone (fast-forward when clean) and the plugin-managed sparse worktree from their remote default branches, then derives an index of titles and IDs from `memory/active/` in both stores and injects one section per store; full bodies load lazily on demand.
 
 State is positional: `memory/active/` is shared truth, `memory/retired/` holds removed memories with a reason.
 

@@ -97,6 +97,11 @@ export type ProjectStoreOptions = {
 export type ProjectStoreAccess = {
     base: string;
     name: string;
+    /**
+     * Present only for the global store clone: the canonical root directory that
+     * must remain a real directory at consumer time.
+     */
+    directRoot?: string;
 };
 /** Thrown when a consumer cannot take the lease, or must not read a recovering store. */
 export declare class StoreAccessError extends Error {
@@ -119,6 +124,25 @@ export declare function projectStoreBase(home?: string): string;
 export declare function managedName(repository: string): string;
 /** All paths of one managed store. */
 export declare function managedPaths(repository: string, base: string): ManagedPaths;
+export type GlobalStoreOptions = {
+    /** Home directory the lock base path is derived from (tests inject a temp home). */
+    home?: string;
+    /** Absolute lock base directory override (tests inject a temp base). */
+    base?: string;
+    /** Minimum milliseconds between refreshes. `0` refreshes on every call. */
+    refreshIntervalMs?: number;
+    /** Refresh now, ignoring the timing cache. */
+    forceRefresh?: boolean;
+    /** Git runner override (tests simulate failures). */
+    git?: GitRun;
+};
+export type GlobalStoreResolution = {
+    root: string;
+    /** Present when the global store is a Git repository and uses the shared lease. */
+    access?: ProjectStoreAccess;
+    /** Diagnostic detail when a refresh was skipped or failed; never fatal. */
+    detail?: string;
+};
 /**
  * Resolve the project store for `projectDir`.
  *
@@ -133,6 +157,19 @@ export declare function managedPaths(repository: string, base: string): ManagedP
 export declare function resolveProjectStore(projectDir: string, opts?: ProjectStoreOptions): Promise<ProjectStoreResolution>;
 /** Clear the timing cache (tests only; runtime never needs it). */
 export declare function resetProjectStoreCache(): void;
+/**
+ * Refresh the global store clone in place with a fast-forward merge from the
+ * remote default branch, serialized by the same cross-process lease family.
+ *
+ * The global store is a dedicated memory repository, not an application code
+ * checkout. Still, the refresh is strictly non-destructive:
+ * - If the directory is not a Git working tree, it is left as a plain folder.
+ * - If tracked files have local changes, the current branch differs from the
+ *   remote default branch, or the branch cannot be fast-forwarded, the refresh
+ *   is skipped and the existing local clone stays usable.
+ * - Untracked `.memory/` staging, audit state, and logs are untouched.
+ */
+export declare function refreshGlobalStore(globalRoot: string, opts?: GlobalStoreOptions): Promise<GlobalStoreResolution>;
 /** Cheap existence check; used to keep a cached root from bypassing recovery. */
 export declare function refreshMarkerPending(paths: ManagedPaths): Promise<boolean>;
 /**

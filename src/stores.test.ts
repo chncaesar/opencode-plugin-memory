@@ -200,4 +200,108 @@ describe("resolveStores: Git project", () => {
       assert.ok(stores.project.root.startsWith(path.join(fx.home, ".local", "share", "opencode", "project-memory")))
     })
   })
+
+  it("automatically fast-forwards a clean global store clone and preserves untracked staging", async () => {
+    const root = await tempDir("mem-global-sync-")
+    const remote = path.join(root, "global-remote.git")
+    const publisher = path.join(root, "publisher")
+    const globalClone = path.join(root, "global-clone")
+    const projectDir = path.join(root, "plain-project")
+    const home = path.join(root, "home")
+    await fs.mkdir(projectDir, { recursive: true })
+    await fs.mkdir(home, { recursive: true })
+    try {
+      await defaultGitRun(["init", "-q", "--bare", remote], root)
+      await defaultGitRun(["clone", "-q", remote, publisher], root)
+      await defaultGitRun(["config", "user.email", "test@example.com"], publisher)
+      await defaultGitRun(["config", "user.name", "Test"], publisher)
+      await fs.mkdir(path.join(publisher, "memory", "active"), { recursive: true })
+      await fs.writeFile(
+        path.join(publisher, "memory", "active", "mem-gggg0001.md"),
+        "---\nid: mem-gggg0001\ntitle: First global rule\n---\nbody\n",
+        "utf8",
+      )
+      await defaultGitRun(["add", "-A"], publisher)
+      await defaultGitRun(["commit", "-qm", "init"], publisher)
+      await defaultGitRun(["branch", "-M", "main"], publisher)
+      await defaultGitRun(["push", "-q", "-u", "origin", "main"], publisher)
+
+      await defaultGitRun(["clone", "-q", remote, globalClone], root)
+      await fs.mkdir(path.join(globalClone, ".memory", "staging"), { recursive: true })
+      await fs.writeFile(path.join(globalClone, ".memory", "staging", "mem-staged99.md"), "staged\n", "utf8")
+
+      // Merge a new global memory upstream.
+      await fs.writeFile(
+        path.join(publisher, "memory", "active", "mem-gggg0002.md"),
+        "---\nid: mem-gggg0002\ntitle: Newly merged global rule\n---\nbody\n",
+        "utf8",
+      )
+      await defaultGitRun(["add", "-A"], publisher)
+      await defaultGitRun(["commit", "-qm", "add second"], publisher)
+      await defaultGitRun(["push", "-q", "origin", "main"], publisher)
+
+      resetProjectStoreCache()
+      const stores = await resolveStores(projectDir, config({ globalMemoryPath: globalClone }), {
+        home,
+        global: { forceRefresh: true },
+      })
+      assert.equal(stores.global?.root, globalClone)
+      assert.ok(stores.global?.access, "Git-backed global store carries a cross-process lease")
+      await fs.access(path.join(globalClone, "memory", "active", "mem-gggg0002.md"))
+      assert.equal(await fs.readFile(path.join(globalClone, ".memory", "staging", "mem-staged99.md"), "utf8"), "staged\n")
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("skips fast-forwarding the global clone when tracked files have local edits, without failing the session", async () => {
+    const root = await tempDir("mem-global-dirty-")
+    const remote = path.join(root, "global-remote.git")
+    const publisher = path.join(root, "publisher")
+    const globalClone = path.join(root, "global-clone")
+    const projectDir = path.join(root, "plain-project")
+    const home = path.join(root, "home")
+    await fs.mkdir(projectDir, { recursive: true })
+    await fs.mkdir(home, { recursive: true })
+    try {
+      await defaultGitRun(["init", "-q", "--bare", remote], root)
+      await defaultGitRun(["clone", "-q", remote, publisher], root)
+      await defaultGitRun(["config", "user.email", "test@example.com"], publisher)
+      await defaultGitRun(["config", "user.name", "Test"], publisher)
+      await fs.mkdir(path.join(publisher, "memory", "active"), { recursive: true })
+      const tracked = path.join("memory", "active", "mem-gggg0001.md")
+      await fs.writeFile(path.join(publisher, tracked), "---\nid: mem-gggg0001\ntitle: Original\n---\nbody\n", "utf8")
+      await defaultGitRun(["add", "-A"], publisher)
+      await defaultGitRun(["commit", "-qm", "init"], publisher)
+      await defaultGitRun(["branch", "-M", "main"], publisher)
+      await defaultGitRun(["push", "-q", "-u", "origin", "main"], publisher)
+
+      await defaultGitRun(["clone", "-q", remote, globalClone], root)
+
+      // Advance upstream and make a local tracked edit in the global clone.
+      await fs.writeFile(
+        path.join(publisher, "memory", "active", "mem-gggg0002.md"),
+        "---\nid: mem-gggg0002\ntitle: Upstream addition\n---\nbody\n",
+        "utf8",
+      )
+      await defaultGitRun(["add", "-A"], publisher)
+      await defaultGitRun(["commit", "-qm", "upstream"], publisher)
+      await defaultGitRun(["push", "-q", "origin", "main"], publisher)
+
+      const localEdit = "---\nid: mem-gggg0001\ntitle: Local edit\n---\nbody\n"
+      await fs.writeFile(path.join(globalClone, tracked), localEdit, "utf8")
+
+      resetProjectStoreCache()
+      const stores = await resolveStores(projectDir, config({ globalMemoryPath: globalClone }), {
+        home,
+        global: { forceRefresh: true },
+      })
+      assert.equal(stores.global?.root, globalClone)
+      assert.equal(stores.globalProblem, undefined)
+      assert.equal(await fs.readFile(path.join(globalClone, tracked), "utf8"), localEdit)
+      await assert.rejects(fs.access(path.join(globalClone, "memory", "active", "mem-gggg0002.md")))
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
 })

@@ -226,7 +226,23 @@ export async function loadPromptBlock(
       if (err instanceof StoreAccessError) projectBusy = true
     }
   }
-  const global = stores.global ? await readListing(stores.global, onProblems) : undefined
+  let global: ScopeListing | undefined
+  let globalBusy = false
+  if (stores.global) {
+    try {
+      global = await withStoreAccess(stores.global, () => readListing(stores.global!, onProblems))
+    } catch (err) {
+      if (err instanceof StoreAccessError) {
+        globalBusy = true
+        global = { scope: "global", memories: [], omitted: 0, unavailable: true }
+      }
+    }
+  }
+  const globalNotice = stores.globalProblem
+    ? globalProblemPrompt(stores.globalProblem)
+    : globalBusy
+      ? "Global memory is being refreshed right now, so the global index is unavailable this turn; continue without it."
+      : undefined
   const notice = stores.projectProblem
     ? projectProblemPrompt(stores.projectProblem)
     : projectBusy
@@ -235,7 +251,7 @@ export async function loadPromptBlock(
   const input: PromptInput = {
     project,
     ...(global ? { global } : {}),
-    ...(stores.globalProblem ? { globalNotice: globalProblemPrompt(stores.globalProblem) } : {}),
+    ...(globalNotice ? { globalNotice } : {}),
     ...(notice ? { projectNotice: notice } : {}),
     ...(opts.legacyImportDeferred ? { legacyNotice: LEGACY_IMPORT_DEFERRED } : {}),
   }

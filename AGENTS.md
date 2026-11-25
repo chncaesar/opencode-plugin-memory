@@ -13,7 +13,7 @@ The LLM never writes shared truth directly. It only writes a proposal file into 
 
 ## Two stores
 
-- **Global** — one private repository of the user, cloned at `globalMemoryPath` (default `~/.local/share/opencode/memory`), read by every session in every repository. Proposals default here.
+- **Global** — one private repository of the user, cloned at `globalMemoryPath` (default `~/.local/share/opencode/memory`), read by every session in every repository and automatically fast-forwarded from its remote default branch when clean. Proposals default here.
 - **Project** — the current repository's own `memory/` folder in Git, shared with whoever has the repository. At runtime a Git project uses one persistent plugin-managed sparse worktree under `~/.local/share/opencode/project-memory/<name>-<hash>/worktree` that tracks the remote default branch, so refreshes never touch the developer's active checkout. Used only for knowledge that is true because of that repository.
 
 Both stores use the same layout and the same code; a store is just a root directory. Each has its own staging folder, bot lock, audit state and pull-request flow, so one store failing never blocks the other. A missing or unreadable global store degrades to project-only memory — it must never break a session. An unusable managed project store fails project memory closed instead of silently falling back to the developer's working copy. A supersede stays inside one store, because the replacement must retire its target in the same PR.

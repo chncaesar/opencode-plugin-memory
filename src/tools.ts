@@ -115,18 +115,21 @@ function projectUnavailable(stores: StoreSet): string {
 type ToolResult = { title: string; output: string }
 
 /**
- * Hold the managed project store's cross-process lease across a complete
- * read/check/write phase. Global and plain-directory stores have no lease.
- * A busy/recovering store is reported instead of being read or written.
+ * Hold the cross-process access lease for every available Git-backed store
+ * across a complete read/check/write phase. Plain-directory stores have no
+ * lease. A busy/recovering store is reported instead of being read or written.
  */
 async function withProjectLease<T extends ToolResult>(
   stores: StoreSet,
   fn: () => Promise<T>,
 ): Promise<T | ToolResult> {
-  const project = usableProjectStore(stores)
-  if (!project) return fn()
+  const targets = availableStores(stores)
+  const run = targets.reduceRight<() => Promise<T>>(
+    (next, store) => () => withStoreAccess(store, next),
+    fn,
+  )
   try {
-    return await withStoreAccess(project, fn)
+    return await run()
   } catch (err) {
     if (err instanceof StoreAccessError) {
       return { title: "Project memory busy", output: err.message }

@@ -5,7 +5,7 @@ parent: Reference
 nav_order: 2
 ---
 
-**The agent proposed a memory, but a later session cannot see it.** Check that its pull request was merged into the repository's default branch. A staged proposal or an open pull request is not an active memory. Project memories refresh automatically from the remote default branch into the plugin-managed project store; global memories require pulling your global store clone at `globalMemoryPath`.
+**The agent proposed a memory, but a later session cannot see it.** Check that its pull request was merged into the repository's default branch. A staged proposal or an open pull request is not an active memory. Project memories refresh automatically from the remote default branch into the plugin-managed project store; global memories fast-forward automatically in `globalMemoryPath` when the clone is on its default branch with no local tracked edits.
 
 **A proposal did not produce a pull request.** Confirm the repository has an `origin` remote, your account can push to it, and GitHub CLI is installed and authenticated. The bot reports failures and retains failed proposals for retry.
 

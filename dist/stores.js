@@ -1,7 +1,7 @@
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
-import { assertAccessBoundary, pendingRefreshForAccess, resolveProjectStore, StoreAccessError, withProjectStoreAccess, } from "./projectStore.js";
+import { assertAccessBoundary, pendingRefreshForAccess, refreshGlobalStore, resolveProjectStore, StoreAccessError, withProjectStoreAccess, } from "./projectStore.js";
 export { StoreAccessError };
 /** Expand a leading `~` (or `~/`); anything else is returned unchanged. */
 export function expandHome(value, home = os.homedir()) {
@@ -72,7 +72,19 @@ export async function resolveStores(projectDir, config, opts = {}) {
         return set;
     }
     if (kind === "dir") {
-        set.global = { scope: "global", root: globalPath };
+        const globalResolved = await refreshGlobalStore(globalPath, {
+            ...(opts.home ? { home: opts.home } : {}),
+            ...(opts.project?.base ? { base: opts.project.base } : {}),
+            ...(opts.project?.refreshIntervalMs !== undefined ? { refreshIntervalMs: opts.project.refreshIntervalMs } : {}),
+            ...(opts.project?.forceRefresh !== undefined ? { forceRefresh: opts.project.forceRefresh } : {}),
+            ...(opts.project?.git ? { git: opts.project.git } : {}),
+            ...(opts.global ?? {}),
+        });
+        set.global = {
+            scope: "global",
+            root: globalPath,
+            ...(globalResolved.access ? { access: globalResolved.access } : {}),
+        };
         set.defaultScope = config.defaultScope;
         return set;
     }
@@ -116,14 +128,15 @@ export async function withStoreAccess(store, fn) {
     const access = store.access;
     if (!access)
         return fn();
+    const label = store.scope === "global" ? "global" : "project";
     return withProjectStoreAccess(access, async () => {
         // Re-check the path under the lease: a cached Store must never follow a
         // symlink swapped in after resolution.
         const boundary = await assertAccessBoundary(access);
         if (!boundary.ok) {
-            throw new StoreAccessError(`The project memory store path is no longer the managed checkout (${boundary.detail}); nothing was read or written.`);
+            throw new StoreAccessError(`The ${label} memory store path is no longer valid (${boundary.detail}); nothing was read or written.`);
         }
-        if (await pendingRefreshForAccess(access)) {
+        if (!access.directRoot && (await pendingRefreshForAccess(access))) {
             throw new StoreAccessError("The project memory store is recovering from an interrupted refresh. Try again in a moment.");
         }
         return fn();
