@@ -97,25 +97,62 @@ export declare function branchFor(memory: Memory): string;
  */
 export declare function acquireLock(projectDir: string): Promise<(() => Promise<void>) | null>;
 /**
- * Process every staged proposal once. All git work happens in a throwaway git
- * worktree, so the developer's checkout (branch, index, uncommitted files) is
- * never touched. For each proposal:
- *   1. if its branch is already on the remote (an earlier run pushed it but did
- *      not finish), find its PR, or open one, and drop the staged file;
- *   2. otherwise start from the fetched default branch in the worktree (detached,
- *      no local branch), apply the transform, commit, push an explicit ref, open
- *      PR, drop the staged file;
- *   3. on failure leave the staged file for the next run.
+ * One publish run, with the machine-local publish record kept around it.
+ *
+ * Every caller — the standalone `once`/`watch` commands and the in-plugin
+ * `memory_publish` tool — goes through here, so a failure is recorded exactly
+ * once and is identical in both paths.
+ *
+ * The record never changes the run's outcome:
+ * - a failed result (including rejected staged files) persists the reason;
+ * - a thrown error is recorded and rethrown unchanged;
+ * - a run that verified there is nothing left to publish clears an older
+ *   failure;
+ * - a busy run records nothing, because it did not verify anything.
+ *
+ * Recording is best effort (see publishState.ts): it must not throw, and it must
+ * not replace the outcome or error the caller would otherwise see.
  */
 export declare function processStagingOnce(projectDir: string, opts?: BotOptions): Promise<BotResult>;
+/** Where the CLI's store root came from. */
+export type CliStoreSource = "managed" | "project-dir" | "explicit";
+/** The store a CLI run will publish from, and how it was chosen. */
+export type CliStoreTarget = {
+    /** Absolute root the bot publishes from. */
+    root: string;
+    /**
+     * `managed` — the plugin-managed worktree of this Git repository;
+     * `project-dir` — the directory itself, when it is not a Git project and is
+     * therefore its own store; `explicit` — a store root named by `--dir`.
+     */
+    source: CliStoreSource;
+    /** Developer toplevel the managed store belongs to (source `managed` only). */
+    repository?: string;
+};
 /**
- * Resolve the store directory the CLI should process.
+ * One phrase naming the store a run checked. The CLI must never claim "no staged
+ * proposals" without saying which store it looked at: the same words for a
+ * developer checkout and for its managed store would hide the fact that the
+ * agent's proposals live in the other one.
+ */
+export declare function describeCliStore(target: CliStoreTarget): string;
+/**
+ * Resolve the store the CLI should process, and how it was chosen.
  *
- * - An explicit `--dir <path>` is treated as a store root directly (for
- *   example, the global memory clone).
+ * - An explicit `--dir <path>` is an explicit store selection: it must already
+ *   exist and hold `.memory/` or `memory/` (see `explicitStoreDir`). It is used
+ *   exactly as given — never remapped to another directory.
  * - An omitted `--dir` resolves the current directory through the managed
- *   project-store manager, so running `opencode-memory-bot once` from a
- *   developer checkout processes that project's managed staging folder.
+ *   project-store manager. A Git project uses its managed worktree; a plain
+ *   directory stays its own store, which is the plugin's historical behaviour
+ *   for non-Git projects. The source is returned so the CLI can name it.
+ * - A Git project whose managed store cannot be initialized still refuses: its
+ *   developer checkout is never a substitute.
+ */
+export declare function resolveCliStoreTarget(cwd: string, dirArg?: string, opts?: ProjectStoreOptions): Promise<CliStoreTarget>;
+/**
+ * The store root only, kept for callers of the original signature. Use
+ * `resolveCliStoreTarget` when the CLI needs to name the store it checked.
  */
 export declare function resolveCliStoreDir(cwd: string, dirArg?: string, opts?: ProjectStoreOptions): Promise<string>;
 /** Poll staging forever, processing new proposals as they appear. */

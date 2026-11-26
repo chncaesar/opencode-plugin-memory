@@ -15,6 +15,7 @@ import {
   type ModelCall,
 } from "./audit.js"
 import { registerAuditAgent } from "./auditAgent.js"
+import { publishWarning } from "./publishState.js"
 import { tool } from "@opencode-ai/plugin/tool"
 
 /**
@@ -158,6 +159,10 @@ async function injectMemoryBlock(directory: string, config: PluginConfig, logger
     for (const store of availableStores(stores)) {
       const warning = await auditWarning(store.root, config).catch(() => null)
       if (warning) notices.push(warning)
+      // A publish failure is reported once in the tool's own result; without
+      // this the model would forget it while the proposals stay staged.
+      const publishFailed = await publishWarning(store.root).catch(() => null)
+      if (publishFailed) notices.push(publishFailed)
       const pending = await pendingPublishNotice(store.root, store.scope).catch(() => null)
       if (pending) notices.push(pending)
     }

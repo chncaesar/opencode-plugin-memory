@@ -4,6 +4,7 @@ import { generateMemoryId, listActiveMemories, listRetiredMemories, listStagedPr
 import { detectSecrets } from "./secret.js";
 import { processStagingOnce } from "./bot.js";
 import { describeAuditStatus } from "./audit.js";
+import { describePublishStatus } from "./publishState.js";
 import { availableStores, globalProblemToolMessage, projectProblemToolMessage, resolveStores, StoreAccessError, usableProjectStore, withStoreAccess, } from "./stores.js";
 // Use the zod instance bundled with @opencode-ai/plugin to avoid version conflicts
 const z = tool.schema;
@@ -472,7 +473,7 @@ Returns full bodies of active memories from both stores, plus your own staged pr
     const memory_review = tool({
         description: `A read-only overview of both memory stores. Shows active memories (id + title) per store, pending proposals, aging memories, and — on request — retired memories.
 
-Use this when the system prompt says memories need review, or when cleaning up memory. It also reports how the background audit last went for each store (including failures). It never edits anything; use memory_propose / memory_update / memory_delete to propose changes.`,
+Use this when the system prompt says memories need review, or when cleaning up memory. It also reports how the background audit and the last publish went for each store (including failures). It never edits anything; use memory_propose / memory_update / memory_delete to propose changes.`,
         args: {
             include_retired: z
                 .boolean()
@@ -530,6 +531,8 @@ Use this when the system prompt says memories need review, or when cleaning up m
                         lines.push(`- [${a.memory.id}] ${a.memory.title} (${a.age} days)`);
                     lines.push("", "### Background audit");
                     lines.push(...(await describeAuditStatus(store.root, config)));
+                    lines.push("", "### Publishing");
+                    lines.push(...(await describePublishStatus(store.root)));
                     if (include_retired) {
                         lines.push("", `### Retired memories (${retired.length})`);
                         if (retired.length === 0)

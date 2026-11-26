@@ -26,6 +26,7 @@ import { fileURLToPath } from "url";
 import { execFile } from "child_process";
 import { activeDir, isMemoryId, machineDir, memoryRootDir, readMemoryFileNoFollow, retiredDir, stagingDir, writeMemoryFile, } from "./storage.js";
 import { resolveProjectStore } from "./projectStore.js";
+import { recordPublishFailure, recordPublishSuccess } from "./publishState.js";
 // ─── Child processes ─────────────────────────────────────────────────────────
 function run(cmd, args, cwd) {
     return new Promise((resolve, reject) => {
@@ -614,8 +615,11 @@ async function remoteBranchExists(cwd, branch) {
  *      no local branch), apply the transform, commit, push an explicit ref, open
  *      PR, drop the staged file;
  *   3. on failure leave the staged file for the next run.
+ *
+ * Callers use `processStagingOnce`, which adds the durable publish record; this
+ * is the run itself.
  */
-export async function processStagingOnce(projectDir, opts = {}) {
+async function runStagingOnce(projectDir, opts = {}) {
     const cwd = opts.cwd ?? projectDir;
     const log = opts.log ?? ((line) => console.error(line));
     const openPr = opts.openPr ?? defaultOpenPr;
@@ -728,30 +732,151 @@ export async function processStagingOnce(projectDir, opts = {}) {
     }
     return result;
 }
+/** Most log lines quoted in a persisted failure; enough to name what broke. */
+const MAX_FAILURE_LOG_LINES = 5;
+/**
+ * A one-line reason from the run's own log lines, so a persisted failure keeps
+ * the per-proposal detail ("failed mem-…: gh down") instead of only a count.
+ */
+function failureReason(lines, result) {
+    const problems = lines.filter((line) => line.startsWith("failed ") || line.startsWith("rejected ") || line.startsWith("bot error:"));
+    const detail = problems.length > 0
+        ? problems.slice(0, MAX_FAILURE_LOG_LINES).join("; ")
+        : `${result.failed} proposal${result.failed === 1 ? "" : "s"} could not be published and stayed in staging`;
+    return detail;
+}
+/**
+ * One publish run, with the machine-local publish record kept around it.
+ *
+ * Every caller — the standalone `once`/`watch` commands and the in-plugin
+ * `memory_publish` tool — goes through here, so a failure is recorded exactly
+ * once and is identical in both paths.
+ *
+ * The record never changes the run's outcome:
+ * - a failed result (including rejected staged files) persists the reason;
+ * - a thrown error is recorded and rethrown unchanged;
+ * - a run that verified there is nothing left to publish clears an older
+ *   failure;
+ * - a busy run records nothing, because it did not verify anything.
+ *
+ * Recording is best effort (see publishState.ts): it must not throw, and it must
+ * not replace the outcome or error the caller would otherwise see.
+ */
+export async function processStagingOnce(projectDir, opts = {}) {
+    const lines = [];
+    const log = (line) => {
+        lines.push(line);
+        (opts.log ?? ((text) => console.error(text)))(line);
+    };
+    let result;
+    try {
+        result = await runStagingOnce(projectDir, { ...opts, log });
+    }
+    catch (err) {
+        await recordPublishFailure(projectDir, err instanceof Error ? err.message : String(err));
+        throw err;
+    }
+    if (result.busy)
+        return result;
+    if (result.failed > 0)
+        await recordPublishFailure(projectDir, failureReason(lines, result));
+    else
+        await recordPublishSuccess(projectDir);
+    return result;
+}
 function commitMessage(memory) {
     if (memory.intent === "retire")
         return `memory: retire ${memory.id}`;
     const title = memory.title.length > 60 ? `${memory.title.slice(0, 60)}…` : memory.title;
     return `memory: add ${memory.id} — ${title}`;
 }
-// ─── Watch / regenerate / CLI ───────────────────────────────────────────────
 /**
- * Resolve the store directory the CLI should process.
- *
- * - An explicit `--dir <path>` is treated as a store root directly (for
- *   example, the global memory clone).
- * - An omitted `--dir` resolves the current directory through the managed
- *   project-store manager, so running `opencode-memory-bot once` from a
- *   developer checkout processes that project's managed staging folder.
+ * One phrase naming the store a run checked. The CLI must never claim "no staged
+ * proposals" without saying which store it looked at: the same words for a
+ * developer checkout and for its managed store would hide the fact that the
+ * agent's proposals live in the other one.
  */
-export async function resolveCliStoreDir(cwd, dirArg, opts = {}) {
-    if (dirArg !== undefined)
-        return path.resolve(dirArg);
+export function describeCliStore(target) {
+    switch (target.source) {
+        case "managed":
+            return `the plugin-managed store for ${target.repository ?? "this repository"} at ${target.root}`;
+        case "explicit":
+            return `the store at ${target.root} (from --dir)`;
+        case "project-dir":
+            return `${target.root} (this directory is not a Git project, so it is its own store)`;
+    }
+}
+async function lstatKind(target) {
+    try {
+        const stat = await fs.lstat(target);
+        if (stat.isDirectory())
+            return "dir";
+        return "other";
+    }
+    catch (err) {
+        if (err.code === "ENOENT")
+            return "missing";
+        throw err;
+    }
+}
+/**
+ * Validate an explicit `--dir` as a store root.
+ *
+ * An explicit path is the user's own store selection, so it stays authoritative
+ * and is never remapped to another directory. It only has to be provably a
+ * store root, not merely a directory that happens to exist: a nonexistent path
+ * is a typo, and a directory with no `.memory/` and no `memory/` would publish
+ * nothing and then say "no staged proposals", the same false answer this command
+ * must not give.
+ */
+async function explicitStoreDir(dirArg) {
+    const target = path.resolve(dirArg);
+    const kind = await lstatKind(target);
+    if (kind === "missing") {
+        throw new Error(`--dir ${target} does not exist. Pass the root of an existing memory store: a directory that already holds .memory/ or memory/.`);
+    }
+    if (kind !== "dir") {
+        throw new Error(`--dir ${target} is not a directory. Pass the root of an existing memory store: a directory that already holds .memory/ or memory/.`);
+    }
+    const holdsStore = (await lstatKind(path.join(target, ".memory"))) === "dir" || (await lstatKind(path.join(target, "memory"))) === "dir";
+    if (!holdsStore) {
+        throw new Error(`--dir ${target} is not a memory store: it holds neither .memory/ nor memory/. Pass the store root itself (the directory that holds .memory/ or memory/), not its parent or a child.`);
+    }
+    return target;
+}
+/**
+ * Resolve the store the CLI should process, and how it was chosen.
+ *
+ * - An explicit `--dir <path>` is an explicit store selection: it must already
+ *   exist and hold `.memory/` or `memory/` (see `explicitStoreDir`). It is used
+ *   exactly as given — never remapped to another directory.
+ * - An omitted `--dir` resolves the current directory through the managed
+ *   project-store manager. A Git project uses its managed worktree; a plain
+ *   directory stays its own store, which is the plugin's historical behaviour
+ *   for non-Git projects. The source is returned so the CLI can name it.
+ * - A Git project whose managed store cannot be initialized still refuses: its
+ *   developer checkout is never a substitute.
+ */
+export async function resolveCliStoreTarget(cwd, dirArg, opts = {}) {
+    if (dirArg !== undefined && dirArg !== "") {
+        return { root: await explicitStoreDir(dirArg), source: "explicit" };
+    }
     const resolved = await resolveProjectStore(path.resolve(cwd), opts);
     if (resolved.status === "unavailable") {
         throw new Error(`project memory store is unavailable at ${resolved.root}${resolved.detail ? ` (${resolved.detail})` : ""}`);
     }
-    return resolved.root;
+    return {
+        root: resolved.root,
+        source: resolved.status === "managed" ? "managed" : "project-dir",
+        ...(resolved.repository ? { repository: resolved.repository } : {}),
+    };
+}
+/**
+ * The store root only, kept for callers of the original signature. Use
+ * `resolveCliStoreTarget` when the CLI needs to name the store it checked.
+ */
+export async function resolveCliStoreDir(cwd, dirArg, opts = {}) {
+    return (await resolveCliStoreTarget(cwd, dirArg, opts)).root;
 }
 /** Poll staging forever, processing new proposals as they appear. */
 export async function startWatch(projectDir, intervalMs, opts = {}) {
@@ -774,38 +899,45 @@ function printUsage() {
         "opencode-memory-bot — turn staged memory proposals into pull requests",
         "",
         "Usage:",
-        "  node dist/bot.js once [--dir <path>]        process staged proposals, then exit",
-        "  node dist/bot.js watch [--dir <path>] [--interval <ms>]   poll staging forever",
+        "  node dist/bot.js once [--dir <store root>]        process staged proposals, then exit",
+        "  node dist/bot.js watch [--dir <store root>] [--interval <ms>]   poll staging forever",
+        "  --dir names an existing store root; without it the current Git project's plugin-managed store is used",
     ].join("\n"));
 }
 async function main() {
     const argv = process.argv.slice(2);
     const command = argv[0] ?? "once";
-    const dirArg = argv.includes("--dir") ? argv[argv.indexOf("--dir") + 1] : undefined;
+    const dirIndex = argv.indexOf("--dir");
+    const dirArg = dirIndex >= 0 ? argv[dirIndex + 1] : undefined;
+    if (dirIndex >= 0 && (dirArg === undefined || dirArg === "")) {
+        throw new Error("--dir requires a path to an existing memory store root (a directory that already holds .memory/ or memory/).");
+    }
     const intervalArg = argv.includes("--interval") ? argv[argv.indexOf("--interval") + 1] : undefined;
     const intervalMs = intervalArg ? Number(intervalArg) || 2000 : 2000;
     switch (command) {
         case "once": {
-            const projectDir = await resolveCliStoreDir(process.cwd(), dirArg);
-            const result = await processStagingOnce(projectDir);
+            const target = await resolveCliStoreTarget(process.cwd(), dirArg);
+            const result = await processStagingOnce(target.root);
             if (result.recovered > 0)
                 console.log(`recovered ${result.recovered} proposal${result.recovered === 1 ? "" : "s"} (branch already pushed)`);
             if (result.promoted > 0)
                 console.log(`promoted ${result.promoted} proposal${result.promoted === 1 ? "" : "s"}`);
             else if (result.skipped > 0)
                 console.log(`skipped ${result.skipped} proposal${result.skipped === 1 ? "" : "s"}`);
-            else if (result.failed === 0 && result.recovered === 0)
-                console.log("no staged proposals");
+            // Never an unqualified "no staged proposals": name the store that was checked.
+            else if (result.failed === 0 && result.recovered === 0 && !result.busy) {
+                console.log(`no staged proposals (checked ${describeCliStore(target)})`);
+            }
             if (result.failed > 0) {
-                console.error(`${result.failed} proposal${result.failed === 1 ? "" : "s"} failed; left in staging`);
+                console.error(`${result.failed} proposal${result.failed === 1 ? "" : "s"} failed; left in staging (checked ${describeCliStore(target)})`);
                 process.exitCode = 1;
             }
             return;
         }
         case "watch": {
-            const projectDir = await resolveCliStoreDir(process.cwd(), dirArg);
-            console.error(`watching ${path.join(projectDir, ".memory", "staging")} every ${intervalMs}ms`);
-            await startWatch(projectDir, intervalMs);
+            const target = await resolveCliStoreTarget(process.cwd(), dirArg);
+            console.error(`watching ${path.join(target.root, ".memory", "staging")} every ${intervalMs}ms (checked ${describeCliStore(target)})`);
+            await startWatch(target.root, intervalMs);
             return;
         }
         case "regenerate": {

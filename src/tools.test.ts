@@ -5,6 +5,7 @@ import os from "os"
 import path from "path"
 import { createMemoryTools, mapRetireReason } from "./tools.js"
 import { runAudit } from "./audit.js"
+import { recordPublishFailure } from "./publishState.js"
 import { activeDir, listActiveMemories, listStagedProposals, writeMemoryFile } from "./storage.js"
 import { DEFAULT_CONFIG } from "./types.js"
 import type { Logger } from "./logging.js"
@@ -281,6 +282,27 @@ describe("memory_review shows the background audit", () => {
     await withDir(async (dir) => {
       const r = await run(tools.memory_review, {}, dir)
       assert.match(r.output, /## Background audit\nNot run yet/)
+    })
+  })
+})
+
+describe("memory_review shows publishing status", () => {
+  it("exposes a failed publish with its stored reason", async () => {
+    await withDir(async (dir) => {
+      await recordPublishFailure(dir, "gh: not authenticated")
+      const r = await run(tools.memory_review, {}, dir)
+      assert.match(r.output, /### Publishing/)
+      assert.match(r.output, /Last publish: .* — FAILED/)
+      assert.match(r.output, /not authenticated/)
+      assert.match(r.output, /did not open a pull request for every proposal/)
+      assert.match(r.output, /memory_publish/)
+    })
+  })
+
+  it("says no publish has been recorded for the store yet", async () => {
+    await withDir(async (dir) => {
+      const r = await run(tools.memory_review, {}, dir)
+      assert.match(r.output, /### Publishing\nNo publish recorded yet for this store\./)
     })
   })
 })

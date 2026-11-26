@@ -5,8 +5,9 @@ import os from "os";
 import path from "path";
 import { execFileSync, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
-import { acquireLock, applyPropose, applyRetire, branchFor, buildPrBody, buildPrCreateArgs, buildPrListArgs, buildPrTitle, defaultBranch, parseRemoteUrl, processStagingOnce, resolveCliStoreDir } from "./bot.js";
+import { acquireLock, applyPropose, applyRetire, branchFor, buildPrBody, buildPrCreateArgs, buildPrListArgs, buildPrTitle, defaultBranch, parseRemoteUrl, processStagingOnce, resolveCliStoreDir, resolveCliStoreTarget } from "./bot.js";
 import { activeDir, listActiveMemories, listRetiredMemories, retiredDir, stagingDir, writeMemoryFile, writeProposal } from "./storage.js";
+import { publishWarning, readPublishState, recordPublishFailure } from "./publishState.js";
 async function withDir(fn) {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mem-bot-"));
     try {
@@ -27,25 +28,94 @@ it("prints CLI help when launched through an npm-style bin symlink", { skip: pro
     });
 });
 describe("resolveCliStoreDir", () => {
+    /** A clone with a main branch pushed to a bare remote: a developer checkout. */
+    async function developerRepo(root) {
+        const remote = path.join(root, "remote.git");
+        const dev = path.join(root, "dev");
+        const home = path.join(root, "home");
+        execFileSync("git", ["init", "-q", "--bare", remote], { cwd: root });
+        execFileSync("git", ["clone", "-q", remote, dev], { cwd: root });
+        execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: dev });
+        execFileSync("git", ["config", "user.name", "Test"], { cwd: dev });
+        await fs.writeFile(path.join(dev, "README.md"), "readme\n", "utf8");
+        execFileSync("git", ["add", "-A"], { cwd: dev });
+        execFileSync("git", ["commit", "-qm", "init"], { cwd: dev });
+        execFileSync("git", ["branch", "-M", "main"], { cwd: dev });
+        execFileSync("git", ["push", "-q", "-u", "origin", "main"], { cwd: dev });
+        return { dev, home };
+    }
     it("resolves a developer checkout to its managed project store when --dir is omitted", async () => {
         await withDir(async (root) => {
-            const remote = path.join(root, "remote.git");
-            const dev = path.join(root, "dev");
-            const home = path.join(root, "home");
-            execFileSync("git", ["init", "-q", "--bare", remote], { cwd: root });
-            execFileSync("git", ["clone", "-q", remote, dev], { cwd: root });
-            execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: dev });
-            execFileSync("git", ["config", "user.name", "Test"], { cwd: dev });
-            await fs.writeFile(path.join(dev, "README.md"), "readme\n", "utf8");
-            execFileSync("git", ["add", "-A"], { cwd: dev });
-            execFileSync("git", ["commit", "-qm", "init"], { cwd: dev });
-            execFileSync("git", ["branch", "-M", "main"], { cwd: dev });
-            execFileSync("git", ["push", "-q", "-u", "origin", "main"], { cwd: dev });
+            const { dev, home } = await developerRepo(root);
+            const resolved = await resolveCliStoreTarget(dev, undefined, { home, forceRefresh: true });
+            assert.equal(resolved.source, "managed");
+            assert.notEqual(resolved.root, dev);
+            assert.ok(resolved.root.startsWith(home + path.sep));
+            assert.ok(resolved.repository);
+        });
+    });
+    it("resolveCliStoreDir still returns just the store root", async () => {
+        await withDir(async (root) => {
+            const { dev, home } = await developerRepo(root);
             const resolved = await resolveCliStoreDir(dev, undefined, { home, forceRefresh: true });
+            assert.equal(typeof resolved, "string");
             assert.notEqual(resolved, dev);
             assert.ok(resolved.startsWith(home + path.sep));
-            const explicit = await resolveCliStoreDir(dev, "/explicit/global-store", { home });
-            assert.equal(explicit, path.resolve("/explicit/global-store"));
+        });
+    });
+    it("keeps a plain directory as its own store, as the plugin does for non-Git projects", async () => {
+        await withDir(async (root) => {
+            const dir = path.join(root, "plain");
+            await fs.mkdir(dir);
+            const resolved = await resolveCliStoreTarget(dir, undefined, { home: path.join(root, "home") });
+            assert.deepEqual({ root: resolved.root, source: resolved.source }, { root: dir, source: "project-dir" });
+        });
+    });
+    it("accepts an explicit --dir that is an existing store root, exactly as given", async () => {
+        await withDir(async (root) => {
+            const store = path.join(root, "global-store");
+            await fs.mkdir(path.join(store, "memory"), { recursive: true });
+            const resolved = await resolveCliStoreTarget(root, store);
+            assert.deepEqual({ root: resolved.root, source: resolved.source }, { root: store, source: "explicit" });
+            // The compatibility accessor agrees.
+            assert.equal(await resolveCliStoreDir(root, store), store);
+        });
+    });
+    it("refuses an explicit --dir that does not exist", async () => {
+        await withDir(async (root) => {
+            await assert.rejects(resolveCliStoreTarget(root, path.join(root, "missing")), /does not exist/);
+        });
+    });
+    it("refuses an explicit --dir that holds neither .memory/ nor memory/", async () => {
+        await withDir(async (root) => {
+            const empty = path.join(root, "not-a-store");
+            await fs.mkdir(empty);
+            await assert.rejects(resolveCliStoreTarget(root, empty), /neither \.memory\/ nor memory\//);
+        });
+    });
+    it("does not remap an explicit --dir that is a developer checkout with a managed store", async () => {
+        await withDir(async (root) => {
+            const { dev, home } = await developerRepo(root);
+            const managed = await resolveCliStoreTarget(dev, undefined, { home, forceRefresh: true });
+            assert.equal(managed.source, "managed");
+            // A checkout that also holds a store layout is still used exactly as given.
+            await fs.mkdir(path.join(dev, ".memory", "staging"), { recursive: true });
+            const explicit = await resolveCliStoreTarget(dev, dev, { home });
+            assert.deepEqual({ root: explicit.root, source: explicit.source }, { root: dev, source: "explicit" });
+        });
+    });
+    it("names the store it checked instead of reporting an unqualified 'no staged proposals'", async () => {
+        await withDir(async (dir) => {
+            await fs.mkdir(path.join(dir, ".memory", "staging"), { recursive: true });
+            const run = spawnSync(process.execPath, [fileURLToPath(new URL("./bot.js", import.meta.url)), "once"], {
+                cwd: dir,
+                encoding: "utf8",
+            });
+            assert.ifError(run.error);
+            assert.equal(run.status, 0, run.stderr);
+            assert.match(run.stdout, /no staged proposals \(checked /);
+            assert.match(run.stdout, /not a Git project/);
+            assert.ok(run.stdout.includes(path.basename(dir)), run.stdout);
         });
     });
 });
@@ -709,6 +779,160 @@ describe("filesystem boundary", () => {
             assert.equal(opened, 0);
             await fs.access(file); // still staged
             assert.match(sh(repo, "ls-remote", "--heads", "origin", "memory/mem-aaaa0001"), /memory\/mem-aaaa0001/);
+        });
+    });
+});
+describe("publish failures stay visible after the call", () => {
+    it("records the failing step, and the system prompt warns until it is cleared", async () => {
+        await withDir(async (root) => {
+            const repo = await setupRepo(root);
+            await writeProposal(repo, { id: "mem-bbbbbbbb", title: "B", body: "body b", proposedAt: "2026-01-01", intent: "propose" });
+            const failed = await processStagingOnce(repo, {
+                log: quiet,
+                findPr: async () => null,
+                openPr: async () => {
+                    throw new Error("gh down");
+                },
+            });
+            assert.equal(failed.failed, 1);
+            const state = await readPublishState(repo);
+            assert.equal(state.lastOutcome, "failed");
+            assert.ok(state.lastOutcomeAt);
+            assert.match(state.lastError ?? "", /gh down/);
+            // The proposal is still staged: the failure describes real pending work.
+            await fs.access(path.join(stagingDir(repo), "mem-bbbbbbbb.md"));
+            const warning = (await publishWarning(repo)) ?? "";
+            assert.match(warning, /last memory publish FAILED/i);
+            assert.match(warning, /gh down/);
+            assert.match(warning, /memory_publish/);
+            assert.match(warning, /retry/i);
+            // A partial run may have opened some PRs; the claim must not overstate.
+            assert.match(warning, /did not open a pull request for every proposal/);
+        });
+    });
+    it("clears the warning once a later run publishes the proposal", async () => {
+        await withDir(async (root) => {
+            const repo = await setupRepo(root);
+            await writeProposal(repo, { id: "mem-bbbbbbbb", title: "B", body: "body b", proposedAt: "2026-01-01", intent: "propose" });
+            await processStagingOnce(repo, {
+                log: quiet,
+                findPr: async () => null,
+                openPr: async () => {
+                    throw new Error("gh down");
+                },
+            });
+            assert.notEqual(await publishWarning(repo), null);
+            // The earlier run pushed the branch; this one recovers it.
+            const retried = await processStagingOnce(repo, {
+                log: quiet,
+                findPr: async () => "https://example.test/pr/9",
+            });
+            assert.equal(retried.failed, 0);
+            assert.equal(retried.recovered, 1);
+            assert.equal(await publishWarning(repo), null);
+            const state = await readPublishState(repo);
+            assert.equal(state.lastOutcome, "ok");
+            assert.equal(state.lastError, undefined);
+        });
+    });
+    it("clears the warning when a later run verifies nothing is staged", async () => {
+        await withDir(async (root) => {
+            const repo = await setupRepo(root);
+            await recordPublishFailure(repo, "earlier failure");
+            assert.match((await publishWarning(repo)) ?? "", /earlier failure/);
+            const idle = await processStagingOnce(repo, { log: quiet });
+            assert.equal(idle.promoted, 0);
+            assert.equal(idle.failed, 0);
+            assert.equal(await publishWarning(repo), null);
+        });
+    });
+    it("does not clear a recorded failure while another run holds the lock", async () => {
+        await withDir(async (root) => {
+            const repo = await setupRepo(root);
+            await writeProposal(repo, { id: "mem-hhhhhhhh", title: "H", body: "h", proposedAt: "2026-01-01", intent: "propose" });
+            await recordPublishFailure(repo, "earlier failure");
+            const release = await acquireLock(repo);
+            assert.ok(release);
+            try {
+                const busy = await processStagingOnce(repo, { log: quiet, findPr: async () => null, openPr: async () => "x" });
+                assert.equal(busy.busy, true);
+            }
+            finally {
+                await release();
+            }
+            assert.equal((await readPublishState(repo)).lastOutcome, "failed");
+            assert.match((await publishWarning(repo)) ?? "", /earlier failure/);
+        });
+    });
+    it("records an exception thrown before any result, without replacing it", async () => {
+        await withDir(async (dir) => {
+            const elsewhere = path.join(dir, "elsewhere");
+            await fs.mkdir(elsewhere);
+            await fs.mkdir(path.join(dir, ".memory"));
+            await fs.symlink(elsewhere, path.join(dir, ".memory", "staging"));
+            await assert.rejects(processStagingOnce(dir, { log: quiet }), /not a real directory/);
+            const state = await readPublishState(dir);
+            assert.equal(state.lastOutcome, "failed");
+            assert.match(state.lastError ?? "", /not a real directory/);
+        });
+    });
+    it("keeps the per-proposal reason for a rejected staged file", async () => {
+        await withDir(async (dir) => {
+            const file = path.join(stagingDir(dir), "mem-aaaa0001.md");
+            await fs.mkdir(stagingDir(dir), { recursive: true });
+            await fs.writeFile(file, "---\nid: mem-bbbb0002\ntitle: X\nintent: propose\n---\nbody\n");
+            const res = await processStagingOnce(dir, { log: quiet, openPr: async () => "https://example.test/pr/1" });
+            assert.equal(res.failed, 1);
+            assert.match((await readPublishState(dir)).lastError ?? "", /frontmatter id/);
+        });
+    });
+});
+describe("publish state is written only when it changes", () => {
+    it("a quiet run with no recorded failure writes nothing", async () => {
+        await withDir(async (root) => {
+            const repo = await setupRepo(root);
+            await fs.mkdir(path.join(stagingDir(repo)), { recursive: true });
+            const res = await processStagingOnce(repo, { log: quiet });
+            assert.equal(res.promoted + res.failed + res.skipped, 0);
+            await assert.rejects(fs.access(path.join(repo, ".memory", "publish-state.json")));
+        });
+    });
+});
+describe("CLI argument handling", () => {
+    it("refuses a --dir flag with no value instead of quietly using the current directory", async () => {
+        await withDir(async (dir) => {
+            await fs.mkdir(path.join(dir, ".memory", "staging"), { recursive: true });
+            const run = spawnSync(process.execPath, [fileURLToPath(new URL("./bot.js", import.meta.url)), "once", "--dir"], {
+                cwd: dir,
+                encoding: "utf8",
+            });
+            assert.ifError(run.error);
+            assert.notEqual(run.status, 0);
+            assert.match(run.stderr, /--dir requires a path/);
+            assert.doesNotMatch(run.stdout, /no staged proposals/);
+        });
+    });
+});
+describe("publish record cannot be redirected by a symlinked .memory", () => {
+    it("a symlinked .memory refuses the run and receives no publish-state.json through its target", async () => {
+        await withDir(async (dir) => {
+            const elsewhere = path.join(dir, "elsewhere");
+            await fs.mkdir(path.join(elsewhere, "staging"), { recursive: true });
+            await fs.writeFile(path.join(elsewhere, "staging", "mem-aaaa0001.md"), "---\nid: mem-aaaa0001\ntitle: X\nintent: propose\n---\nbody\n", "utf8");
+            await fs.symlink(elsewhere, path.join(dir, ".memory"));
+            await assert.rejects(processStagingOnce(dir, { log: quiet }), /not a real directory/);
+            // The failure is real, but recording it must not write through the link.
+            assert.deepEqual(await fs.readdir(elsewhere), ["staging"]);
+            await assert.rejects(fs.access(path.join(elsewhere, "publish-state.json")));
+            await assert.rejects(fs.access(path.join(dir, ".memory", "publish-state.json")));
+        });
+    });
+    it("still creates .memory when it is absent", async () => {
+        await withDir(async (dir) => {
+            await recordPublishFailure(dir, "earlier failure");
+            const state = await readPublishState(dir);
+            assert.equal(state.lastOutcome, "failed");
+            assert.match(state.lastError ?? "", /earlier failure/);
         });
     });
 });

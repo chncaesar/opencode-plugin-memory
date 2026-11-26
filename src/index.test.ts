@@ -6,6 +6,7 @@ import path from "path"
 import { createV2ModelCall, pendingPublishNotice, resolveAuditCall, resolveConfig, server, setup } from "./plugin.js"
 import defaultExport from "./index.js"
 import { activeDir, listActiveMemories, stagingDir, writeMemoryFile, writeProposal } from "./storage.js"
+import { recordPublishFailure, recordPublishSuccess } from "./publishState.js"
 
 async function withDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mem-index-"))
@@ -195,6 +196,25 @@ describe("pending publish notice", () => {
 })
 
 describe("plugin entry", () => {
+  it("injects a publish-failure warning until a later run clears it", async () => {
+    await withDir(async (dir) => {
+      await recordPublishFailure(dir, "gh: not authenticated")
+      const hooks = await createServer(dir)
+      const out = { system: [] as string[] }
+      await (hooks["experimental.chat.system.transform"] as any)({ sessionID: "ses_x" }, out)
+      const text = out.system.join("\n")
+      assert.match(text, /last memory publish FAILED/i)
+      assert.match(text, /not authenticated/)
+      assert.match(text, /did not open a pull request for every proposal/)
+      assert.match(text, /retry memory_publish/i)
+
+      await recordPublishSuccess(dir)
+      const after = { system: [] as string[] }
+      await (hooks["experimental.chat.system.transform"] as any)({ sessionID: "ses_x" }, after)
+      assert.ok(!/publish FAILED/i.test(after.system.join("\n")))
+    })
+  })
+
   it("injecting the index in a directory without memories creates no memory/ folder", async () => {
     await withDir(async (dir) => {
       const hooks = await createServer(dir)
