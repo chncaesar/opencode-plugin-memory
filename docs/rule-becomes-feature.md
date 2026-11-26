@@ -25,7 +25,7 @@ If the agent skips a memory because the finished feature will state the rule its
 
 ## When code takes over
 
-When the agent builds a remembered rule — or notices during the session that it has already been built — it automatically proposes retiring that memory and opens the pull request. You do not need to request retirement or publishing as a separate step.
+When the agent builds a remembered rule — or notices during the session that it has already been built — it proposes retiring that memory and opens the pull request. You do not need to request retirement or publishing as a separate step.
 
 Check one thing in the pull request: **does the product, code, test or documentation now guarantee the rule?** If yes, merge it. If not, close it and keep the memory.
 

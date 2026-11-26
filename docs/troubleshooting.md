@@ -9,6 +9,10 @@ nav_order: 2
 
 **A proposal did not produce a pull request.** Confirm the repository has an `origin` remote, your account can push to it, and GitHub CLI is installed and authenticated. The bot reports failures and retains failed proposals for retry.
 
+**The bot says nothing is staged, although the agent proposed something.** You are most likely running an old copy of the bot, which looks for proposals inside your project folder instead of the isolated project store. Use the `npx` form on the [install page]({% link install.md %}#install-the-bot-optional), or [upgrade the bot]({% link install.md %}#upgrading) so it matches the plugin's version.
+
+**I upgraded the plugin, and the bot still behaves like the old version.** They are two separate installations: the plugin is the copy OpenCode loads from its own cache, while the bot is a global install whose only job is to put `opencode-memory-bot` on your `PATH` — upgrading the plugin never touches it. Upgrade both, in that order, as described in [Upgrading]({% link install.md %}#upgrading); or use the `npx` form, which always resolves the current version.
+
 **The audit reports a missing API key.** Check the configured provider, environment variable or key file, and restart OpenCode after updating configuration. A partially configured provider does not fall back silently.
 
 **A later session sees only some of my memories, or says global memory is not configured.** A missing global clone degrades to project-only memory instead of failing. Check that `globalMemoryPath` exists and is a clone of your private memory repository; proposals already staged in the global store stay there. If both stores have entries but one section is truncated, raise `maxSummaryChars` — the two sections share it.

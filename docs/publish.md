@@ -5,14 +5,14 @@ parent: Daily use
 nav_order: 3
 ---
 
-The agent proposes a memory and opens its pull request automatically. You do not need to ask it to publish or approve a separate publishing step. **Your only approval is merging the pull request.**
+The agent proposes a memory, and publishing needs no instruction from you: whenever proposals are waiting, the plugin tells the agent they have no pull request yet, and the agent opens them. **Your only approval is merging the pull request.**
 
 Each pull request opens in the repository its memory belongs to: a global memory in your private memory repository, a project memory in the project repository. Publishing one store never blocks the other, and it does not switch your current branch or modify your uncommitted work.
 
-If automatic publishing fails, you can retry from the project directory (the CLI resolves that repository's plugin-managed project store automatically):
+If publishing fails, you can retry from the project directory (the bot resolves that repository's plugin-managed project store automatically):
 
 ```bash
-npx -p @chncaesar/opencode-plugin-memory opencode-memory-bot once
+npx -p @chncaesar/opencode-plugin-memory@latest opencode-memory-bot once
 ```
 
 `once` processes whatever is staged and exits; `watch` keeps polling instead, every two seconds unless you pass `--interval <ms>`.
