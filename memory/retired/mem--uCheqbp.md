@@ -9,6 +9,9 @@ tags:
 author: Jiachuan Zhu
 source: memory_propose
 proposed_at: 2026-11-17T02:54:19.482Z
+superseded_by: mem-olufvdM3
+retired_at: 2026-11-28T03:47:31.025Z
+retired_reason: superseded
 ---
 往 OpenCode 官方生态页加插件条目时，有四个容易白忙的点，前三个会导致 PR 被机器人自动关闭（警告后 72 小时）。
 
